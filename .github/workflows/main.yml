@@ -36,7 +36,7 @@ jobs:
         run: |
           mkdir release
           copy dist\chaoxing.exe release\
-          copy config_template.ini release\
+          copy config.ini.example release\
           cd release
           7z a -tzip chaoxing.zip *
 
