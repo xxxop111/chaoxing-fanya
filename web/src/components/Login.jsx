@@ -1,17 +1,44 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from './ui/Card';
 import Button from './ui/Button';
 import Input from './ui/Input';
 import Label from './ui/Label';
-import { LogIn, Loader2 } from 'lucide-react';
+import { LogIn, Loader2, ShieldCheck, ShieldAlert } from 'lucide-react';
 import api from '../api/axios';
+
+// 「记住密码」把账号密码存在本机浏览器里（localStorage）。
+// 这是本机自用工具，文件与配置本来就在你机器上；但仍然明文保存，
+// 界面上会明确提示，你可以随时取消勾选把它清掉。
+const REMEMBER_KEY = 'chaoxing.rememberedLogin';
+
+const loadRemembered = () => {
+  try {
+    const raw = window.localStorage.getItem(REMEMBER_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (err) {
+    return null;
+  }
+};
 
 const Login = ({ onLoginSuccess }) => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [useCookies, setUseCookies] = useState(false);
+  const [remember, setRemember] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // 打开页面时若之前勾了「记住密码」就自动填上
+  useEffect(() => {
+    const saved = loadRemembered();
+    if (!saved) return;
+    setUsername(saved.username || '');
+    setPassword(saved.password || '');
+    setUseCookies(Boolean(saved.useCookies));
+    setRemember(true);
+  }, []);
 
   const handleLogin = async (e) => {
     e.preventDefault();
@@ -26,6 +53,17 @@ const Login = ({ onLoginSuccess }) => {
       });
 
       if (response.data.status) {
+        try {
+          if (remember) {
+            window.localStorage.setItem(REMEMBER_KEY, JSON.stringify({
+              username, password, useCookies,
+            }));
+          } else {
+            window.localStorage.removeItem(REMEMBER_KEY);
+          }
+        } catch (err) {
+          console.warn('保存登录信息失败:', err);
+        }
         onLoginSuccess({ username, password });
       } else {
         setError(response.data.msg || '登录失败');
@@ -87,6 +125,31 @@ const Login = ({ onLoginSuccess }) => {
               <Label htmlFor="use-cookies" className="cursor-pointer text-sm font-normal">
                 使用Cookie登录（需提前配置cookies.txt）
               </Label>
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center space-x-2">
+                <input
+                  id="remember"
+                  type="checkbox"
+                  className="w-4 h-4 rounded border-gray-300 text-primary focus:ring-primary"
+                  checked={remember}
+                  onChange={(e) => {
+                    setRemember(e.target.checked);
+                    if (!e.target.checked) {
+                      try { window.localStorage.removeItem(REMEMBER_KEY); } catch (err) { /* ignore */ }
+                    }
+                  }}
+                />
+                <Label htmlFor="remember" className="cursor-pointer text-sm font-normal flex items-center">
+                  {remember
+                    ? <ShieldCheck className="w-4 h-4 mr-1 text-green-600" />
+                    : <ShieldAlert className="w-4 h-4 mr-1 text-amber-500" />}
+                  记住密码（下次自动填写）
+                </Label>
+              </div>
+              <p className="text-xs text-muted-foreground pl-6">
+                账号密码会以**明文**保存在本机浏览器里；公共电脑上请不要勾选。
+              </p>
             </div>
             {error && (
               <div className="p-3 bg-destructive/10 text-destructive text-sm rounded-md">

@@ -245,7 +245,9 @@ def _ocr_image_to_text(img_url: str) -> str:
         if "p.ananas.chaoxing.com" in img_url:
             extra_headers["Referer"] = "https://mooc1.chaoxing.com/"
 
-        resp = session.get(img_url, headers=extra_headers or None, timeout=8)
+        # 超星图片 CDN 偶发很慢（实测同一张 829B 的公式图耗时 0.7s ~ 5.4s 不等），
+        # 原来的 8s 在多线程并发下载时经常超时，导致 OCR 直接拿不到图。
+        resp = session.get(img_url, headers=extra_headers or None, timeout=25)
         if resp.status_code != 200:
             logger.debug(f"下载题目图片失败: {img_url} -> {resp.status_code}")
             return ""

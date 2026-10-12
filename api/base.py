@@ -2,6 +2,7 @@
 import functools
 import random
 import re
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,34 @@ from loguru import logger
 from requests import RequestException
 from requests.adapters import HTTPAdapter
 from tqdm import tqdm
+
+
+class _NullProgressBar:
+    """无控制台环境下的 tqdm 替身：吞掉所有调用，不做任何输出。"""
+
+    def __init__(self, *args, **kwargs):
+        self.n = 0
+
+    def update(self, *args, **kwargs):
+        return None
+
+    def refresh(self, *args, **kwargs):
+        return None
+
+    def close(self, *args, **kwargs):
+        return None
+
+    def set_description(self, *args, **kwargs):
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
 
 from api.answer import *
 from api.answer_check import cut
@@ -110,6 +139,62 @@ class StudyResult(Enum):
         return self == StudyResult.SUCCESS
     def is_failure(self):
         return self != StudyResult.SUCCESS
+
+def dedup_course_list(courses: list) -> list:
+    """按 (courseId, clazzId) 去重，保持原顺序。
+
+    ``Chaoxing.get_course_list`` 先取默认文件夹、再逐个课程文件夹**累加**结果，
+    同一门课在多个文件夹出现时就会重复。重复不只是显示问题：任务执行是按课程
+    遍历的，重复会让**同一个任务点被处理两次**。
+
+    注意去重键包含 clazzId —— 同一门课教两个班时 clazzId 不同，属于不同班级，
+    必须保留两条。
+    """
+    seen = set()
+    unique = []
+    for course in courses:
+        key = (str(course.get("courseId")), str(course.get("clazzId")))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(course)
+    dropped = len(courses) - len(unique)
+    if dropped > 0:
+        logger.info("课程列表存在 {} 条重复项，已按 (courseId, clazzId) 去重", dropped)
+    return unique
+
+
+def disambiguate_course_titles(courses: list) -> list:
+    """同名课程加后缀区分，返回**新列表**（每项多一个 ``displayTitle``）。
+
+    同一门课教两个班时 ``clazzId`` 不同、``title`` 相同，用户会看到两个
+    「数据结构与算法」而不知道区别。超星数据里没有班级名，只能用 ``teacher``
+    区分；教师也相同或缺失时退化为序号。
+
+    不改 ``title`` 本身 —— 别处（任务引擎、cpi 匹配等）依赖它。
+    """
+    counts: dict = {}
+    for course in courses:
+        title = course.get("title") or ""
+        counts[title] = counts.get(title, 0) + 1
+    used: dict = {}
+    result = []
+    for course in courses:
+        entry = dict(course)
+        title = course.get("title") or ""
+        if counts.get(title, 1) > 1:
+            teacher = str(course.get("teacher") or "").strip()
+            suffix = teacher or "未标注教师"
+            taken = used.setdefault(title, set())
+            if suffix in taken:
+                suffix = f"{suffix}·{len(taken) + 1}"
+            taken.add(suffix)
+            entry["displayTitle"] = f"{title}（{suffix}）"
+        else:
+            entry["displayTitle"] = title
+        result.append(entry)
+    return result
+
 
 class Chaoxing:
     def __init__(self, account: Account = None, tiku: Tiku = None, **kwargs):
@@ -224,7 +309,8 @@ class Chaoxing:
             }
             _resp = _session.post(_url, data=_data)
             course_list += decode_course_list(_resp.text)
-        return course_list
+        # 多个文件夹累加会产生重复项，必须去重：否则同一任务点会被执行两次
+        return dedup_course_list(course_list)
 
     def get_course_point(self, _courseid, _clazzid, _cpi):
         _session = SessionManager.get_session()
@@ -488,8 +574,14 @@ class Chaoxing:
             except Exception as exc:
                 logger.debug(f"视频进度回调执行失败(初始): {exc}")
 
-        pbar = tqdm(total=duration, initial=play_time, desc=_job["name"],
-                    unit_scale=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}')
+        # 打包为「无控制台」的桌面应用时 sys.stderr 是 None，
+        # tqdm 会因为没有输出流而抛异常。此时用空实现替身，进度仍通过
+        # progress_callback 上报给界面，只是不再画终端进度条。
+        if sys.stderr is None:
+            pbar = _NullProgressBar()
+        else:
+            pbar = tqdm(total=duration, initial=play_time, desc=_job["name"],
+                        unit_scale=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}')
 
         forbidden_retry = 0
         max_forbidden_retry = 2
@@ -501,7 +593,15 @@ class Chaoxing:
             logger.info("任务瞬间完成: {}", _job['name'])
             return StudyResult.SUCCESS
 
+        # 手动停止信号。长视频按真实时间推进，可能跑几个小时，
+        # 必须能在循环内部中途退出，否则「停止」按钮要等到视频播完才生效。
+        _stop_event = getattr(self, "stop_event", None)
+
         while not passed:
+            if _stop_event is not None and _stop_event.is_set():
+                logger.warning("收到停止请求，中断当前视频任务: {}", _job['name'])
+                return StudyResult.ERROR
+
             # Sometimes the last request needs to be sent several times to complete the task
             if play_time - last_log_time >= wait_time or play_time == duration:
 

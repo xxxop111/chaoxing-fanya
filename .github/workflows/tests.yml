@@ -1,0 +1,33 @@
+# 单元测试：只为「平台一改版就会静默失效」的解析层跑测试。
+#
+# 不登录、不联网、不写入任何账号数据，可安全在 CI 上运行。
+# 依赖清单是**实测得出**的：在一个干净 venv 里逐轮补缺失模块，直到
+# `python tests/test_parsers.py` 报 17 passed 为止（见 README「单元测试」）。
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    # 用 Windows：项目本身面向 Windows，且导入链里含平台相关依赖，
+    # 换 Linux 可能因 win32 模块缺失而失败。
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the minimal dependency set for the parser tests
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests beautifulsoup4 lxml loguru openai httpx tqdm urllib3 fonttools pyaes
+
+      - name: Run unit tests
+        run: python tests/test_parsers.py

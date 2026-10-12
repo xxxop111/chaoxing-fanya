@@ -84,8 +84,10 @@ def _apply_ocr_to_title_if_needed(q_info: dict) -> None:
 
     def _repl(match: re.Match) -> str:
         src = match.group(1) or ""
-        # 只处理超星题目图片的域名，避免误伤其他内容
-        if "p.ananas.chaoxing.com" not in src:
+        # 只处理超星题目图片的域名，避免误伤其他内容。
+        # p.cldisk.com 也是超星的公式图床，原先漏掉了：这些公式图会被原样
+        # 以 <img src=...> 交给模型，等于题目缺少关键条件。
+        if not any(d in src for d in ("p.ananas.chaoxing.com", "p.cldisk.com")):
             return match.group(0)
 
         text = ""
@@ -943,6 +945,12 @@ class AI(Tiku):
                         "model": self.model,
                         "messages": messages,
                     }
+                    # DeepSeek V4 默认开启 thinking（effort=high），单道选择题的
+                    # 思维链也会超过 30s 客户端超时，日志表现为
+                    # "The read operation timed out" 后重试并最终失败。
+                    # 只对 DeepSeek 端点关闭，避免把未知字段发给其他兼容服务。
+                    if "deepseek" in (self.endpoint or "").lower():
+                        payload["thinking"] = {"type": "disabled"}
                     response = self._httpx_client.post(
                         self.endpoint,
                         headers=headers,

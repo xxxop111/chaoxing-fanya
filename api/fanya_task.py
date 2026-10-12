@@ -1,0 +1,2180 @@
+# -*- coding: utf-8 -*-
+"""泛雅「任务」模块（任务引擎 / task.chaoxing.com）自动化支持。
+
+本模块补齐了原始项目只处理**章节任务点**的空白：泛雅课程页左侧的「任务」
+标签实际由独立的任务引擎提供服务（task.chaoxing.com），其中包含
+`AI实践`（AI 对话挑战）、`主题讨论` 等需要交互才能完成的任务点。
+
+接口来源（浏览器实测，见 `docs/FANYA_TASK_API.md`）：
+
+课程 → 任务列表
+    POST {task}/userStudyTask/getData                     {page,searchKey,pageSize,courseId,moocClassId}
+    POST {task}/userStudyTask/getTaskSpeedOfProgress      ?encryTaskUserId=
+    POST {task}/userStudyTask/isAllowStudyTask            ?encryTaskUserId=
+任务 → 分组 → 任务点
+    POST {task}/userStudyPlan/getGroupData                ?encryTaskUserId=
+    POST {task}/userStudyPlan/getPlanDataByGroupId        ?encryTaskUserId=&encryGroupId=
+    POST {task}/userStudyPlan/getToStudyUrl               ?encryptPlanId=&encryTaskUserId=&studyJumpType=0&isInterface=false
+    POST {task}/userStudyPlan/scoreRefresh                ?encryTaskUserId=&encryptPlanId=
+
+`planType` 取值（`planTypeName` 由接口直接返回，这里只用于分发）：
+    14 = 主题讨论, 15 = AI实践, 10 = 视频, 11 = 文档, 22 = 音频,
+    4 = 作业, 5 = 考试, 8 = 章节, 9 = 签到, 17 = 自测
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+import urllib.parse
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+
+import requests
+from loguru import logger
+
+from api.base import SessionManager
+from api.config import GlobalConst as gc
+
+TASK_DOMAIN = "https://task.chaoxing.com"
+MOOC_ANS_DOMAIN = "https://mooc2-ans.chaoxing.com"
+GROUPWEB_DOMAIN = "https://groupweb.chaoxing.com"
+MOBILELEARN_DOMAIN = "https://mobilelearn.chaoxing.com"
+
+# 任务点类型 → 适配器名。未列出的类型只做展示，不做自动完成。
+PLAN_TYPE_AI_PRACTICE = 15
+PLAN_TYPE_DISCUSSION = 14
+PLAN_TYPE_VIDEO = 10
+PLAN_TYPE_DOCUMENT = 11
+PLAN_TYPE_AUDIO = 22
+PLAN_TYPE_WORK = 4
+PLAN_TYPE_EXAM = 5
+PLAN_TYPE_CHAPTER = 8
+PLAN_TYPE_SIGN = 9
+PLAN_TYPE_QUIZ = 17
+
+# 只需由「章节学习」既有流程负责的类型，任务模块内不重复处理
+CHAPTER_MANAGED_TYPES = {0, 1, 8, 10, 11, 22}
+
+PLAN_TYPE_LABELS = {
+    0: "课程",
+    1: "知识点",
+    4: "作业",
+    5: "考试",
+    8: "章节",
+    9: "签到",
+    10: "视频",
+    11: "文档",
+    13: "自测",
+    14: "主题讨论",
+    15: "AI实践",
+    17: "自测",
+    22: "音频",
+}
+
+
+class FanyaTaskError(Exception):
+    """任务引擎接口返回异常。"""
+
+
+def _plan_type_label(plan_type: Any, fallback: str = "") -> str:
+    if fallback:
+        return fallback
+    try:
+        return PLAN_TYPE_LABELS.get(int(plan_type), f"未知类型({plan_type})")
+    except (TypeError, ValueError):
+        return fallback or "未知类型"
+
+
+def _resolve_is_finish(raw: dict) -> bool:
+    """判断任务点是否已完成。
+
+    ``isFinish`` 是权威字段；``score`` 会在部分类型（分组任务等）上提前出现，
+    因此只在接口没有返回 ``isFinish`` 时才退化用 ``score`` 判断。
+    """
+    if "isFinish" in raw and raw.get("isFinish") is not None:
+        return bool(raw.get("isFinish"))
+    return raw.get("score") is not None
+
+
+@dataclass
+class FanyaPlanItem:
+    """任务引擎中的一个任务点。"""
+
+    plan_id: int
+    encrypt_plan_id: str
+    name: str
+    plan_type: int
+    plan_type_name: str = ""
+    is_finish: bool = False
+    is_lock: bool = False
+    plan_allow_study: bool = True
+    choose_study: bool = False
+    score: Any = None
+    extra: dict = field(default_factory=dict)
+
+    # 预览阶段填充
+    supported: bool = False
+    handled_by: str = ""
+    skip_reason: str = ""
+
+    @property
+    def type_label(self) -> str:
+        return _plan_type_label(self.plan_type, self.plan_type_name)
+
+
+@dataclass
+class FanyaTask:
+    """任务引擎中的一个任务（课程页「任务」里的一张卡片，例如「第4周课堂任务」）。"""
+
+    task_id: int
+    name: str
+    encry_task_user_id: str
+    progress: float = 0.0
+    allow_study: bool = True
+    allow_study_message: str = ""
+    items: list[FanyaPlanItem] = field(default_factory=list)
+    group_encry_id: str = ""
+    extra: dict = field(default_factory=dict)
+
+    @property
+    def pending_items(self) -> list[FanyaPlanItem]:
+        return [i for i in self.items if not i.is_finish]
+
+    @property
+    def completable_items(self) -> list[FanyaPlanItem]:
+        return [i for i in self.items if not i.is_finish and i.supported]
+
+
+class FanyaTaskClient:
+    """任务引擎客户端。复用项目全局登录会话（cookies 已在其中）。"""
+
+    def __init__(self, session: Optional[requests.Session] = None, timeout: float = 20.0):
+        self.session = session or SessionManager.get_session()
+        self.timeout = timeout
+        self._referer = f"{TASK_DOMAIN}/userStudyTask/index"
+
+    # ------------------------------------------------------------------ 基础请求
+
+    def _post(self, path: str, params: Optional[dict] = None, payload: Optional[dict] = None,
+              timeout: Optional[float] = None, allow_form: bool = False) -> Any:
+        """任务引擎的 POST 接口。默认发 JSON（该站点对表单类型返回 415）。"""
+        url = path if path.startswith("http") else f"{TASK_DOMAIN}{path}"
+        headers = {
+            "Referer": self._referer,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        try:
+            if allow_form:
+                resp = self.session.post(url, params=params, data=payload or {}, headers=headers,
+                                         timeout=timeout or self.timeout)
+            else:
+                resp = self.session.post(url, params=params, json=payload if payload is not None else {},
+                                         headers=headers, timeout=timeout or self.timeout)
+        except requests.RequestException as exc:
+            raise FanyaTaskError(f"请求 {url} 失败: {exc}") from exc
+
+        if resp.status_code != 200:
+            raise FanyaTaskError(f"请求 {url} 返回 HTTP {resp.status_code}")
+
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise FanyaTaskError(f"请求 {url} 返回非 JSON 内容: {resp.text[:200]}") from exc
+
+        if isinstance(data, dict) and data.get("result") is False:
+            raise FanyaTaskError(f"{url} 返回失败: {data.get('message') or data.get('msg')}")
+        return data
+
+    def _get(self, path: str, params: Optional[dict] = None, referer: Optional[str] = None,
+             timeout: Optional[float] = None) -> requests.Response:
+        url = path if path.startswith("http") else f"{TASK_DOMAIN}{path}"
+        headers = {"Referer": referer or self._referer}
+        try:
+            return self.session.get(url, params=params, headers=headers,
+                                    timeout=timeout or self.timeout)
+        except requests.RequestException as exc:
+            raise FanyaTaskError(f"请求 {url} 失败: {exc}") from exc
+
+    # ------------------------------------------------------------------ 任务/任务点
+
+    def get_course_tasks(self, course_id: Any, class_id: Any, page_size: int = 30) -> list[FanyaTask]:
+        """拉取某门课程在任务引擎里的全部任务。"""
+        tasks: list[FanyaTask] = []
+        page = 1
+        while True:
+            data = self._post(
+                "/userStudyTask/getData",
+                payload={
+                    "page": page,
+                    "searchKey": "",
+                    "pageSize": page_size,
+                    "courseId": int(course_id),
+                    "moocClassId": int(class_id),
+                },
+            )
+            batch = data.get("data") or []
+            for raw in batch:
+                tasks.append(
+                    FanyaTask(
+                        task_id=raw.get("taskId"),
+                        name=raw.get("name") or "",
+                        encry_task_user_id=raw.get("encryTaskUserId") or "",
+                        progress=float(raw.get("taskStudyProgress") or 0.0),
+                        extra=raw,
+                    )
+                )
+            if len(batch) < page_size:
+                break
+            page += 1
+            if page > 20:  # 安全上限
+                break
+        return tasks
+
+    def get_task_progress(self, encry_task_user_id: str) -> Optional[float]:
+        try:
+            data = self._post(
+                "/userStudyTask/getTaskSpeedOfProgress",
+                params={"encryTaskUserId": encry_task_user_id},
+            )
+        except FanyaTaskError as exc:
+            logger.debug("读取任务进度失败: {}", exc)
+            return None
+        payload = data.get("data") or {}
+        speed = payload.get("speedOfprogress")
+        try:
+            return float(speed)
+        except (TypeError, ValueError):
+            return None
+
+    def check_allow_study(self, encry_task_user_id: str) -> tuple[bool, str]:
+        """任务是否在可学习时间窗口内。"""
+        try:
+            data = self._post(
+                "/userStudyTask/isAllowStudyTask",
+                params={"encryTaskUserId": encry_task_user_id},
+            )
+        except FanyaTaskError as exc:
+            return False, str(exc)
+        return bool(data.get("result")), data.get("message") or ""
+
+    def load_task_items(self, task: FanyaTask) -> FanyaTask:
+        """填充任务的默认分组与任务点列表。"""
+        groups = self._post(
+            "/userStudyPlan/getGroupData",
+            params={"encryTaskUserId": task.encry_task_user_id},
+        )
+        items: list[FanyaPlanItem] = []
+        for group in groups.get("data") or []:
+            group_info = group.get("taskGroup") or {}
+            encry_group_id = group.get("encryptGroupId") or ""
+            if not encry_group_id:
+                continue
+            if not task.group_encry_id:
+                task.group_encry_id = encry_group_id
+            plans = self._post(
+                "/userStudyPlan/getPlanDataByGroupId",
+                params={
+                    "encryTaskUserId": task.encry_task_user_id,
+                    "encryGroupId": encry_group_id,
+                },
+            )
+            for raw in plans.get("data") or []:
+                plan_type = raw.get("planType")
+                try:
+                    plan_type_int = int(plan_type)
+                except (TypeError, ValueError):
+                    plan_type_int = -1
+                items.append(
+                    FanyaPlanItem(
+                        plan_id=raw.get("planId"),
+                        encrypt_plan_id=raw.get("encryptPlanId") or "",
+                        name=raw.get("name") or "",
+                        plan_type=plan_type_int,
+                        plan_type_name=raw.get("planTypeName") or "",
+                        # 完成判定：isFinish 是权威字段。注意 score 会在「分组任务」
+                        # 等类型上提前出现（组内已有部分得分），因此只有当接口
+                        # 完全没有返回 isFinish 时才退化为「score 非空」。
+                        is_finish=_resolve_is_finish(raw),
+                        is_lock=bool(raw.get("isLock")),
+                        plan_allow_study=bool(raw.get("planAllowStudy", True)),
+                        choose_study=bool(raw.get("chooseStudy")),
+                        score=raw.get("score"),
+                        extra=dict(raw, group_encry_id=encry_group_id),
+                    )
+                )
+            task.extra.setdefault("groups", []).append(
+                {
+                    "group_id": group_info.get("id"),
+                    "group_name": group_info.get("name"),
+                    "encrypt_group_id": encry_group_id,
+                    "group_allow_study": group.get("groupAllowStudy"),
+                    "group_allow_study_condition": group.get("groupAllowStudyCondition"),
+                    "plan_count": len(plans.get("data") or []),
+                }
+            )
+        task.items = items
+        return task
+
+    def get_plan_item(self, encry_task_user_id: str, encry_group_id: str,
+                      plan_id: Any) -> Optional[dict]:
+        """重新读取单个任务点的原始状态（用于完成后校验）。
+
+        ``scoreRefresh`` 在本账号上是空操作（返回 ``PARAMETER_INVALID``），
+        因此校验完成状态只能靠重新拉取分组下的任务点。
+        """
+        if not encry_group_id:
+            return None
+        try:
+            data = self._post(
+                "/userStudyPlan/getPlanDataByGroupId",
+                params={
+                    "encryTaskUserId": encry_task_user_id,
+                    "encryGroupId": encry_group_id,
+                },
+            )
+        except FanyaTaskError as exc:
+            logger.debug("重新读取任务点状态失败: {}", exc)
+            return None
+        for raw in data.get("data") or []:
+            if str(raw.get("planId")) == str(plan_id):
+                return raw
+        return None
+
+    def verify_plan_finished(self, encry_task_user_id: str, encry_group_id: str,
+                             plan_id: Any) -> Optional[bool]:
+        """完成任务点后校验其是否真的变为已完成。返回 ``None`` 表示读取失败。"""
+        raw = self.get_plan_item(encry_task_user_id, encry_group_id, plan_id)
+        if raw is None:
+            return None
+        return _resolve_is_finish(raw)
+
+    def get_study_url(self, encry_task_user_id: str, encrypt_plan_id: str,
+                      study_jump_type: int = 0) -> dict:
+        """取得任务点的学习跳转信息（url / topicId / bbsId / topicUuid ...）。"""
+        data = self._post(
+            "/userStudyPlan/getToStudyUrl",
+            params={
+                "encryptPlanId": encrypt_plan_id,
+                "encryTaskUserId": encry_task_user_id,
+                "studyJumpType": study_jump_type,
+                "isInterface": "false",
+            },
+        )
+        return data.get("data") or {}
+
+    def refresh_plan(self, encry_task_user_id: str, encrypt_plan_id: str) -> dict:
+        """完成任务点后刷新成绩/状态，使任务进度统计同步。"""
+        try:
+            data = self._post(
+                "/userStudyPlan/scoreRefresh",
+                params={
+                    "encryTaskUserId": encry_task_user_id,
+                    "encryptPlanId": encrypt_plan_id,
+                },
+            )
+        except FanyaTaskError as exc:
+            logger.debug("刷新任务点成绩失败: {}", exc)
+            return {}
+        return data.get("data") or {}
+
+    def refresh_task(self, encry_task_user_id: str, timeout: float = 30.0) -> Optional[float]:
+        """重新读取任务进度（完成后调用，用于前端展示）。"""
+        try:
+            data = self._post(
+                "/userStudyTask/getTaskSpeedOfProgress",
+                params={"encryTaskUserId": encry_task_user_id},
+                timeout=timeout,
+            )
+        except FanyaTaskError as exc:
+            logger.debug("刷新任务进度失败: {}", exc)
+            return None
+        payload = data.get("data") or {}
+        try:
+            return float(payload.get("speedOfprogress"))
+        except (TypeError, ValueError):
+            return None
+
+
+# ======================================================================
+# 作答内容生成（复用前端已配置的 OpenAI 兼容接口，默认 DeepSeek）
+# ======================================================================
+
+
+class ContentGenerator:
+    """用配置里已有的 AI 接口生成讨论回复 / 对话内容。
+
+    配置沿用 Web 端「AI 题库」的三项：``endpoint`` / ``key`` / ``model``。
+    未配置时所有生成方法都返回 ``None``，调用方需回退到模板文本。
+    """
+
+    def __init__(self, endpoint: str = "", key: str = "", model: str = "",
+                 timeout: float = 90.0, max_retries: int = 2):
+        self.endpoint = (endpoint or "").strip()
+        self.key = (key or "").strip()
+        self.model = (model or "").strip()
+        self.timeout = timeout
+        self.max_retries = max_retries
+
+    @classmethod
+    def from_tiku_config(cls, tiku_config: Optional[dict]) -> "ContentGenerator":
+        cfg = tiku_config or {}
+        return cls(
+            endpoint=cfg.get("endpoint") or "",
+            key=cfg.get("key") or "",
+            model=cfg.get("model") or "",
+        )
+
+    @property
+    def available(self) -> bool:
+        return bool(self.endpoint and self.key and self.model)
+
+    def _chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int = 900) -> Optional[str]:
+        if not self.available:
+            logger.warning("未配置 AI 接口（endpoint/key/model），无法生成作答内容")
+            return None
+
+        import httpx  # 与 api/answer.py 使用同一依赖
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        # DeepSeek V4 默认开启 thinking，会显著拉长响应时间并可能超出超时
+        if "deepseek" in self.endpoint.lower():
+            payload["thinking"] = {"type": "disabled"}
+
+        headers = {
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+        }
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                with httpx.Client(timeout=self.timeout) as client:
+                    resp = client.post(self.endpoint, headers=headers, json=payload)
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                body = resp.json()
+                choices = body.get("choices") or []
+                if not choices:
+                    raise RuntimeError(f"响应中没有 choices: {str(body)[:200]}")
+                content = (choices[0].get("message") or {}).get("content") or ""
+                content = content.strip()
+                if not content:
+                    raise RuntimeError("模型返回空内容")
+                return content
+            except Exception as exc:  # noqa: BLE001 - 生成失败需回退到模板
+                last_error = exc
+                logger.warning("AI 生成失败（第 {}/{} 次）: {}", attempt, self.max_retries, exc)
+                if attempt < self.max_retries:
+                    time.sleep(1.5 * attempt)
+        logger.error("AI 生成最终失败: {}", last_error)
+        return None
+
+    def generate_discussion_reply(self, topic: str, course_title: str = "",
+                                  min_chars: int = 120) -> Optional[str]:
+        """为主题讨论生成一段可直接发布的回复。"""
+        system = (
+            "你是一名大学课程的学习者，正在参与课程论坛的主题讨论。"
+            "请用中文写一段观点明确、有条理、口语自然的回复。"
+            "要求：紧扣题目，先给出核心观点，再分点展开论述，最后简要总结；"
+            f"长度约 {min_chars}-{max(min_chars * 3, 300)} 字；"
+            "不要出现「作为一个AI」「根据我的训练数据」之类的表述，不要使用 Markdown 标题。"
+        )
+        user = f"课程：{course_title}\n讨论题目：{topic}\n\n请直接给出你的回复正文。"
+        return self._chat(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
+        )
+
+    def generate_text(self, system: str, user: str, temperature: float = 0.2,
+                      max_tokens: int = 4000) -> Optional[str]:
+        """通用文本生成，供需要较长输出（例如整段代码）的适配器使用。
+
+        注意 ``_chat`` 默认 ``max_tokens=900``，对代码来说远远不够 ——
+        实测 900 token 会把一个 115 行的 Java 程序**截断在半句**，
+        服务端判题直接返回「编译错误: reached end of file while parsing」。
+        """
+        return self._chat([{"role": "system", "content": system},
+                           {"role": "user", "content": user}],
+                          temperature=temperature, max_tokens=max_tokens)
+
+    def generate_chat_reply(self, prompt: str, history: Optional[list[dict]] = None,
+                            role_hint: str = "") -> Optional[str]:
+        """为情景对话类 AI 实践生成一句学生发言。"""
+        system = (
+            "你是一名正在完成大学课程「AI实践」任务的学生。"
+            "请用中文自然地回复对方，内容要切题、有思考深度、有自己的判断，"
+            "长度约 100-250 字，不要输出任何解释性旁白或 Markdown 格式。"
+        )
+        if role_hint:
+            system += f"\n任务背景：{role_hint}"
+        messages = [{"role": "system", "content": system}]
+        for turn in history or []:
+            role = turn.get("role")
+            content = turn.get("content") or ""
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": prompt})
+        return self._chat(messages)
+
+
+# ======================================================================
+# 适配器注册表：planType → 支持状态与处理函数
+# ======================================================================
+
+# status 取值：
+#   auto      完全自动，无需用户额外提供材料
+#   partial   可自动但需要用户先提供材料（例如上传型 AI实践的作品文件）
+#   manual    接口层面无法自动完成，需人工/教师操作
+#   pending   尚未实现（协议未知或开发中）
+STATUS_AUTO = "auto"
+STATUS_PARTIAL = "partial"
+STATUS_MANUAL = "manual"
+STATUS_PENDING = "pending"
+
+
+@dataclass
+class AdapterSpec:
+    plan_type: int
+    handler: str
+    status: str
+    label: str
+    note: str = ""
+
+
+ADAPTERS: dict[int, AdapterSpec] = {}
+
+
+def register_adapter(plan_type: int, handler: str, status: str, label: str, note: str = "") -> None:
+    ADAPTERS[plan_type] = AdapterSpec(plan_type, handler, status, label, note)
+
+
+# 由既有「章节学习」流程负责的类型：任务引擎里的同一个任务点，
+# 实际就是章节下的视频/文档/作业，复用 main.process_job 即可。
+register_adapter(PLAN_TYPE_CHAPTER, "chapter", STATUS_AUTO, "章节",
+                 "复用章节任务点流程（externalDataId == mooc1 章节 point id）")
+# 视频：任务引擎自有播放页（videoStudy/learnPage），进度由 videoDataLog 上报。
+# 实测服务端接受一次到位的进度上报，isFinish 立即翻转为 true。
+register_adapter(PLAN_TYPE_VIDEO, "video", STATUS_AUTO, "视频",
+                 "上报 videoDataLog 观看进度（实测一次到位即可完成）")
+register_adapter(PLAN_TYPE_DOCUMENT, "document", STATUS_AUTO, "文档",
+                 "上报文档阅读完成（task.chaoxing.com/documentStudy/readEnd）")
+# 作业：mooc2 课程作业（mooc2/work/task?workId=&enc=），knowledgeid=0 且 jobid 为空，
+# 不在章节任务点里，无法复用 study_work → 需单独的课程作业适配器。
+register_adapter(PLAN_TYPE_WORK, "course_work", STATUS_AUTO, "作业",
+                 "mooc2 课程作业：题库作答后提交（复用题库 submit/cover_rate 策略）")
+register_adapter(1, "chapter", STATUS_AUTO, "知识点", "复用章节任务点流程")
+# 音频：与视频同构（audioStudy/learnPage + audioDataLog）。本账号没有音频任务点，
+# 因此无法真机验证；处理器会明确报错（而不是静默失败），所以仍然标记为可自动完成，
+# 但备注如实说明「未验证」。
+register_adapter(PLAN_TYPE_AUDIO, "audio", STATUS_AUTO, "音频",
+                 "与视频同构实现（audioStudy/audioDataLog），本账号无样本，未验证")
+
+register_adapter(PLAN_TYPE_DISCUSSION, "discussion", STATUS_AUTO, "主题讨论", "AI 生成回复并提交")
+# AI实践 按子模式分别处理（代码实践 / 思维阶梯 / 情景对话 / 上传作品），
+# 这里的类型级注册只是兜底：真正生效的是 _ai_practice_handler() + resolve_item()。
+register_adapter(PLAN_TYPE_AI_PRACTICE, "ai_practice", STATUS_PARTIAL, "AI实践",
+                 "未能识别子模式（多为学习窗口未开放）；已实现 代码实践 与 思维阶梯")
+register_adapter(PLAN_TYPE_QUIZ, "quiz", STATUS_PARTIAL, "自测",
+                 "可用题库作答；默认只暂存不交卷（需开启「考试交卷」）；"
+                 "过期的无法补完成，本账号缺未过期样本故未验证")
+register_adapter(PLAN_TYPE_EXAM, "quiz", STATUS_PARTIAL, "测验",
+                 "可用题库作答；默认只暂存不交卷（需开启「考试交卷」）；未验证")
+# 问卷实际走超星 OA 表单（智慧办公），提交端点需要管理员侧登录，无法自动化
+register_adapter(6, "manual", STATUS_MANUAL, "问卷", "需人工在超星 OA 表单中填写")
+# 分组任务：本账号已在组内，任意成员即可提交（onlyLeaderSubmit=0）。
+# 但提交有两个坑：(1) 提交会**覆盖全组已有内容**（实测两个小组都已提交过，
+# 编辑次数 9 / 14）；(2) 完成判据是总成绩 ≥60，提交后任务点可能仍为未完成。
+# 因此默认只生成内容不提交，且默认拒绝覆盖已有内容。
+register_adapter(18, "group_task", STATUS_PARTIAL, "分组任务",
+                 "可生成小组答案；默认不提交，且默认拒绝覆盖小组已有内容；"
+                 "完成取决于评分 ≥60，提交后可能仍未完成")
+register_adapter(20, "manual", STATUS_MANUAL, "线下课堂", "由教师在课堂上记录，无法自动完成")
+# AI课堂为第三方对接（棱镜），客户端不上报泛雅，无确定性完成接口
+register_adapter(10042, "manual", STATUS_MANUAL, "AI课堂", "第三方课堂，需人工进入完成")
+
+
+def adapter_for(plan_type: int) -> AdapterSpec:
+    return ADAPTERS.get(
+        plan_type,
+        AdapterSpec(plan_type, "unknown", STATUS_PENDING, f"未知类型({plan_type})", "尚未支持"),
+    )
+
+
+def effective_status(spec: AdapterSpec) -> tuple[str, str]:
+    """结合「处理器是否真的实现了」给出最终状态。
+
+    注册表里声明的状态是**目标**状态；如果对应处理器还没写，
+    就不能对外宣称「可自动完成」，否则执行时只会得到一堆报错。
+    这里统一降级为 ``pending``，保证界面与命令行输出始终诚实。
+    """
+    if spec.status in (STATUS_AUTO, STATUS_PARTIAL) and spec.handler not in HANDLERS:
+        return STATUS_PENDING, f"{spec.label}：自动完成处理器尚未实现"
+    return spec.status, spec.note
+
+
+def _ai_practice_handler(ai_mode: dict) -> str:
+    """AI实践每个子模式对应不同的处理器。"""
+    from api.fanya_ai import (MODE_CHAT, MODE_CODE, MODE_LADDER,
+                          MODE_STORY, MODE_UPLOAD)
+
+    mode = ai_mode.get("mode")
+    if mode == MODE_CODE:
+        return "ai_code"
+    if mode == MODE_LADDER:
+        return "ai_ladder"
+    if mode == MODE_CHAT:
+        return "ai_chat"
+    if mode == MODE_STORY:
+        # AI剧情：对话部分复用 chat 链路；最后的「上传报告」节点尚未自动化
+        return "ai_story"
+    if mode == MODE_UPLOAD:
+        return "ai_upload"
+    return "ai_practice"
+
+
+def resolve_item(item: FanyaPlanItem) -> tuple[str, str, str]:
+    """给出任务点最终生效的 ``(status, handler, note)``。
+
+    AI实践必须**按子模式**细分：upload 需人工、chat 未实现、code 已实测可自动、
+    ladder 已实现但未验证。注册表里 planType 15 只有一个笼统条目，因此这里单独处理。
+    """
+    if item.plan_type == PLAN_TYPE_AI_PRACTICE:
+        ai_mode = item.extra.get("ai_mode")
+        if not ai_mode:
+            return (STATUS_PENDING, "ai_practice",
+                    "AI实践：未能识别子模式（学习窗口可能已关闭）")
+        status, note = _ai_practice_status(ai_mode)
+        handler = _ai_practice_handler(ai_mode)
+        if status in (STATUS_AUTO, STATUS_PARTIAL) and handler not in HANDLERS:
+            return STATUS_PENDING, handler, f"{note}（处理器尚未实现）"
+        return status, handler, note
+    spec = adapter_for(item.plan_type)
+    status, note = effective_status(spec)
+    return status, spec.handler, note
+
+
+def _ai_practice_status(ai_mode: dict) -> tuple[str, str]:
+    """根据 AI实践子模式给出支持状态与说明。"""
+    from api.fanya_ai import (
+        MODE_CHAT, MODE_CODE, MODE_LADDER, MODE_STORY, MODE_UPLOAD, format_rules,
+    )
+
+    mode = ai_mode.get("mode")
+    rules_text = format_rules(ai_mode.get("rules") or [])
+    if mode == MODE_UPLOAD:
+        # 上传作品型：已实现「生成作品 → 上传网盘 → 挂附件 → 交卷 → AI评分」。
+        # 但有些题目原文写着「禁止直接大段复制 AI 输出，用自己的话整理」，
+        # 这类默认只生成草稿（不提交），需显式开启 upload_ai_text 覆盖。
+        note = ("上传作品型：已实现（生成作品 → 上传网盘 → 挂附件 → 交卷 → AI评分）；"
+                "交卷前会回读校验附件确实挂上，挂不上则中止（不会交空记录）；"
+                "题目若声明「禁止复制 AI 输出」则默认只出草稿，需勾选覆盖")
+        if rules_text:
+            note += f"｜要求：{rules_text}"
+        return STATUS_PARTIAL, note
+    if mode == MODE_CHAT:
+        return STATUS_PARTIAL, ("情景对话型：已实现（生成场景 → 多轮对话 → 交卷 → 评估出分）；"
+                                "本账号无未过期的该模式样本，未真机验证")
+    if mode == MODE_LADDER:
+        return STATUS_AUTO, ("思维阶梯型：已真机验证（2026-10-12 于「静电场环路定理闯关」"
+                             "完整跑通：拆题 → 8 轮逐题作答（含多选）→ 交卷 → 结题报告出分，"
+                             "得分 85，平台判定任务点完成）")
+    # 代码实践型（type=4）：已真机验证 —— 一次到位提交并评估，得分 ≥60 即完成
+    if mode == MODE_CODE:
+        return STATUS_AUTO, ("代码实践型：AI 生成代码 → 自测运行校验 → 建卷交卷 → 评估出分"
+                             "（已实测完成，得分 76）")
+    if mode == MODE_STORY:
+        # 真机结论（2026-10-12）：发学生消息 ✅、章节交卷 ✅（status 0→1），
+        # 但**评分拿不到** —— `evaluate/stream` 返回「会话不存在」，因为评分绑定在
+        # WebSocket 实时会话上（`conversationId` 纯 HTTP 路径下始终为空）。
+        # 故分数恒为 0，据实标注为「需人工」，不做夸大。
+        return STATUS_MANUAL, ("AI剧情型：协议已完整逆向（章节结构 / 参数 / 37 个端点，"
+                               "见协议文档）；发消息与交卷实测可用，但评分需 WebSocket "
+                               "实时会话（未实现），拿不到分数，需手动完成")
+    return STATUS_PENDING, f"{ai_mode.get('modeLabel') or '未知模式'}：暂未支持自动完成"
+
+
+def _describe_quiz_items(client: FanyaTaskClient, task: FanyaTask, redo: bool = False) -> None:
+    """为未完成的自测/测验任务点补充考试窗口与过期状态（只读）。
+
+    过期的自测**无法通过任何接口补完成**（`scoreRefresh` 只是同步已有成绩），
+    因此必须在界面上直接说清楚，避免用户反复尝试。
+    """
+    from api import fanya_quiz
+
+    for item in task.items:
+        # 注意：自测/测验**始终**跳过已完成项 —— 它们不支持自动重做
+        # （作业/测验的重做是平台 UI 流程），而且在重做模式下逐个去识别已完成的
+        # 试卷非常慢（每项多次请求、每次 30s 超时），会拖到用户以为卡死。
+        if item.plan_type not in (PLAN_TYPE_QUIZ, PLAN_TYPE_EXAM) or item.is_finish:
+            continue
+        if item.extra.get("quiz_info"):
+            continue
+        if item.plan_type == PLAN_TYPE_QUIZ:
+            info = fanya_quiz.describe_self_test(
+                client, task.encry_task_user_id, item.encrypt_plan_id)
+        else:
+            try:
+                study_url = client.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
+            except FanyaTaskError as exc:
+                logger.debug("测验任务点暂不可进入（{}）：{}", item.name, exc)
+                continue
+            info = fanya_quiz.describe_exam(client, study_url)
+        if info:
+            item.extra["quiz_info"] = info
+            logger.info("自测/测验「{}」：{}", item.name[:30], info.get("summary") or "已识别")
+
+
+def _describe_ai_practice_items(client: FanyaTaskClient, course: dict, task: FanyaTask, redo: bool = False) -> None:
+    """为未完成的 AI实践任务点补充子模式信息（只读）。"""
+    from api import fanya_ai
+
+    for item in task.items:
+        if item.plan_type != PLAN_TYPE_AI_PRACTICE or (item.is_finish and not redo):
+            continue
+        if item.extra.get("ai_mode"):
+            continue
+        try:
+            study_url = client.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
+        except FanyaTaskError as exc:
+            # 最常见的原因是该任务点自己的学习窗口还没开 / 已关。
+            # 记下来，让界面说明「读不到模式」的原因，而不是含糊地说「未支持」。
+            item.extra["ai_mode_error"] = _window_reason(str(exc))
+            logger.debug("AI实践任务点暂不可进入（{}）：{}", item.name, exc)
+            continue
+        described = fanya_ai.describe(client.session, course, study_url)
+        if described:
+            item.extra["ai_mode"] = described
+            logger.info("AI实践「{}」子模式：{}", item.name[:30], described.get("modeLabel"))
+        else:
+            item.extra["ai_mode_error"] = "未能读取作答模式（load-data 未返回或结构变化）"
+
+
+def _window_reason(message: str) -> str:
+    """把服务端的窗口报错整理成给用户看的一句话。"""
+    if "不在学习时间内" in message:
+        return "学习窗口未开放（服务端拒绝进入），等窗口开启后再盘点即可读到模式"
+    return f"暂不可进入该任务点：{message[:60]}"
+
+
+def _format_progress(value: Any) -> str:
+    """把任务进度格式化成不会误导人的字符串。
+
+    多数任务返回 0~1 的比例，但实测个别任务（COM0018A 的项目1/项目2）返回的是
+    8.33 这样的**百分数**。不能一律按比例渲染成「833%」，所以超出 [0,1] 时
+    直接显示原始值并标注。
+    """
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if 0.0 <= num <= 1.0:
+        return f"{num:.1%}"
+    return f"{num:g}（服务端原始值，疑似百分数）"
+
+
+def classify_items(task: FanyaTask) -> None:
+    """为任务点标注支持状态，供执行器与预览界面共用。"""
+    for item in task.items:
+        status, handler, note = resolve_item(item)
+        item.supported = status in (STATUS_AUTO, STATUS_PARTIAL)
+        item.handled_by = handler
+        if item.is_finish:
+            item.skip_reason = "已完成"
+        elif item.is_lock:
+            item.skip_reason = "未解锁（前置任务点未完成）"
+        elif item.choose_study:
+            item.skip_reason = "选学任务点"
+        elif not item.plan_allow_study:
+            item.skip_reason = "当前不允许学习"
+        elif status == STATUS_MANUAL:
+            item.skip_reason = note or "需人工完成"
+        elif status == STATUS_PENDING:
+            item.skip_reason = note or "暂未支持自动完成"
+        else:
+            item.skip_reason = note
+
+
+# ======================================================================
+# 预览：列出所有课程 / 任务 / 任务点及其可自动化判定
+# ======================================================================
+
+
+def build_task_preview(chaoxing: Any, courses: list[dict],
+                       client: Optional[FanyaTaskClient] = None,
+                       on_progress: Optional[Callable[[dict], None]] = None,
+                       redo: bool = False) -> dict:
+    """遍历给定课程，返回「任务」模块的完整清单与可自动化判定。
+
+    该函数只做 GET/POST 读取，不会修改任何学习记录，可安全用于前端预览。
+    """
+    client = client or FanyaTaskClient()
+    result: dict = {"courses": [], "summary": {
+        "courseCount": 0, "taskCount": 0, "pendingCount": 0,
+        "completableCount": 0, "manualCount": 0, "unsupportedCount": 0,
+    }}
+
+    def emit(**payload) -> None:
+        if callable(on_progress):
+            try:
+                on_progress(payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("预览进度回调失败: {}", exc)
+
+    for index, course in enumerate(courses, start=1):
+        emit(type="course_start", index=index, total=len(courses),
+             courseId=str(course.get("courseId")), title=course.get("title") or "")
+        course_entry = {
+            "courseId": str(course.get("courseId")),
+            "classId": str(course.get("clazzId")),
+            "cpi": str(course.get("cpi") or ""),
+            "title": course.get("title") or "",
+            "hasTaskEngine": False,
+            "tasks": [],
+            "error": "",
+        }
+        try:
+            tasks = client.get_course_tasks(course.get("courseId"), course.get("clazzId"))
+        except FanyaTaskError as exc:
+            course_entry["error"] = str(exc)
+            logger.warning("课程「{}」任务列表读取失败: {}", course_entry["title"], exc)
+            result["courses"].append(course_entry)
+            emit(type="course_done", index=index, total=len(courses),
+                 courseId=course_entry["courseId"], title=course_entry["title"],
+                 taskCount=0)
+            continue
+
+        if not tasks:
+            logger.info("课程「{}」没有任务引擎任务", course_entry["title"])
+            result["courses"].append(course_entry)
+            emit(type="course_done", index=index, total=len(courses),
+                 courseId=course_entry["courseId"], title=course_entry["title"],
+                 taskCount=0)
+            continue
+
+        course_entry["hasTaskEngine"] = True
+        result["summary"]["courseCount"] += 1
+
+        for task in tasks:
+            try:
+                client.load_task_items(task)
+            except FanyaTaskError as exc:
+                logger.warning("任务「{}」任务点读取失败: {}", task.name, exc)
+                continue
+            # AI实践 有四种子模式（情景对话 / 上传作品 / 思维阶梯 / 代码实践），
+            # 完成方式不同；自测/测验要识别考试窗口。**必须在 classify_items 之前**
+            # 识别：resolve_item() 依赖 item.extra["ai_mode"] 才能选出模式专属处理器，
+            # 顺序反了会让 AI实践 被判成「不支持」，任务级 completableCount 会少算。
+            _describe_ai_practice_items(client, course, task, redo=redo)
+            _describe_quiz_items(client, task, redo=redo)
+            classify_items(task)
+            allow, allow_msg = client.check_allow_study(task.encry_task_user_id)
+            task.allow_study = allow
+            task.allow_study_message = allow_msg
+
+            items = []
+            for item in task.items:
+                status, handler, note = resolve_item(item)
+                ai_mode = item.extra.get("ai_mode")
+                if not ai_mode and item.extra.get("ai_mode_error"):
+                    # 读不到模式时说明真实原因（多为学习窗口未开放）
+                    note = item.extra["ai_mode_error"]
+                quiz_info = item.extra.get("quiz_info")
+                if quiz_info and quiz_info.get("summary"):
+                    note = quiz_info["summary"]
+                    if quiz_info.get("expired"):
+                        status = STATUS_MANUAL
+                items.append({
+                    "planId": item.plan_id,
+                    "name": item.name,
+                    "planType": item.plan_type,
+                    "typeLabel": item.type_label,
+                    "isFinish": item.is_finish,
+                    "isLock": item.is_lock,
+                    "chooseStudy": item.choose_study,
+                    "status": status,
+                    "handler": handler,
+                    "supported": status in (STATUS_AUTO, STATUS_PARTIAL),
+                    "note": note,
+                    "skipReason": item.skip_reason,
+                    "aiMode": ai_mode.get("mode") if ai_mode else None,
+                    "aiModeLabel": ai_mode.get("modeLabel") if ai_mode else "",
+                    "aiRules": ai_mode.get("rules") if ai_mode else [],
+                    "entryUrl": ai_mode.get("entryUrl") if ai_mode else "",
+                    "quizExpired": bool(quiz_info.get("expired")) if quiz_info else False,
+                    "quizWindow": (quiz_info.get("window") or "") if quiz_info else "",
+                })
+                if not item.is_finish:
+                    result["summary"]["pendingCount"] += 1
+                    if status in (STATUS_AUTO, STATUS_PARTIAL):
+                        result["summary"]["completableCount"] += 1
+                    elif status == STATUS_MANUAL:
+                        result["summary"]["manualCount"] += 1
+                    else:
+                        result["summary"]["unsupportedCount"] += 1
+
+            result["summary"]["taskCount"] += 1
+            course_entry["tasks"].append({
+                "taskId": task.task_id,
+                "name": task.name,
+                "progress": task.progress,
+                "allowStudy": task.allow_study,
+                "allowStudyMessage": task.allow_study_message,
+                "encryTaskUserId": task.encry_task_user_id,
+                "pendingCount": len(task.pending_items),
+                "completableCount": len(task.completable_items),
+                "groups": task.extra.get("groups") or [],
+                "items": items,
+            })
+
+        result["courses"].append(course_entry)
+        emit(type="course_done", index=index, total=len(courses),
+             courseId=course_entry["courseId"], title=course_entry["title"],
+             taskCount=len(course_entry["tasks"]))
+
+    return result
+
+
+def collect_plan_items(tasks: list[FanyaTask]) -> list[FanyaPlanItem]:
+    """把多个任务的任务点摊平，便于执行器按顺序处理。"""
+    items: list[FanyaPlanItem] = []
+    for task in tasks:
+        items.extend(task.items)
+    return items
+
+
+# ======================================================================
+# 执行器
+# ======================================================================
+
+
+@dataclass
+class CompletionContext:
+    """单个任务点的执行上下文，传给各 handler。"""
+
+    chaoxing: Any
+    client: FanyaTaskClient
+    course: dict
+    task: FanyaTask
+    item: FanyaPlanItem
+    generator: ContentGenerator
+    study_url: dict
+    options: dict
+    # 是否要求「生成后暂停、逐条审批」：为 True 时，处理器只准备内容，
+    # 把「预览 + 提交回调」登记到 approvals，绝不真实提交。
+    require_approval: bool = True
+    approvals: Any = None
+
+    def log(self, message: str) -> None:
+        logger.info(message)
+
+    @property
+    def label(self) -> str:
+        return (f"{self.course.get('title') or ''} / {self.task.name} / {self.item.name}")
+
+    def register_approval(self, kind: str, preview: str,
+                          submit_fn: Optional[Callable[[], tuple[bool, str]]] = None,
+                          extra: Optional[dict] = None) -> Optional[str]:
+        """登记一个待审批项，返回其 id（未启用审批时返回 ``None``）。"""
+        if not self.require_approval or self.approvals is None:
+            return None
+        entry = self.approvals.add(kind=kind, label=self.label, preview=preview,
+                                   submit_fn=submit_fn, extra=extra or {})
+        return entry.id
+
+
+class FanyaTaskRunner:
+    """按任务点逐个执行自动完成，并把进度通过回调上报给前端。"""
+
+    def __init__(self, chaoxing: Any, client: Optional[FanyaTaskClient] = None,
+                 generator: Optional[ContentGenerator] = None,
+                 options: Optional[dict] = None,
+                 on_event: Optional[Callable[[dict], None]] = None):
+        self.chaoxing = chaoxing
+        self.client = client or FanyaTaskClient()
+        self.generator = generator or ContentGenerator()
+        self.options = options or {}
+        self.on_event = on_event
+        self.results: list[dict] = []
+        self.stop_event = self.options.get("stop_event")
+        # 「重做模式」：允许选中**已完成**的任务点再答一次
+        # （平台按 remainScoreCount 允许重练；作业/测验的重做是平台自己的 UI 流程，
+        #   未探明请求格式，因此这些类型在重做模式下会明确拒绝而不是硬写）
+        self.redo = bool(self.options.get("redo"))
+        if self.redo:
+            # AI实践 的重做＝先结束旧作答记录再建新卷（平台没有放弃接口）
+            self.options = {**self.options, "ai_redo": True}
+        # 「生成后暂停、逐条审批」：默认开启（options.require_approval=False 才关闭）
+        self.require_approval = bool(self.options.get("require_approval", True))
+        self.approvals = self.options.get("approvals")
+        if self.approvals is None:
+            from api.fanya_approval import STORE
+            self.approvals = STORE
+
+    # ---------------------------------------------------------------- 事件
+
+    def _emit(self, **payload) -> None:
+        if callable(self.on_event):
+            try:
+                self.on_event(payload)
+            except Exception as exc:  # noqa: BLE001 - 回调失败不影响主流程
+                logger.debug("上报任务完成事件失败: {}", exc)
+
+    def _stop_requested(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
+
+    # ---------------------------------------------------------------- 主流程
+
+    def run_courses(self, courses: list[dict], tasks_by_course: Optional[dict] = None) -> list[dict]:
+        """对每门课程下的每个任务执行自动完成。
+
+        ``tasks_by_course`` 可选，形如 ``{courseId: [taskId, ...]}``，
+        用于只处理用户勾选的任务。未提供时处理所有任务。
+        """
+        course_index = 0
+        for course in courses:
+            if self._stop_requested():
+                break
+            course_index += 1
+            course_id = str(course.get("courseId"))
+            title = course.get("title") or course_id
+            self._emit(type="course_start", courseId=course_id, title=title,
+                       index=course_index, total=len(courses))
+
+            try:
+                tasks = self.client.get_course_tasks(course.get("courseId"), course.get("clazzId"))
+            except FanyaTaskError as exc:
+                logger.error("课程「{}」任务读取失败: {}", title, exc)
+                self._emit(type="course_error", courseId=course_id, title=title, error=str(exc))
+                continue
+
+            wanted = (tasks_by_course or {}).get(course_id)
+            if wanted:
+                wanted_set = {int(x) for x in wanted}
+                tasks = [t for t in tasks if int(t.task_id) in wanted_set]
+
+            for task in tasks:
+                if self._stop_requested():
+                    break
+                self.run_task(course, task)
+
+            self._emit(type="course_done", courseId=course_id, title=title)
+        return self.results
+
+    def run_task(self, course: dict, task: FanyaTask, only_plan_ids: Optional[list[int]] = None) -> list[dict]:
+        """执行单个任务下的所有可自动化任务点。"""
+        try:
+            self.client.load_task_items(task)
+        except FanyaTaskError as exc:
+            logger.error("任务「{}」任务点读取失败: {}", task.name, exc)
+            return self.results
+
+        # 必须先识别 AI实践 子模式 / 自测状态，再 classify_items：
+        # resolve_item() 依赖 item.extra["ai_mode"] 才能选出模式专属处理器
+        # （代码实践 / 思维阶梯）。顺序反了的话 AI实践 会被判成「不支持」而被跳过
+        # —— 预览说可勾选、执行却跳过。
+        _describe_ai_practice_items(self.client, course, task, redo=self.redo)
+        _describe_quiz_items(self.client, task, redo=self.redo)
+        classify_items(task)
+        allow, allow_msg = self.client.check_allow_study(task.encry_task_user_id)
+        task.allow_study = allow
+        task.allow_study_message = allow_msg
+
+        wanted = {int(x) for x in only_plan_ids} if only_plan_ids else None
+        candidates = []
+        for item in task.items:
+            if wanted is not None and int(item.plan_id) not in wanted:
+                continue
+            if item.is_finish and not self.redo:
+                continue
+            candidates.append(item)
+
+        logger.info(
+            "任务「{}」：共 {} 个任务点，待完成 {} 个，其中可自动化 {} 个",
+            task.name, len(task.items), len(candidates),
+            len([i for i in candidates if i.supported]),
+        )
+
+        if not task.allow_study:
+            # 服务端会直接拒绝未到学习时间的任务点（getToStudyUrl 返回
+            # “任务学习时间：… 当前不在学习时间内”），因此这里只做记录，
+            # 不去逐条尝试，避免制造一堆必然失败的请求。
+            reason = task.allow_study_message or "当前不在任务学习时间内"
+            logger.warning("任务「{}」暂不可学习：{}", task.name, reason)
+            for item in candidates:
+                result = {
+                    "courseId": str(course.get("courseId")),
+                    "courseTitle": course.get("title") or "",
+                    "taskId": task.task_id,
+                    "taskName": task.name,
+                    "planId": item.plan_id,
+                    "name": item.name,
+                    "typeLabel": item.type_label,
+                    "planType": item.plan_type,
+                    "handler": adapter_for(item.plan_type).handler,
+                    "ok": False,
+                    "skipped": True,
+                    "message": f"未到学习时间：{reason}",
+                }
+                self.results.append(result)
+                self._emit(type="item_done", **result)
+            self._emit(type="task_done", courseId=str(course.get("courseId")),
+                       taskId=task.task_id, name=task.name, progress=task.progress)
+            return self.results
+
+        self._emit(type="task_start", courseId=str(course.get("courseId")),
+                   taskId=task.task_id, name=task.name, pending=len(candidates))
+
+        for item in candidates:
+            if self._stop_requested():
+                logger.warning("已请求停止，剩余任务点跳过")
+                break
+            self.run_item(course, task, item)
+
+        progress = self.client.refresh_task(task.encry_task_user_id)
+        self._emit(type="task_done", courseId=str(course.get("courseId")),
+                   taskId=task.task_id, name=task.name, progress=progress)
+        if progress is not None:
+            logger.info("任务「{}」进度已更新为 {}", task.name, _format_progress(progress))
+        return self.results
+
+    def run_item(self, course: dict, task: FanyaTask, item: FanyaPlanItem) -> dict:
+        """执行一个任务点，返回结果字典。"""
+        _, handler_name, _ = resolve_item(item)
+        # 重做闸门：只有 AI实践 有安全的自动重做路径（平台按 remainScoreCount
+        # 允许重练）。作业/测验的「重做」是平台自己的 UI 流程，请求格式未探明，
+        # 其余类型（视频/文档/章节/音频/讨论/分组）重做没有意义，一律拒绝。
+        label = f"[{item.type_label}] {item.name}"
+        logger.info("开始处理任务点: {}", label)
+
+        result = {
+            "courseId": str(course.get("courseId")),
+            "courseTitle": course.get("title") or "",
+            "taskId": task.task_id,
+            "taskName": task.name,
+            "planId": item.plan_id,
+            "name": item.name,
+            "typeLabel": item.type_label,
+            "planType": item.plan_type,
+            "handler": handler_name,
+            "ok": False,
+            "skipped": False,
+            "verified": None,
+            "message": "",
+        }
+        self._emit(type="item_start", **{k: result[k] for k in
+                                        ("courseId", "courseTitle", "taskId", "taskName",
+                                         "planId", "name", "typeLabel")})
+
+        # 重做闸门：只有 AI实践 有安全的自动重做路径（平台按 remainScoreCount 允许
+        # 重练，做法是结束旧作答记录再建新卷）。作业/测验的「重做」是平台自己的 UI
+        # 流程，请求格式未探明；其余类型（视频/文档/章节/音频/讨论/分组）重做没有
+        # 意义 —— 这些一律拒绝，绝不硬写。
+        if self.redo and item.is_finish and item.plan_type != PLAN_TYPE_AI_PRACTICE:
+            result["skipped"] = True
+            result["message"] = ("该类型不支持自动重做：请在课程页面用「重做 / 重新练习」"
+                                 "手动操作（自动重做目前仅支持 AI实践）")
+            logger.warning("跳过重做 {}：{}", label, result["message"])
+            self.results.append(result)
+            self._emit(type="item_done", **result)
+            return result
+
+        if not item.supported:
+            result["skipped"] = True
+            result["message"] = item.skip_reason or "该类型暂不支持自动完成"
+            logger.warning("跳过任务点 {}：{}", label, result["message"])
+            self.results.append(result)
+            self._emit(type="item_done", **result)
+            return result
+
+        handler = HANDLERS.get(handler_name)
+        if handler is None:
+            result["skipped"] = True
+            result["message"] = f"处理器 {handler_name} 尚未实现"
+            logger.warning("跳过任务点 {}：{}", label, result["message"])
+            self.results.append(result)
+            self._emit(type="item_done", **result)
+            return result
+
+        try:
+            study_url = self.client.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
+        except FanyaTaskError as exc:
+            # 常见原因：该任务点有自己的有效期，服务端会返回
+            # “任务点学习时间：… 当前不在学习时间内”。这种情况直接记为跳过。
+            result["skipped"] = True
+            result["message"] = f"无法进入任务点：{exc}"
+            logger.warning("跳过任务点 {}：{}", label, result["message"])
+            self.results.append(result)
+            self._emit(type="item_done", **result)
+            return result
+
+        ctx = CompletionContext(
+            chaoxing=self.chaoxing,
+            client=self.client,
+            course=course,
+            task=task,
+            item=item,
+            generator=self.generator,
+            study_url=study_url or {},
+            options=self.options,
+            require_approval=self.require_approval,
+            approvals=self.approvals,
+        )
+
+        try:
+            ok, message = handler(ctx)
+            result["ok"] = bool(ok)
+            result["message"] = message or ("完成" if ok else "未成功")
+        except Exception as exc:  # noqa: BLE001 - 单个任务点失败不应中断整门课程
+            logger.error("任务点 {} 处理异常: {}", label, exc)
+            logger.debug("异常详情", exc_info=True)
+            result["message"] = f"异常: {type(exc).__name__}: {exc}"
+
+        if result["ok"]:
+            logger.info("任务点完成: {} — {}", label, result["message"])
+            # scoreRefresh 在本账号上是空操作，因此改为重新拉取分组下的任务点来校验
+            group_id = item.extra.get("group_encry_id") or task.group_encry_id
+            verified = self.client.verify_plan_finished(
+                task.encry_task_user_id, group_id, item.plan_id)
+            result["verified"] = verified
+            if verified is True:
+                result["message"] = f"{result['message']}（任务点状态已确认完成）"
+            elif verified is False:
+                result["message"] = (
+                    f"{result['message']}（注意：任务点状态仍为未完成，"
+                    "可能需要等待老师评分或平台同步）"
+                )
+                logger.warning("任务点 {} 提交成功但状态仍为未完成", label)
+            else:
+                logger.debug("未能校验任务点 {} 的完成状态", label)
+        else:
+            logger.warning("任务点未完成: {} — {}", label, result["message"])
+
+        self.results.append(result)
+        self._emit(type="item_done", **result)
+        return result
+
+
+# handler 注册表在文件末尾由各适配器模块填充
+HANDLERS: dict[str, Callable[[CompletionContext], tuple[bool, str]]] = {}
+
+
+def register_handler(name: str):
+    def decorator(func):
+        HANDLERS[name] = func
+        return func
+    return decorator
+
+
+def _session_puid(session: requests.Session) -> str:
+    """当前登录用户的 puid（讨论区回复比对的正是这个值，而非 uid）。"""
+    for key in ("_uid", "UID"):
+        value = session.cookies.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+# ----------------------------------------------------------------------
+# 适配器：主题讨论（planType 14）
+# ----------------------------------------------------------------------
+
+
+@register_handler("discussion")
+def handle_discussion(ctx: CompletionContext) -> tuple[bool, str]:
+    """为主题讨论任务点生成一段回复并提交。"""
+    from api import fanya_discuss as fd
+
+    session = ctx.client.session
+    class_id = str(ctx.course.get("clazzId") or ctx.course.get("classId") or "")
+    course_id = str(ctx.course.get("courseId") or "")
+
+    topic = fd.parse_topic_from_study_url(ctx.study_url, class_id=class_id)
+    if not topic["bbsId"] or not topic["topicUuid"]:
+        return False, "未能从任务点解析出 bbsid / topicUuid，无法定位讨论帖"
+
+    puid = _session_puid(session)
+    if not puid:
+        return False, "未能取得当前用户 puid，无法判断是否已回复"
+
+    try:
+        replied, floor, _ = fd.has_replied(session, topic["bbsId"], topic["topicUuid"],
+                                           topic["classId"] or class_id, puid)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("查询讨论回复列表失败: {}", exc)
+        replied, floor = False, None
+
+    if replied:
+        return True, f"该话题下已有本账号回复（{floor}），无需重复提交"
+
+    question = ctx.item.name or topic.get("title") or ""
+    text = None
+    if ctx.generator.available:
+        text = ctx.generator.generate_discussion_reply(
+            question, course_title=ctx.course.get("title") or "")
+    if not text:
+        logger.warning("使用模板文本作为讨论回复")
+        text = fd.fallback_reply_text(question, ctx.course.get("title") or "")
+    logger.info("拟发布回复（{} 字）：{}", len(text), text[:80].replace("\n", " "))
+
+    topic_class = topic["classId"] or class_id
+
+    def _publish() -> tuple[bool, str]:
+        """真正发布回复（仅在审批通过或未启用审批时执行）。"""
+        try:
+            token = fd.scrape_url_token(session, topic["bbsId"], topic["topicUuid"],
+                                        topic_class)
+            result = fd.reply_to_topic(
+                session, topic["bbsId"], topic["topicUuid"], topic_class,
+                course_id, text, url_token=token,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, f"发布回复失败: {type(exc).__name__}: {exc}"
+
+        if not result.get("status"):
+            return False, f"发布回复被拒绝: {result.get('msg') or result}"
+
+        # 复核：确认回复确实出现在列表里
+        try:
+            time.sleep(1.5)
+            replied2, floor2, _ = fd.has_replied(session, topic["bbsId"], topic["topicUuid"],
+                                                 topic_class, puid)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("复核回复结果失败: {}", exc)
+            replied2, floor2 = False, None
+
+        if replied2:
+            return True, f"已发布回复（{floor2}）"
+        return True, "回复已提交（列表复核未命中，可能是分页延迟）"
+
+    # 审批模式：只生成不发布
+    if ctx.require_approval:
+        entry_id = ctx.register_approval(
+            kind="discussion",
+            preview=f"{ctx.label}\n话题：{question[:120]}\n\n拟发布回复：\n{text}",
+            submit_fn=_publish,
+            extra={"topicUuid": topic["topicUuid"]},
+        )
+        return True, f"已生成回复（{len(text)} 字），待审批后发布 [id={entry_id}]"
+
+    return _publish()
+
+
+# ----------------------------------------------------------------------
+# 适配器：文档（planType 11）
+# ----------------------------------------------------------------------
+
+
+@register_handler("document")
+def handle_document(ctx: CompletionContext) -> tuple[bool, str]:
+    """完成「文档」任务点。
+
+    任务引擎自己的文档学习页（``task.chaoxing.com/documentStudy/learnPage``）
+    在云盘阅读器上报 ``isFinished=1`` 时会调用 ``GET /documentStudy/readEnd``，
+    这就是服务端认可的「读完了」上报。这里直接复现该请求。
+    """
+    url = ctx.study_url.get("url") or ""
+    match = re.search(r"encryPlanUserId=([^&\s]+)", url)
+    if not match:
+        return False, f"未能从任务点跳转地址解析出 encryPlanUserId：{url[:120]}"
+
+    encry_plan_user_id = urllib.parse.unquote(match.group(1))
+    read_end_url = f"{TASK_DOMAIN}/documentStudy/readEnd"
+    try:
+        resp = ctx.client.session.get(
+            read_end_url,
+            params={"encryPlanUserId": encry_plan_user_id},
+            headers={
+                "Referer": url,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=ctx.client.timeout,
+        )
+    except requests.RequestException as exc:
+        return False, f"上报文档阅读完成失败: {exc}"
+
+    if resp.status_code != 200:
+        return False, f"上报文档阅读完成返回 HTTP {resp.status_code}"
+
+    try:
+        body = resp.json()
+    except ValueError:
+        return False, f"上报文档阅读完成返回非 JSON: {resp.text[:160]}"
+
+    if not body.get("result"):
+        return False, f"上报文档阅读完成被拒绝: {body.get('message') or body.get('msg') or body}"
+    return True, "已上报文档阅读完成"
+
+
+# ----------------------------------------------------------------------
+# 适配器：视频（planType 10）/ 音频（planType 22）
+# ----------------------------------------------------------------------
+
+# 任务引擎自有的播放页 → 进度上报前缀
+_PLAY_KINDS = {
+    "video": {"page": "videoStudy/learnPage", "data_log": "videoDataLog/dataLog",
+              "entity": "video"},
+    "audio": {"page": "audioStudy/learnPage", "data_log": "audioDataLog/dataLog",
+              "entity": "audio"},
+}
+
+
+def _parse_play_vo(html: str, entity: str) -> Optional[dict]:
+    """从播放页 HTML 中解析 ``videoLearnVo`` / ``audioLearnVo``（页面内嵌 JSON）。"""
+    pattern = rf"{entity}LearnVo\s*=\s*(\{{.*?\}})\s*(?:const|</script>|\n)"
+    match = re.search(pattern, html, re.S)
+    if not match:
+        return None
+    raw = match.group(1).replace("\\/", "/")
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        logger.debug("解析 {}LearnVo 失败: {}", entity, exc)
+        return None
+
+
+def _handle_play(ctx: CompletionContext, kind: str) -> tuple[bool, str]:
+    """视频/音频共用的完成逻辑：上报「开始播放」与「播放结束」。
+
+    实测（2026-10，planId 4097446，时长 1362 秒）：服务端**接受一次到位的
+    进度上报**，`isFinish` 立即由 false 变为 true，无需按真实时长等待。
+    若某任务点设置了观看时长要求（``enableVideoWatchDuration``），服务端可能
+    拒绝跳跃，此时回退为分段上报，并在日志中说明。
+    """
+    spec = _PLAY_KINDS[kind]
+    url = ctx.study_url.get("url") or ""
+    if spec["page"] not in url:
+        return False, f"任务点跳转地址不是任务引擎的{kind}播放页：{url[:120]}"
+
+    session = ctx.client.session
+    try:
+        resp = session.get(url, timeout=ctx.client.timeout)
+    except requests.RequestException as exc:
+        return False, f"打开播放页失败: {exc}"
+    if resp.status_code != 200:
+        return False, f"打开播放页返回 HTTP {resp.status_code}"
+
+    html = resp.content.decode("utf-8", errors="replace")
+    vo = _parse_play_vo(html, kind)
+    if not vo:
+        return False, f"未能从播放页解析出 {kind}LearnVo"
+    encry_id = vo.get("encryId")
+    info = vo.get("videoInfo") or vo.get("audioInfo") or {}
+    try:
+        duration = int(info.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    if not encry_id or duration <= 0:
+        return False, f"播放参数不完整（encryId={bool(encry_id)}, duration={duration}）"
+    logger.info("{}任务点：时长 {} 秒，开始上报进度", kind, duration)
+
+    headers = {"Referer": url, "X-Requested-With": "XMLHttpRequest"}
+
+    def report(current_time: int, status: int) -> tuple[bool, str]:
+        try:
+            r = session.get(
+                f"{TASK_DOMAIN}/{spec['data_log']}/{duration}/{int(current_time)}/{status}",
+                params={"encryId": encry_id}, headers=headers, timeout=ctx.client.timeout,
+            )
+        except requests.RequestException as exc:
+            return False, f"进度上报失败: {exc}"
+        if r.status_code != 200:
+            return False, f"进度上报返回 HTTP {r.status_code}"
+        try:
+            body = r.json()
+        except ValueError:
+            return False, f"进度上报返回非 JSON: {r.text[:120]}"
+        if not body.get("result"):
+            return False, str(body.get("message") or body)
+        return True, ""
+
+    # 1) 开始播放
+    ok, msg = report(0, 0)
+    if not ok:
+        return False, f"上报「开始播放」被拒绝：{msg}"
+
+    # 2) 一次跳到片尾；被拒则回退为「按真实时间模拟播放」
+    ok, msg = report(duration, 2)
+    if not ok:
+        logger.warning("一次到位上报被拒（{}），回退为按真实时间模拟播放", msg)
+        from api import fanya_video
+
+        try:
+            ok2, msg2 = fanya_video.simulate_playback(
+                session,
+                {"encryId": encry_id,
+                 "currentTime": 0,
+                 "farthestTimeValue": 0,
+                 "videoInfo": {"duration": duration}},
+                heartbeat_seconds=float(ctx.options.get("video_heartbeat")
+                                        or fanya_video.DEFAULT_HEARTBEAT_SECONDS),
+                speed=float(ctx.options.get("video_speed") or 1.0),
+                max_wall_seconds=float(ctx.options.get("video_max_seconds") or 7200.0),
+                progress_callback=lambda cur, total: logger.info(
+                    "播放进度 {:.1f}%（{}/{} 秒）", cur * 100.0 / max(total, 1), cur, total),
+                stop_event=ctx.options.get("stop_event"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, f"真实时长播放失败: {exc}"
+        if not ok2:
+            return False, msg2
+        return True, msg2
+
+    # 3) 记录播放位置
+    try:
+        session.get(
+            f"{TASK_DOMAIN}/planUserSchedule/lastCurrentTime/{duration}",
+            params={"encryId": encry_id}, headers=headers, timeout=ctx.client.timeout,
+        )
+    except requests.RequestException as exc:
+        logger.debug("记录播放位置失败: {}", exc)
+
+    return True, f"已上报{duration}秒观看进度"
+
+
+@register_handler("video")
+def handle_video(ctx: CompletionContext) -> tuple[bool, str]:
+    return _handle_play(ctx, "video")
+
+
+@register_handler("audio")
+def handle_audio(ctx: CompletionContext) -> tuple[bool, str]:
+    return _handle_play(ctx, "audio")
+
+
+# ----------------------------------------------------------------------
+# 适配器：AI实践 —— 代码实践(4) / 思维阶梯(2)
+# ----------------------------------------------------------------------
+
+
+@register_handler("ai_code")
+def handle_ai_code(ctx: CompletionContext) -> tuple[bool, str]:
+    """完成「AI实践 · 代码实践」(``data.type == 4``) 任务点。
+
+    已真机验证：planId 4107919（COM0018A 项目1）由未完成变为已完成，得分 76。
+
+    **审批模式（默认）**：只生成代码并跑完自测，把代码预览登记为待审批项，
+    用户批准后才建卷交卷。
+    """
+    from api import fanya_ladder as ladder
+
+    def _approval(code: str, lang_name: str, submit_fn) -> None:
+        ctx.register_approval(
+            kind="ai_code",
+            preview=(f"{ctx.label}\n语言：{lang_name}｜已通过自测运行\n\n"
+                     f"{code[:2000]}" + ("\n…（代码更长，提交时用完整版本）"
+                                        if len(code) > 2000 else "")),
+            submit_fn=submit_fn,
+            extra={"language": lang_name, "codeLength": len(code)},
+        )
+
+    try:
+        ok, msg = ladder.complete_code_task(
+            ctx.client.session, ctx.course, ctx.study_url, ctx.generator,
+            options=ctx.options, on_log=logger.info,
+            approval=_approval if ctx.require_approval else None,
+        )
+    except ladder.LadderAbort as exc:
+        return False, f"代码实践已中止（未提交）：{exc}"
+    except ladder.LadderError as exc:
+        return False, f"代码实践失败: {exc}"
+    return ok, msg
+
+
+@register_handler("ai_upload")
+def handle_ai_upload(ctx: CompletionContext) -> tuple[bool, str]:
+    """完成「AI实践 · 上传作品」(``data.type == 1``) 任务点。
+
+    按题目要求生成作品（对话实录型会**真的**和 AI 聊够轮次，
+    文本作品型生成达标字数），渲染成 PNG 并**保存到磁盘**。
+
+    ⚠️ **不自动上传**：``fileModeType=0`` 的挂附件载荷尚未解析正确，
+    贸然提交只会得到一条没有附件的空记录（实测评分服务返回 500）。
+    作品图片会保存到项目下的 ``作品/`` 目录，由用户在浏览器手动上传。
+
+    ⚠️ 题目若写明「禁止直接大段复制 AI 输出」，也不会自动提交。
+    """
+    from api import fanya_upload as up
+
+    def _approval(preview: str, submit_fn) -> None:
+        ctx.register_approval(
+            kind="ai_upload",
+            preview=f"{ctx.label}\n{preview}",
+            submit_fn=submit_fn,
+            extra={"kind": "upload"},
+        )
+
+    try:
+        ok, msg = up.complete_upload_task(
+            ctx.client.session, ctx.course, ctx.study_url, ctx.generator,
+            options=ctx.options, on_log=logger.info,
+            approval=_approval if ctx.require_approval else None,
+            # 挂附件载荷已抓真实请求确认（扁平数组），交卷前会回读二次校验
+            submit_enabled=True,
+        )
+    except up.UploadAbort as exc:
+        return False, f"上传作品已中止（未提交）：{exc}"
+    except up.UploadError as exc:
+        return False, f"上传作品失败: {exc}"
+    return ok, msg
+
+
+@register_handler("ai_ladder")
+def handle_ai_ladder(ctx: CompletionContext) -> tuple[bool, str]:
+    """完成「AI实践 · 思维阶梯」(``data.type == 2``) 任务点。
+
+    ✅ **已真机验证**（2026-10-12）：在「静电场环路定理闯关」上完整跑通 ——
+    题目拆出 8 个小问、逐题作答（含单选与多选）、交卷、结题报告出分，
+    得分 85；平台将任务点判定为完成（``isFinish=True``）。
+    也验证了容错分支：建新卷失败时回退为「续做旧记录」。
+
+    **审批模式（默认）下不执行**：该模式暂未实现「生成后暂停」，而它又未经真机
+    验证，因此默认拒绝直接交卷，需显式开启 ``options.allow_ai_submit``。
+    """
+    if ctx.require_approval and not ctx.options.get("allow_ai_submit"):
+        return False, ("思维阶梯尚未支持「生成后暂停」审批流程（链路本身已真机验证，"
+                       "得分 85）；如确认要直接交卷，请开启「允许 AI实践直接提交」选项")
+
+    from api import fanya_ladder as ladder
+
+    # 「以目标分为标准，越高越好」：一次答不达标就再练一次。
+    # 平台的达标标准是「多次练习平均分」，所以多刷几次把平均分抬上去是有效手段；
+    # 每次重练都会先结束上一条记录再建新卷（平台没有放弃接口）。
+    threshold = float(ctx.options.get("ladder_threshold") or 80)
+    max_attempts = max(1, int(ctx.options.get("ladder_attempts") or 3))
+    ids = ladder._ids(ctx.study_url, ctx.course)
+
+    def current_score() -> float | None:
+        try:
+            data = ladder.load_data(ctx.client.session, ids)
+        except ladder.LadderError:
+            return None
+        raw = data.get("answerScore")
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    best: float | None = None
+    last_msg = ""
+    for attempt in range(1, max_attempts + 1):
+        opts = dict(ctx.options)
+        if attempt > 1:
+            opts["ai_redo"] = True          # 结束旧记录后再建新卷
+        logger.info("思维阶梯第 {}/{} 次作答（目标 {} 分）", attempt, max_attempts, threshold)
+        try:
+            ok, msg = ladder.complete_think_ladder(
+                ctx.client.session, ctx.course, ctx.study_url, ctx.generator,
+                options=opts, on_log=logger.info,
+            )
+        except ladder.LadderAbort as exc:
+            return False, f"思维阶梯已中止（未提交）：{exc}"
+        except ladder.LadderError as exc:
+            return False, f"思维阶梯失败: {exc}"
+        last_msg = msg
+        if not ok:
+            return ok, msg
+        score = current_score()
+        if score is not None:
+            best = score if best is None else max(best, score)
+            logger.info("第 {} 次得分：{}（目标 {}）", attempt, score, threshold)
+            if score >= threshold:
+                return True, f"思维阶梯已达标：第 {attempt} 次得 {score} 分（目标 {threshold}）"
+        else:
+            logger.info("第 {} 次已交卷，但暂时读不到分数", attempt)
+
+    if best is None:
+        return True, f"{last_msg}（试了 {max_attempts} 次，分数待平台刷新）"
+    if best >= threshold:
+        return True, f"思维阶梯已达标：最高 {best} 分（目标 {threshold}）"
+    return True, (f"思维阶梯已提交 {max_attempts} 次，最高 {best} 分，"
+                  f"仍未达 {threshold} 分（可在重做模式再试）")
+
+
+@register_handler("ai_chat")
+def handle_ai_chat(ctx: CompletionContext) -> tuple[bool, str]:
+    """完成「AI实践 · 情景对话」(``data.type == 0``) 任务点。
+
+    ⚠️ 尚未真机验证（账号内无未过期的情景对话样本）。默认进行 5 轮问答，
+    可用选项 ``chat_turns`` 调整。
+
+    **审批模式（默认）下不执行**：该链路**未真机验证**（与已实测的思维阶梯不同），
+    且暂未实现「生成后暂停」，需显式开启 ``options.allow_ai_submit``。
+    """
+    if ctx.require_approval and not ctx.options.get("allow_ai_submit"):
+        return False, ("情景对话尚未支持「生成后暂停」审批流程，且该链路未真机验证；"
+                       "如确认要直接交卷，请开启「允许 AI实践直接提交」选项")
+
+    from api import fanya_chat as chat
+
+    try:
+        ok, msg = chat.complete_chat_task(
+            ctx.client.session, ctx.course, ctx.study_url, ctx.generator,
+            options=ctx.options, on_log=logger.info,
+        )
+    except chat.ChatAbort as exc:
+        return False, f"情景对话已中止（未提交）：{exc}"
+    except chat.ChatError as exc:
+        return False, f"情景对话失败: {exc}"
+    return ok, msg
+
+
+@register_handler("ai_story")
+def handle_ai_story(ctx: CompletionContext) -> tuple[bool, str]:
+    """推进「AI实践 · AI剧情」(``data.type == 7``) 的**章节对话**。
+
+    协议来自客户端 JS 逆向 + 真机只读探测（见 ``docs/FANYA_TASK_API.md``）：
+    剧情是一串「章节」，每章由 ``condition[].hit`` 判完成、``nextChapterUuid``
+    串到下一章；每章要么是对话（``subtype=0``）要么是上传（``subtype=1``）。
+
+    ⚠️ **两条边界**（都是刻意的，不是缺陷）：
+
+    1. **每章最多发 ``options["story_max_rounds"]`` 轮**（默认 3）。平台每章
+       上限 5 轮，用户明确要求「AI 先试 3 轮，达不到就把剩下的留给我自己做」，
+       所以轮数用尽即停手并报告，绝不硬刷。
+    2. **上传节点（``subtype=1``）尚未自动化**，遇到就停并说明。
+
+    ``add-chat`` 会写入**不可撤销**的真实对话内容，故本处理器在审批模式下
+    默认不执行，需显式开启 ``options["allow_ai_submit"]``。
+    """
+    if ctx.require_approval and not ctx.options.get("allow_ai_submit"):
+        return False, ("AI剧情会写入不可撤销的真实对话内容，且最后一章「上传报告」"
+                       "尚未自动化；如确认要执行，请开启「允许 AI实践直接提交」选项")
+
+    from api import fanya_story as story
+
+    try:
+        ok, msg = story.complete_story_task(
+            ctx.client.session, ctx.course, ctx.study_url, ctx.generator,
+            options=ctx.options, on_log=logger.info,
+        )
+    except story.StoryAbort as exc:
+        return False, f"AI剧情已停手：{exc}"
+    except story.StoryError as exc:
+        return False, f"AI剧情失败: {exc}"
+    return ok, msg
+
+
+# ----------------------------------------------------------------------
+# 适配器：自测（17）/ 测验（5）
+# ----------------------------------------------------------------------
+
+
+@register_handler("quiz")
+def handle_quiz(ctx: CompletionContext) -> tuple[bool, str]:
+    """完成自测/测验任务点。
+
+    ⚠️ 该链路**未经真机验证**（本账号没有未过期的考试样本）。因此默认行为是
+    **只逐题暂存（tempSave=true），绝不交卷**；只有显式打开
+    ``options["exam_submit"]`` 才会交卷。任何异常、未知题型、题库缺答案都会
+    立刻中止 —— 保证不会误交白卷。
+    """
+    from api import fanya_exam as ex
+    from api import fanya_quiz
+
+    session = ctx.client.session
+    course = ctx.course
+    class_id = str(course.get("clazzId") or course.get("classId") or "")
+
+    # 1) 先判过期：过期试卷无法补完成，直接给出明确结论
+    if ctx.item.plan_type == PLAN_TYPE_QUIZ:
+        info = fanya_quiz.describe_self_test(
+            ctx.client, ctx.task.encry_task_user_id, ctx.item.encrypt_plan_id)
+        if info and info.get("expired"):
+            return False, "考试已过期，无法补完成（需联系老师处理）"
+
+    # 2) 取入口 URL
+    entry_url = (ctx.study_url or {}).get("url") or ""
+    if ctx.item.plan_type == PLAN_TYPE_QUIZ:
+        try:
+            entry_url = ex.resolve_self_test_entry(
+                ctx.client, ctx.task.encry_task_user_id, ctx.item.encrypt_plan_id) or entry_url
+        except ex.ExamError as exc:
+            return False, f"获取自测入口失败: {exc}"
+    if not entry_url:
+        return False, "未能取得考试入口地址"
+
+    try:
+        resp = session.get(entry_url, timeout=ctx.client.timeout, allow_redirects=True)
+    except requests.RequestException as exc:
+        return False, f"打开考试入口失败: {exc}"
+    html = resp.content.decode("utf-8", errors="replace")
+
+    # 3) 尝试进入作答页（入口可能是 lookPaper「查看详情」或 examnotes「须知」）
+    if not ex.looks_like_answering_page(html):
+        next_url = _find_answering_url(html, course, class_id)
+        if not next_url:
+            return False, ("已定位到考试入口，但当前无法取得作答页"
+                           "（该链路尚未真机验证；请手动进入一次以确认页面结构）")
+        try:
+            resp = session.get(next_url, timeout=ctx.client.timeout, allow_redirects=True)
+        except requests.RequestException as exc:
+            return False, f"打开作答页失败: {exc}"
+        html = resp.content.decode("utf-8", errors="replace")
+        if not ex.looks_like_answering_page(html):
+            return False, "打开的页面不是预期的作答页，已中止（不提交任何内容）"
+
+    # 4) 逐题作答：默认只暂存
+    submit_enabled = bool(ctx.options.get("exam_submit"))
+    if not submit_enabled:
+        logger.warning("「考试交卷」开关未开启：本任务点只会逐题暂存，不会交卷")
+
+    total = 0
+    max_questions = int(ctx.options.get("exam_max_questions") or 50)
+    while total < max_questions:
+        try:
+            page = ex.parse_answering_page(html)
+        except ex.ExamAbort as exc:
+            return False, str(exc)
+        page["entryUrl"] = entry_url
+        total += 1
+
+        q_info = ex.build_q_info(page)
+        if q_info is None:
+            return False, (f"第 {total} 题题型无法识别（type={page.get('questionType')}），"
+                           "已中止且未提交任何内容")
+
+        answer = None
+        if ctx.chaoxing is not None and getattr(ctx.chaoxing, "tiku", None) is not None:
+            try:
+                answer = ctx.chaoxing.tiku.query(q_info)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("题库查询异常: {}", exc)
+        if not answer:
+            return False, f"第 {total} 题题库未给出答案，已中止（按约定绝不提交白卷）"
+        logger.info("第 {} 题 [{}] 答案: {}", total,
+                    ex.TYPE_NAMES.get(page.get("questionType"), "?"), str(answer)[:60])
+
+        try:
+            form = ex.build_answer_form(page, answer)
+        except ex.ExamAbort as exc:
+            return False, str(exc)
+
+        has_next = bool(re.search(r"(下一题|nextQuestion|start=\d+)", html))
+        is_last = not has_next
+        do_submit = bool(submit_enabled and is_last)
+        if do_submit:
+            logger.warning("即将交卷，完整表单字段：{}", sorted(form.keys()))
+
+        try:
+            result = ex.save_or_submit(session, page, form, is_submit=do_submit,
+                                       timeout=ctx.client.timeout)
+        except ex.ExamError as exc:
+            return False, f"第 {total} 题保存失败: {exc}"
+
+        if not (result.get("status") or result.get("result")):
+            return False, f"第 {total} 题保存被拒绝: {result.get('msg') or result.get('message')}"
+
+        if is_last:
+            if do_submit:
+                return True, f"已作答 {total} 题并交卷"
+            return False, (f"已暂存 {total} 题作答，但**未交卷**"
+                           "（安全默认；如需交卷请开启「考试交卷」选项）")
+
+        nxt = _find_next_question_url(html)
+        if not nxt:
+            return False, f"已暂存 {total} 题，但未能定位下一题，已中止（未交卷）"
+        try:
+            resp = session.get(nxt, timeout=ctx.client.timeout, allow_redirects=True)
+        except requests.RequestException as exc:
+            return False, f"打开下一题失败: {exc}"
+        html = resp.content.decode("utf-8", errors="replace")
+
+    return False, f"答题轮次超过上限（{max_questions}），已中止（未交卷）"
+
+
+def _find_answering_url(html: str, course: dict, class_id: str) -> str:
+    """从须知/详情页里找出真正的作答页地址。"""
+    m = re.search(r"(reVersionTestStartNew[^\"'\s<>]*)", html)
+    if m:
+        frag = m.group(1)
+        if frag.startswith("http"):
+            return frag
+        return f"https://mooc1.chaoxing.com/{frag.lstrip('/')}"
+    m = re.search(r'(https?://[^"\'\s<>]*examnotes[^"\'\s<>]*)', html)
+    if m:
+        return m.group(1)
+    m = re.search(r'(/exam[^"\'\s<>]*(?:examnotes|test)[^"\'\s<>]*)', html)
+    if m:
+        return f"https://mooc1.chaoxing.com{m.group(1)}"
+    return ""
+
+
+def _find_next_question_url(html: str) -> str:
+    """找「下一题」链接。"""
+    m = re.search(r'href=["\']([^"\']*start=\d+[^"\']*)["\']', html)
+    if m:
+        href = m.group(1).replace("&amp;", "&")
+        if href.startswith("http"):
+            return href
+        return f"https://mooc1.chaoxing.com/{href.lstrip('/')}"
+    return ""
+
+
+# ----------------------------------------------------------------------
+# 适配器：分组任务（planType 18）
+# ----------------------------------------------------------------------
+
+
+@register_handler("group_task")
+def handle_group_task(ctx: CompletionContext) -> tuple[bool, str]:
+    """完成分组任务任务点。
+
+    ⚠️ 两条硬约束（均在真机上实测确认）：
+
+    1. **提交不等于完成**：完成判据是 ``enableGroupTaskScore`` → 总成绩 ≥ 60
+       （教师评分/组内互评）。提交后任务点仍可能是未完成，这属正常。
+    2. **提交是覆盖式的**：``studentSaveRenwu`` 会替换本组已保存/已提交的内容。
+       本账号两个分组任务的小组**都已有提交内容**，贸然提交会抹掉组员成果。
+
+    因此默认**只生成内容、绝不提交**：需要显式开启 ``options["group_submit"]``；
+    即使开启了，只要检测到小组已有编辑/提交记录也会拒绝，除非再显式打开
+    ``options["group_force_overwrite"]``。
+    """
+    from api import fanya_group as gr
+
+    session = ctx.client.session
+    study_url = (ctx.study_url or {}).get("url") or ""
+    if not study_url:
+        return False, "任务点没有提供跳转地址"
+
+    # 1) 解析页面与小组上下文（全部只读）
+    try:
+        info = gr.fetch_context(session, study_url, timeout=ctx.client.timeout)
+    except gr.GroupAbort as exc:
+        return False, str(exc)
+    except gr.GroupTaskError as exc:
+        return False, f"读取分组任务信息失败: {exc}"
+
+    logger.info(
+        "分组任务「{}」：activeId={} groupId={} 编辑次数={} 提交状态={} 组内人数={}",
+        ctx.item.name[:30], info["activeId"], info["groupId"],
+        info["commitLogCount"], info["submitStatus"], info.get("memberCount"),
+    )
+
+    # 2) 基本可行性检查
+    if info["activeStatus"] == 2:
+        return False, ("该分组任务的活动已结束（active.status=2），无法再提交。"
+                       "任务点仍未完成通常是因为需要评分 ≥60（教师评分/组内互评），"
+                       "需联系老师处理")
+    if not info["groupId"]:
+        return False, "当前账号不在任何小组中，无法提交分组任务（需联系老师分配小组）"
+    if not info["activeId"] or not info["courseId"]:
+        return False, "未能取得 activeId / courseId，已中止（不提交任何内容）"
+
+    # 3) 生成内容
+    title, content, used_ai = gr.build_answer(
+        ctx.generator, info.get("activeText") or "", info.get("activeTitle") or ctx.item.name,
+        course_title=ctx.course.get("title") or "",
+    )
+    if not title and not content:
+        return False, "生成的内容为空，已中止（不提交空答案）"
+    plain_preview = gr.html_to_text(content)[:200].replace("\n", " ")
+    logger.info("拟提交标题：{}", title)
+    logger.info("拟提交正文（{}，共 {} 字）：{}",
+                "AI 生成" if used_ai else "模板兜底", len(gr.html_to_text(content)),
+                plain_preview)
+
+    form_preview = {
+        "forceSave": 0, "title": title, "groupId": info["groupId"],
+        "editVersion": info["editVersion"], "activeId": info["activeId"],
+        "courseId": info["courseId"], "content": f"<{len(content)} 字节 HTML>",
+    }
+    logger.info("完整提交字段：{}", form_preview)
+
+    # 4) 覆盖保护：小组已有内容就不动它
+    has_existing = bool(info["commitLogCount"]) or str(info["submitStatus"]) == "1"
+    if has_existing:
+        detail = (f"该小组已有内容（编辑 {info['commitLogCount']} 次，"
+                  f"提交状态 {info['submitStatus']}）")
+        if not ctx.options.get("group_force_overwrite"):
+            if not used_ai:
+                logger.warning("AI 不可用，本次为模板兜底文本")
+            return False, (f"{detail}。提交会**覆盖组员已写好的答案**，因此已拒绝提交"
+                           "（如确实要覆盖，请显式开启「强制覆盖小组内容」）")
+
+    # 5) 默认不提交
+    if not ctx.options.get("group_submit"):
+        return False, ("已生成小组答案但**未提交**（安全默认）。"
+                       "该任务点的完成取决于评分 ≥60，提交本身也不保证变为已完成；"
+                       "如需提交请开启「分组任务提交」选项")
+
+    # 6) 真正提交
+    try:
+        result = gr.submit_answer(
+            session, active_id=info["activeId"], course_id=info["courseId"],
+            group_id=info["groupId"], edit_version=info["editVersion"],
+            title=title, content=content,
+            force_save=1 if ctx.options.get("group_force_overwrite") else 0,
+            referer=info.get("pageUrl") or study_url, timeout=ctx.client.timeout,
+        )
+    except gr.GroupTaskError as exc:
+        return False, f"提交分组任务失败: {exc}"
+
+    if result.get("result") != 1:
+        return False, f"提交分组任务被拒绝: {result.get('errorMsg') or result}"
+
+    data = result.get("data") or {}
+    # status==2：与他人并发编辑冲突，服务端会提示「提交后会覆盖他的内容」
+    if str(data.get("status")) == "2":
+        return False, (f"提交被服务端要求确认（并发编辑冲突）：{data.get('message')}"
+                       "；未做覆盖，请手动在页面上确认")
+    return True, (f"小组答案已提交（标题：{title}）。注意：该任务点需评分 ≥60 才会"
+                  "变为已完成，提交后可能仍显示未完成")
+
+
+# ----------------------------------------------------------------------
+# 适配器：作业（planType 4，mooc2 课程作业）
+# ----------------------------------------------------------------------
+
+
+@register_handler("course_work")
+def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
+    """完成「作业」任务点（mooc2 课程作业）。
+
+    与章节检测作业不是同一套入口，详见 ``api/fanya_work.py``。
+
+    **审批优先**：默认 ``require_approval=True``，此时只读题 + 查题库，
+    **不保存草稿、不提交**，把答案预览登记为待审批项；用户批准后才真正提交。
+    只有在明确关闭审批（``options.require_approval=False``）时，才沿用题库的
+    ``submit`` / ``cover_rate`` 策略直接提交。
+    """
+    from api.fanya_work import (
+        complete_course_work, prepare_course_work, submit_prepared,
+    )
+
+    entry_url = ctx.study_url.get("url") or ""
+    if not entry_url:
+        return False, "任务点没有提供作业页地址"
+
+    tiku = getattr(ctx.chaoxing, "tiku", None) if ctx.chaoxing is not None else None
+    if tiku is None:
+        return False, "缺少题库实例，无法作答作业"
+
+    # 项目既有语义：get_submit_params() == "1" 表示「保存但不提交」
+    try:
+        save_only = str(tiku.get_submit_params()) == "1"
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("读取题库提交设置失败，默认提交: {}", exc)
+        save_only = False
+    try:
+        cover_rate = float(getattr(tiku, "COVER_RATE", 0) or 0)
+    except (TypeError, ValueError):
+        cover_rate = 0.0
+
+    def on_log(message: str) -> None:
+        logger.info("[作业] {}", message)
+
+    if not ctx.require_approval:
+        return complete_course_work(
+            ctx.client.session, entry_url, tiku,
+            save_only=save_only, cover_rate=cover_rate, on_log=on_log,
+        )
+
+    # ---- 审批模式：只准备，不写任何东西 ----
+    ok, msg, prepared = prepare_course_work(
+        ctx.client.session, entry_url, tiku,
+        cover_rate=cover_rate, on_log=on_log,
+    )
+    if not ok:
+        return False, msg
+
+    session = ctx.client.session
+    total = prepared["total"]
+    found = prepared["found"]
+
+    def _submit() -> tuple[bool, str]:
+        # 用户已批准 → 正式提交（pyFlag 置空）
+        logger.info("[作业] 审批通过，提交 {} 题答案", total)
+        return submit_prepared(session, prepared, force_submit=True)
+
+    if found == 0:
+        return False, (f"题库对这 {total} 题全部未命中（可能是纯图片题），"
+                       "已按未命中处理，未提交任何内容")
+
+    entry_id = ctx.register_approval(
+        kind="course_work",
+        preview=f"{ctx.label}\n{msg}",
+        submit_fn=_submit,
+        extra={"total": total, "found": found, "rate": prepared["rate"]},
+    )
+    return True, (f"已生成 {total} 题答案（命中 {found} 题），"
+                  f"待审批后提交 [id={entry_id}]")
+
+
+@register_handler("chapter")
+def handle_chapter(ctx: CompletionContext) -> tuple[bool, str]:
+    """完成「章节」任务点：复用既有的章节学习流程。
+
+    定位方式（实测）：``plan.externalDataId`` 是一个小整数，**精确等于 mooc1
+    章节列表里 ``point["id"]``**（注意 JSON 里是字符串）。而 11/10/4 的
+    ``externalDataId`` 是 32 位 UUID，与 mooc1 的任何 id 都不相等，因此只有
+    planType=8 能走这条路。
+    """
+    raw_ext = ctx.item.extra.get("externalDataId")
+    ext = "" if raw_ext is None else str(raw_ext).strip()
+    if not ext or not ext.isdigit():
+        return False, f"任务点未提供可用的章节标识（externalDataId={raw_ext!r}）"
+
+    course = ctx.course
+    course_id = course.get("courseId")
+    class_id = course.get("clazzId") or course.get("classId")
+    cpi = course.get("cpi")
+    if not (course_id and class_id and cpi):
+        return False, "课程信息缺少 courseId / clazzId / cpi，无法定位章节"
+
+    chaoxing = ctx.chaoxing
+    if chaoxing is None:
+        return False, "缺少 Chaoxing 实例（章节学习需要它来播放/上报）"
+
+    from main import process_job  # 延迟导入，避免与 main 形成循环依赖
+
+    try:
+        point_list = chaoxing.get_course_point(course_id, class_id, cpi)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"读取章节列表失败: {exc}"
+
+    point = None
+    for candidate in point_list.get("points") or []:
+        if str(candidate.get("id")) == ext:
+            point = candidate
+            break
+    if point is None:
+        return False, f"章节列表中未找到 id={ext} 的章节（可能已调整或删除）"
+
+    try:
+        jobs, job_info = chaoxing.get_job_list(course, point)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"读取章节任务点失败: {exc}"
+
+    if not jobs:
+        if job_info.get("notOpen"):
+            return False, "该章节尚未开放"
+        # 没有任务点即视为无内容可做，直接认为完成
+        return True, f"章节「{point.get('title')}」没有需要完成的任务点"
+
+    speed = float(ctx.options.get("speed") or 1.5)
+    logger.info("章节「{}」共 {} 个任务点，开始复用既有学习流程", point.get("title"), len(jobs))
+    failed = []
+    for job in jobs:
+        try:
+            result = process_job(chaoxing, course, job, job_info, speed)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("任务点处理异常: {}", exc)
+            failed.append(f"{job.get('type')}:{job.get('jobid')}(异常)")
+            continue
+        if result is not None and getattr(result, "is_failure", None) and result.is_failure():
+            failed.append(f"{job.get('type')}:{job.get('jobid')}")
+
+    if failed:
+        return False, f"章节「{point.get('title')}」有 {len(failed)}/{len(jobs)} 个任务点未完成：" \
+                      f"{', '.join(failed[:3])}"
+    return True, f"章节「{point.get('title')}」的 {len(jobs)} 个任务点已全部完成"
+

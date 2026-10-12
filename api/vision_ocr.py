@@ -161,6 +161,10 @@ def _call_openai_compatible(config: Dict[str, str], image_bytes: bytes) -> str:
         "Content-Type": "application/json",
     }
 
+    # DeepSeek V4 默认开启 thinking，OCR 这种纯转录任务不需要思维链，
+    # 开启只会拖慢速度并抬高成本。仅对 DeepSeek 端点关闭。
+    thinking_off = "deepseek" in (config.get("endpoint") or "").lower()
+
     payload = {
         "model": config["model"],
         "messages": [
@@ -180,6 +184,9 @@ def _call_openai_compatible(config: Dict[str, str], image_bytes: bytes) -> str:
         "max_tokens": 1024,
         "temperature": 0.1,
     }
+
+    if thinking_off:
+        payload["thinking"] = {"type": "disabled"}
 
     try:
         resp = requests.post(

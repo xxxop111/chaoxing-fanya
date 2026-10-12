@@ -4,7 +4,7 @@ import Button from './ui/Button';
 import { 
   CheckCircle2, Clock, AlertCircle, Play, Home, BookOpen, 
   FileText, XCircle, Loader2, ChevronDown, ChevronRight,
-  Activity, TrendingUp, Film, MonitorPlay
+  Activity, TrendingUp, Film, MonitorPlay, Square
 } from 'lucide-react';
 import api from '../api/axios';
 
@@ -13,8 +13,28 @@ const StudyProgress = ({ taskId, onBack }) => {
   const [taskDetails, setTaskDetails] = useState(null);
   const [logs, setLogs] = useState([]);
   const [expandedCourses, setExpandedCourses] = useState(new Set());
+  const [stopping, setStopping] = useState(false);
   const logsEndRef = useRef(null);
   const intervalRef = useRef(null);
+
+  // 优雅停止：不再开始新章节，当前章节收尾后退出
+  const handleStop = async () => {
+    if (!window.confirm('确定要停止吗？\n\n当前章节会收尾后退出，未开始的章节保持原样，下次可以继续。')) {
+      return;
+    }
+    setStopping(true);
+    try {
+      const response = await api.post(`/task/${taskId}/stop`);
+      if (!response.data.status) {
+        alert(response.data.msg || '停止请求失败');
+      }
+    } catch (err) {
+      console.error('停止任务失败:', err);
+      alert('停止任务失败，请重试');
+    } finally {
+      setStopping(false);
+    }
+  };
 
   useEffect(() => {
     fetchTaskStatus();
@@ -44,7 +64,7 @@ const StudyProgress = ({ taskId, onBack }) => {
       if (response.data.status) {
         setTaskStatus(response.data.data);
         
-        if (response.data.data.status === 'completed' || response.data.data.status === 'error') {
+        if (['completed', 'error', 'stopped'].includes(response.data.data.status)) {
           if (intervalRef.current) {
             clearInterval(intervalRef.current);
           }
@@ -99,6 +119,8 @@ const StudyProgress = ({ taskId, onBack }) => {
         return { text: '已完成', color: 'text-green-600', icon: CheckCircle2 };
       case 'error':
         return { text: '出现错误', color: 'text-red-600', icon: AlertCircle };
+      case 'stopped':
+        return { text: '已手动停止', color: 'text-amber-600', icon: Square };
       default:
         return { text: '未知状态', color: 'text-gray-500', icon: Clock };
     }
@@ -149,12 +171,24 @@ const StudyProgress = ({ taskId, onBack }) => {
             <h1 className="text-3xl font-bold text-gray-900">学习进度监控</h1>
             <p className="text-muted-foreground mt-1">实时跟踪任务执行详情</p>
           </div>
-          {(taskStatus?.status === 'completed' || taskStatus?.status === 'error') && (
-            <Button onClick={onBack}>
-              <Home className="mr-2 h-4 w-4" />
-              返回首页
-            </Button>
-          )}
+          <div className="flex items-center gap-2">
+            {taskStatus?.status === 'running' && (
+              <Button
+                variant="destructive"
+                onClick={handleStop}
+                disabled={stopping || taskStatus?.stop_requested}
+              >
+                <Square className="mr-2 h-4 w-4" />
+                {taskStatus?.stop_requested ? '正在停止…' : '停止'}
+              </Button>
+            )}
+            {['completed', 'error', 'stopped'].includes(taskStatus?.status) && (
+              <Button onClick={onBack}>
+                <Home className="mr-2 h-4 w-4" />
+                返回首页
+              </Button>
+            )}
+          </div>
         </div>
 
         {/* Statistics Cards */}

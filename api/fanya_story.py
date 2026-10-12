@@ -1,0 +1,730 @@
+# -*- coding: utf-8 -*-
+"""「AI剧情」(``data.type == 7``) 的作答链路。
+
+协议全部来自客户端 JS 逆向 + 真机只读探测，见 ``docs/FANYA_TASK_API.md``。
+
+⚠️ 当前状态：**能发言，但拿不到分**
+--------------------------------
+真机验证（2026-10-12）逐项确认：
+
+| 环节 | 结论 |
+| --- | --- |
+| 发学生消息 | ✅ 可用 —— `add-chat` 配**学生角色**（`type=0`）能真实落库 |
+| 记录读取 | ✅ 必须用 `load-data` **带 `chapterRecordUuid`**（`get-chats` 看不到）|
+| 章节交卷 | ✅ 可用 —— `POST /v2/answer/submit` 带 `chapterUuid`+`chapterRecordUuid`，章节 status 0→1 |
+| 实时对话 | ⚠️ 走 `wss://<host>/ai-ans/evaluate/video-call`（WebSocket），**未实现** |
+| 触发评分 | ❌ 失败 —— `evaluate/stream` 返回「**会话不存在**」 |
+
+**根因**：评分绑定在**实时会话**上。客户端先用 WebSocket 建立会话，再调
+`update-conversation-id` 存下 `conversationId`；而纯 HTTP 路径下
+`load-data` 返回的 `conversationId` 始终为空，于是评分无法产生（分数恒为 0）。
+
+因此本模块**只能发言、不能得分**，`ai_story` 处理器据此标注为「需人工」。
+要真正打通，需要实现那套 WebSocket 实时对话协议。
+
+附带发现：`story-host-agent`（SSE）需要页面 URL 里的 `t` / `enc` 鉴权令牌
+（实测 `t=0 enc=0` 会得到「鉴权已过期」，不传则 HTTP 400；令牌有效期 ≥28 分钟）。
+`enc`/`fileEnc`/`asrEnc` **不在任何已知接口的响应里**，疑似由上游页面签发，
+故即便实现了对话，也还需要解决令牌来源。
+
+结构（实测）
+------------
+剧情是一串**章节**，每章就是一个节点，靠 ``condition[].hit`` 判完成、
+``nextChapterUuid`` 串到下一章。每章要么是「情景对话」(``subtype=0``)，
+要么是「上传作品」(``subtype=1``)。
+
+```
+get-progress   → 当前章：chapterRecordUuid / subtype / condition[].hit / nextChapterUuid
+go-chapter     → 进入指定章
+get-chats      → 该章的对话结构（condition 文案 / maxRound / 历史）
+add-chat       → 发一轮（chapterRecordUuid + roleUuid + content）
+```
+
+安全边界
+--------
+* ``add-chat`` 会**写入真实对话内容且不可撤销**，因此每章的轮数由
+  ``story_max_rounds`` 硬性封顶（默认 3 —— 用户明确要求：先由 AI 试 3 轮，
+  达不到就停手交给用户，把剩下的轮次留给他自己做）。
+* 任何异常、AI 生成失败、条件不满足，都**只停止并报告**，不会提交或伪造数据。
+* 上传节点（``subtype=1``）尚未实现，遇到时明确返回"需人工"。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from typing import Any, Callable, Optional
+
+import requests
+from loguru import logger
+
+from api import fanya_ai as ld
+
+STORY = f"{ld.MOOC_ANS_DOMAIN}/mooc2-ans/ai-evaluate/story"
+HEADERS = {"Referer": f"{ld.MOOC_ANS_DOMAIN}/ai-evaluate/v2/answer"}
+
+DEFAULT_MAX_ROUNDS = 3      # 用户要求：AI 先试 3 轮，剩下留给他自己
+PLAN_TYPE_UPLOAD = 1        # subtype=1 → 上传作品节点
+ROLE_NARRATOR = 2           # get-roles 的 type：2=旁白
+ROLE_AGENT = 1              # 1=智能体
+ROLE_STUDENT = 0            # 0=学生（⚠️ 是 0，注意 falsy）
+
+
+class StoryError(Exception):
+    """剧情链路的技术性失败（网络/协议），可重试。"""
+
+
+class StoryAbort(Exception):
+    """应当停止并交给用户的业务性中止（如轮数用尽、遇到上传节点）。"""
+
+
+# ---------------------------------------------------------------- 基础请求
+def _get(session: requests.Session, path: str, params: dict,
+         timeout: float = 30.0) -> dict:
+    try:
+        r = session.get(f"{STORY}/{path}", params=params, timeout=timeout,
+                        headers=HEADERS)
+    except requests.RequestException as exc:
+        raise StoryError(f"请求 {path} 失败: {exc}") from exc
+    if r.status_code != 200:
+        raise StoryError(f"{path} 返回 HTTP {r.status_code}")
+    try:
+        body = r.json()
+    except ValueError as exc:
+        raise StoryError(f"{path} 返回非 JSON: {r.text[:160]}") from exc
+    if not body.get("status"):
+        msg = body.get("errorMsg") or body.get("msg") or str(body)[:160]
+        raise StoryError(f"{path} 失败: {msg}")
+    return body.get("data") or {}
+
+
+def _post_form(session: requests.Session, path: str, data: dict,
+               timeout: float = 40.0) -> dict:
+    try:
+        r = session.post(f"{STORY}/{path}", data=data, timeout=timeout,
+                         headers=HEADERS)
+    except requests.RequestException as exc:
+        raise StoryError(f"POST {path} 失败: {exc}") from exc
+    if r.status_code != 200:
+        raise StoryError(f"POST {path} 返回 HTTP {r.status_code}")
+    try:
+        return r.json()
+    except ValueError as exc:
+        raise StoryError(f"POST {path} 返回非 JSON: {r.text[:160]}") from exc
+
+
+# ---------------------------------------------------------------- 上下文
+def base_params(study_url: dict, course: dict, data: dict) -> dict:
+    """剧情系列接口的公共参数。
+
+    ⚠️ 注意大小写：剧情接口用 **camelCase**（``courseId``/``classId``），
+    而 ``load-data``/``answer/init`` 用全小写（``courseid``/``clazzid``）。
+    传错会得到「课程id为空」。
+    """
+    course_id, class_id, cpi = ld.extract_course_ids(study_url, course)
+    uuid = (data.get("publishRelationUuid")
+            or ld.parse_publish_relation_uuid(study_url) or "")
+    return {
+        "courseId": course_id,
+        "classId": class_id,
+        "cpi": cpi,
+        "libraryUuid": data.get("libraryUuid") or "",
+        "publishRelationUuid": uuid,
+        "recordUuid": data.get("recordUuid") or "",
+    }
+
+
+def get_progress(session: requests.Session, base: dict) -> dict:
+    """当前章的进度（含 ``condition[].hit`` 与 ``nextChapterUuid``）。"""
+    return _get(session, "get-progress", base)
+
+
+def enter_chapter(session: requests.Session, base: dict, chapter_uuid: str) -> dict:
+    return _get(session, "go-chapter", {**base, "chapterUuid": chapter_uuid})
+
+
+def go_home(session: requests.Session, base: dict) -> dict:
+    return _get(session, "go-home", base)
+
+
+def get_chats(session: requests.Session, base: dict, chapter_uuid: str) -> dict:
+    return _get(session, "get-chats", {**base, "chapterUuid": chapter_uuid})
+
+
+def get_roles(session: requests.Session, base: dict) -> list:
+    data = _get(session, "get-roles", base)
+    return data if isinstance(data, list) else []
+
+
+def add_chat(session: requests.Session, base: dict, chapter_record_uuid: str,
+             role_uuid: str, content: str) -> dict:
+    """发一轮对话。⚠️ 这会写入真实内容，不可撤销。"""
+    return _post_form(session, "add-chat", {
+        **base,
+        "chapterRecordUuid": chapter_record_uuid,
+        "roleUuid": role_uuid,
+        "content": content,
+    })
+
+
+# ---------------------------------------------------------------- 取当前章
+def current_chapter(progress: dict) -> Optional[dict]:
+    chapters = progress.get("progress") or []
+    return chapters[0] if chapters else None
+
+
+def chapter_hit(chapter: dict) -> bool:
+    """``condition[].hit`` 全为真才算达标（无 condition 视为未达标）。"""
+    conds = chapter.get("condition") or []
+    if not conds:
+        return False
+    return all(bool(c.get("hit")) for c in conds)
+
+
+def chapter_condition_text(chapter: dict) -> str:
+    conds = chapter.get("condition") or []
+    return "；".join(str(c.get("name") or "") for c in conds if c.get("name"))
+
+
+# ---------------------------------------------------------------- 内容
+_PROMPT_RE = re.compile(r"AI\s*提示词[：:]\s*(.+?)(?:\n\s*\n|提交物|\Z)", re.S)
+
+
+def extract_prompt(requirement: str) -> str:
+    """题目常写着「复制下方提示词发给 AI」—— 第一轮就该发这段原文。
+
+    从 ``requirement`` 里抽出 ``AI提示词：…`` 之后的内容；抽不到返回空串。
+    """
+    m = _PROMPT_RE.search(requirement or "")
+    return (m.group(1).strip() if m else "")
+
+
+def build_round_prompt(chapter: dict, turn: int, history: list,
+                       requirement: str) -> str:
+    """给内容生成器的提示词。
+
+    第 1 轮优先用题目里给定的「AI提示词」原文（这是题目明确要求的做法）；
+    之后每轮要求 AI 结合要求继续追问，推动条件达成。
+    """
+    if turn == 1:
+        given = extract_prompt(requirement)
+        if given:
+            return given
+    return (
+        "我们正在完成课程里的 AI剧情 交互任务。\n"
+        f"章节：{chapter.get('title') or ''}\n"
+        f"任务要求：{(requirement or '')[:600]}\n"
+        f"对话轮次：第 {turn} 轮。\n"
+        "请以学生身份继续向智能体提问或补充计算过程，内容要贴合上面的要求、"
+        "有具体数值与推理，不要重复上一轮。"
+    )
+
+
+def pick_role_uuid(chats: dict, roles: list) -> str:
+    """挑**学生**角色（``type == 0``）作为发言身份。
+
+    ⚠️ 这里踩过坑：最初取的是 ``get-chats`` 首条消息的 ``roleUuid``（那是**智能体**
+    的开场白角色），结果自己发的内容被服务端记成了「智能体说的话」，学生一句没说，
+    评分自然是 0。回读 ``load-data?chapterRecordUuid=`` 才看清：
+    用智能体角色发 → 存成 ``type=1``；用学生角色发 → 存成 ``type=0``。
+    """
+    for role in roles:
+        # ⚠️ 不能写 `role.get("type") or -1` —— 学生的 type 恰好是 0（falsy），
+        # `0 or -1` 会得到 -1，导致永远选不到学生（真实踩过，且让校验也跟着误判）。
+        rtype = role.get("type")
+        if rtype is not None and int(rtype) == ROLE_STUDENT and role.get("uuid"):
+            return str(role["uuid"])
+    for group in (chats.get("chat") or []):
+        for msg in (group.get("chat") or []):
+            if msg.get("roleUuid"):
+                return str(msg["roleUuid"])
+    for role in roles:
+        if role.get("uuid"):
+            return str(role["uuid"])
+    return ""
+
+
+# ---------------------------------------------------------------- 交卷与评分
+def submit_chapter(session: requests.Session, study_url: dict, course: dict,
+                   record_uuid: str, chapter_uuid: str,
+                   chapter_record_uuid: str) -> dict:
+    """章节交卷：``POST /mooc2-ans/ai-evaluate/v2/answer/submit``。
+
+    实测交卷后该章 ``answerRecord[].status`` 由 0 变 1。
+    """
+    course_id, class_id, cpi = ld.extract_course_ids(study_url, course)
+    try:
+        r = session.post(f"{ld.MOOC_ANS_DOMAIN}/mooc2-ans/ai-evaluate/v2/answer/submit",
+                         params={"courseid": course_id, "clazzid": class_id, "cpi": cpi,
+                                 "recordUuid": record_uuid, "chapterUuid": chapter_uuid,
+                                 "chapterRecordUuid": chapter_record_uuid},
+                         timeout=90.0, headers=HEADERS)
+    except requests.RequestException as exc:
+        raise StoryError(f"章节交卷失败: {exc}") from exc
+    if r.status_code != 200:
+        raise StoryError(f"章节交卷返回 HTTP {r.status_code}")
+    return r.json()
+
+
+def evaluate_chapter(session: requests.Session, study_url: dict, course: dict,
+                     ai_enc: str, chapter_uuid: str, chapter_record_uuid: str,
+                     *, max_seconds: float = 300.0) -> str:
+    """触发该章的 AI 评分（``POST /ai-ans/ai-evaluate/v2/evaluate/stream``）。
+
+    ★ 三个**缺一不可**的参数（少任何一个都会得到「会话不存在」）：
+
+    * ``useJsonScheme=true``
+    * ``chapterUuid``
+    * ``chapterRecordUuid``
+
+    ⚠️ ``recordUuid`` 要传**章节记录**（``chapterRecordUuid``），不是整体记录。
+    返回从流里拼出的评估文本（含 ``totalScore``）。
+    """
+    course_id, class_id, cpi = ld.extract_course_ids(study_url, course)
+    params = {
+        "courseId": course_id, "clazzId": class_id, "cpi": cpi,
+        "aiEnc": ai_enc or "", "recordUuid": chapter_record_uuid,
+        "isPreview": 0, "useJsonScheme": "true",
+        "chapterUuid": chapter_uuid, "chapterRecordUuid": chapter_record_uuid,
+    }
+    try:
+        r = session.post(f"{ld.MOOC_ANS_DOMAIN}/ai-ans/ai-evaluate/v2/evaluate/stream",
+                         params=params, stream=True, timeout=(30.0, max_seconds),
+                         headers={"Accept": "text/event-stream",
+                                  "Cache-Control": "no-cache",
+                                  "Connection": "keep-alive",
+                                  "Content-Type": "application/json",
+                                  "Referer": HEADERS["Referer"]})
+    except requests.RequestException as exc:
+        raise StoryError(f"evaluate/stream 请求失败: {exc}") from exc
+    if r.status_code != 200:
+        raise StoryError(f"evaluate/stream 返回 HTTP {r.status_code}")
+
+    buf: list = []
+    try:
+        for raw in r.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+            line = raw.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload:
+                continue
+            try:
+                ev = json.loads(payload)
+            except ValueError:
+                buf.append(payload)
+                continue
+            if ev.get("status") is False:
+                msg = str(ev.get("msg") or "")
+                if "会话不存在" in msg:
+                    raise StoryError(f"evaluate/stream: {msg}"
+                                     f"（缺 useJsonScheme / chapter 参数？）")
+                logger.debug("evaluate 流报错: {}", msg)
+                continue
+            if ev.get("type") == "text" and isinstance(ev.get("content"), str):
+                buf.append(ev["content"])
+    finally:
+        r.close()
+    return "".join(buf)
+
+
+def parse_total_score(text: str) -> Optional[float]:
+    """从评估文本里取 ``totalScore``；取不到返回 None。"""
+    if not text:
+        return None
+    m = re.search(r'"totalScore"\s*:\s*([0-9]+(?:\.[0-9]+)?)', text)
+    if not m:
+        m = re.search(r"total\s*Score\D{0,4}([0-9]+(?:\.[0-9]+)?)", text, re.I)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def init_chapter_chain(session: requests.Session, base: dict,
+                       chapter_uuid: str, fallback_record: str = "") -> str:
+    """为新章节开链，返回该章的 ``chapterRecordUuid``。
+
+    ★ 这是推进到下一章的关键一步：`go-chapter` 只是"进入"，**不会**给出该章的
+    作答记录；必须再调 ``init-chain-answer``（**必须带 chapterUuid**）才会创建
+    一条新的章节记录并返回它的 UUID。
+
+    实测：``{"data": "98224ca7-…", "status": true}``；不带 ``chapterUuid`` 会得到
+    「作答信息为空」。
+
+    幂等处理：服务端在已有未交卷记录时会拒绝（「存在作答中的记录，不允许重新开始
+    新的作答」）。此时若调用方给出了 ``fallback_record``（当前进行中的记录），
+    就直接复用它继续作答 —— 否则整条流程会因为一次重跑而彻底卡死。
+    """
+    try:
+        data = _get(session, "init-chain-answer", {**base, "chapterUuid": chapter_uuid},
+                    timeout=60.0)
+    except StoryError as exc:
+        msg = str(exc)
+        if fallback_record and ("作答中" in msg or "不允许重新开始" in msg):
+            logger.info("该章已有作答中的记录，复用它继续：{}", fallback_record[:8])
+            return str(fallback_record)
+        raise
+    record = data if isinstance(data, str) else (data or {}).get("recordUuid")
+    if not record:
+        if fallback_record:
+            return str(fallback_record)
+        raise StoryError(f"init-chain-answer 未返回章节记录: {str(data)[:160]}")
+    return str(record)
+
+
+def condition_threshold(chapter: dict) -> Optional[float]:
+    """从条件名里解析分数阈值，如「分数达到90分」→ 90.0。"""
+    for text in ([chapter_condition_text(chapter)]
+                 + [str(c.get("name") or "") for c in (chapter.get("condition") or [])]):
+        m = re.search(r"(\d+(?:\.\d+)?)\s*分", text or "")
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+    return None
+
+
+# ---------------------------------------------------------------- 主持人 SSE
+AI_ANS = f"{ld.MOOC_ANS_DOMAIN}/ai-ans/ai-evaluate/story"
+
+HOST_AGENT_HEADERS = {
+    "Accept": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "Content-Type": "application/json",
+    "Referer": f"{ld.MOOC_ANS_DOMAIN}/ai-evaluate/v2/answer",
+}
+
+
+def read_uid(session: requests.Session) -> str:
+    """SSE 接口要 ``uid``，取 cookie 里的 ``_uid`` / ``UID`` / ``uid``。"""
+    try:
+        for ck in session.cookies:
+            if ck.name in ("_uid", "UID", "uid") and ck.value:
+                return str(ck.value)
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def host_agent(session: requests.Session, base: dict, chapter_uuid: str,
+               chapter_record_uuid: str, uid: str, user_content: str,
+               *, speak_role_type: int = ROLE_STUDENT, timeout: float = 180.0):
+    """把学生消息发给「AI 主持人」并**流式**读出事件。
+
+    这才是剧情对话的真正通道（``add-chat`` 只是把消息写进记录）：
+    它一边驱动智能体应答，一边把章节条件判定的结果以 SSE 事件推回来 ——
+    **条件达成时事件里带 ``triggered: true``**。JS 里正是靠这个字段判定
+    「本章完成」，而不是轮询 ``get-progress``。
+
+    逐个 ``yield`` 解析后的 JSON 事件，便于调用方即时看到 ``triggered``。
+    """
+    params = {
+        "previewType": 0,
+        "courseId": base.get("courseId") or "",
+        "clazzId": base.get("classId") or "",
+        "uid": uid,
+        "libraryUuid": base.get("libraryUuid") or "",
+        "publishRelationUuid": base.get("publishRelationUuid") or "",
+        "recordUuid": base.get("recordUuid") or "",
+        "chapterUuid": chapter_uuid,
+        "cpi": base.get("cpi") or "",
+        "speakRoleType": speak_role_type,
+        "chapterRecordUuid": chapter_record_uuid,
+        "npcReply": "false",
+    }
+    try:
+        r = session.post(f"{AI_ANS}/story-host-agent", params=params,
+                         json={"userContent": user_content or ""},
+                         headers=HOST_AGENT_HEADERS, stream=True, timeout=timeout)
+    except requests.RequestException as exc:
+        raise StoryError(f"story-host-agent 请求失败: {exc}") from exc
+    if r.status_code != 200:
+        raise StoryError(f"story-host-agent 返回 HTTP {r.status_code}")
+
+    try:
+        for raw in r.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+            line = raw.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload:
+                continue
+            try:
+                yield json.loads(payload)
+            except ValueError:
+                logger.debug("SSE 行无法解析: {}", line[:120])
+    finally:
+        r.close()
+
+
+def agent_triggered(events, on_event: Optional[Callable] = None) -> tuple[bool, str]:
+    """消费事件流，返回 ``(是否达成条件, 原因)``。"""
+    reason = ""
+    for ev in events:
+        if on_event:
+            on_event(ev)
+        if ev.get("reason"):
+            reason = str(ev["reason"])
+        elif ev.get("conditionDescription"):
+            reason = str(ev["conditionDescription"])
+        if ev.get("triggered"):
+            return True, reason
+    return False, reason
+
+
+def fetch_story_data(session: requests.Session, study_url: dict, course: dict,
+                     record_uuid: str, chapter_record_uuid: str) -> dict:
+    """剧情页真正的数据源：``load-data`` **带 chapterRecordUuid**。
+
+    ⚠️ 两个 UUID 必须分开传（``chapterRecordUuid`` 是章节记录、``recordUuid`` 是
+    整体记录）。我最初把同一个值塞给两个参数，服务端返回
+    ``{"status": false, "msg": "…"}``，于是误判「剧情没有章节数据」。
+
+    返回的数据里才有 ``conversationId`` / ``messages`` / ``chapter`` / ``subtype``
+    —— 这些都是 ``get-chats`` **看不到**的（我一度用 get-chats 验证落库，导致
+    把「其实写进去了」误判成「没写进去」）。
+    """
+    course_id, class_id, cpi = ld.extract_course_ids(study_url, course)
+    params = {
+        "courseid": course_id, "clazzid": class_id, "cpi": cpi,
+        "publishRelationUuid": ld.parse_publish_relation_uuid(study_url) or "",
+        "chapterRecordUuid": chapter_record_uuid,
+        "recordUuid": record_uuid,
+    }
+    try:
+        r = session.get(f"{ld.MOOC_ANS_DOMAIN}/mooc2-ans/ai-evaluate/v2/answer/load-data",
+                        params=params, timeout=30.0, headers=HEADERS)
+    except requests.RequestException as exc:
+        raise StoryError(f"load-data(chapterRecordUuid) 失败: {exc}") from exc
+    body = r.json() if r.status_code == 200 else {}
+    if not body.get("status"):
+        raise StoryError("load-data(chapterRecordUuid) 返回失败: "
+                         + str(body.get("errorMsg") or body.get("msg") or r.text[:120]))
+    return body.get("data") or {}
+
+
+def story_messages(data: dict) -> list:
+    """从 ``load-data`` 的结果里取全部对话消息（展平）。"""
+    out: list = []
+    for group in ((data.get("storyExtraData") or {}).get("chat") or []):
+        out.extend(group.get("chat") or [])
+    if not out:
+        out = list(data.get("messages") or [])
+    return out
+
+
+def student_message_count(data: dict) -> int:
+    """学生自己发的消息条数（用于确认"我发的"真的落库了）。
+
+    只看 ``type == 0`` —— 因为用错 roleUuid 时内容会变成 ``type=1``（智能体），
+    那样虽然"有内容"但学生等于没说话。
+
+    ⚠️ 同样要防 falsy-zero：``m.get("type") or -1`` 会把学生的 0 变成 -1，
+    结果"有学生消息"也被数成 0，校验形同虚设。
+    """
+    count = 0
+    for m in story_messages(data):
+        mtype = m.get("type")
+        if mtype is not None and int(mtype) == ROLE_STUDENT:
+            count += 1
+    return count
+
+
+# ---------------------------------------------------------------- 主流程
+def complete_story_task(session: requests.Session, course: dict, study_url: dict,
+                        generator: Any, *, options: Optional[dict] = None,
+                        on_log: Optional[Callable] = None) -> tuple[bool, str]:
+    """推进 AI剧情，**每章最多 ``story_max_rounds`` 轮**（默认 3）。
+
+    返回 ``(是否完成, 说明)``。遇到上传节点或用尽轮数时返回 ``False`` + 明确原因，
+    把剩余轮次留给用户自己做。
+    """
+    opts = options or {}
+    log = on_log or (lambda m: logger.info(m))
+    max_rounds = int(opts.get("story_max_rounds") or DEFAULT_MAX_ROUNDS)
+    delay = float(opts.get("story_round_delay") or 3.0)
+
+    if generator is None or not getattr(generator, "available", False):
+        raise StoryAbort("未配置 AI 接口（endpoint/key/model），无法进行剧情对话")
+
+    data = ld.load_data(session, ld.extract_course_ids(study_url, course)[0],
+                        ld.extract_course_ids(study_url, course)[1],
+                        ld.extract_course_ids(study_url, course)[2],
+                        ld.parse_publish_relation_uuid(study_url) or "")
+    if data.get("type") != ld.MODE_STORY:
+        raise StoryAbort(f"该任务点不是 AI剧情（type={data.get('type')}）")
+
+    base = base_params(study_url, course, data)
+    if not base["recordUuid"]:
+        raise StoryAbort("load-data 未返回 recordUuid，无法进入剧情作答")
+
+    uid = read_uid(session)
+    if not uid:
+        logger.warning("cookie 里没有 _uid/UID —— story-host-agent 可能拒绝请求")
+
+    progress = get_progress(session, base)
+    chapter = current_chapter(progress)
+    if not chapter:
+        raise StoryAbort("get-progress 未返回任何章节")
+
+    done_rounds = 0
+    chapters_done: list = []
+    visited: set = set()
+
+    # 允许从指定章节续做：平台一次只报"当前章"，已通过的章要靠 nextChapterUuid
+    # 链跳过，否则会把已经拿到的分数白重做一遍。
+    forced = str(opts.get("story_chapter_uuid") or "").strip()
+    if forced:
+        log(f"按设置从指定章节开始：{forced[:8]}…")
+        chapter = {**chapter, "uuid": forced}
+
+    while True:
+        title = chapter.get("title") or ""
+        subtype = int(chapter.get("subtype") or 0)
+        chapter_uuid = str(chapter.get("uuid") or "")
+
+        # 防死循环：服务端一次只报"当前章"，推进不顺时会原地打转（实测 get-progress
+        # 存在滞后），必须自己兜住，否则会无限重复同一章。
+        if chapter_uuid in visited:
+            return (not chapters_done), (
+                f"章节推进回到已处理过的章（{chapter_uuid[:8]}…），已停止以免空转。"
+                f"已完成：{', '.join(chapters_done) or '无'}")
+        visited.add(chapter_uuid)
+
+        if subtype == PLAN_TYPE_UPLOAD:
+            return (not chapters_done), (
+                f"进行到「{title}」是**上传作品**节点，该节点尚未自动化。"
+                f"前面已完成 {len(chapters_done)} 章：{', '.join(chapters_done) or '无'}；"
+                f"请手动上传报告")
+
+        # ---- 0) 已通过的章直接跳过 ----
+        conds = chapter.get("condition") or []
+        nxt0 = conds[0].get("nextChapterUuid") if conds else None
+        recs0 = chapter.get("answerRecord") or [{}]
+        score0 = recs0[0].get("score")
+        thr0 = condition_threshold(chapter)
+        if (int(chapter.get("status") or 0) == 2 and score0 is not None
+                and thr0 is not None and float(score0) >= thr0 and nxt0):
+            log(f"「{title}」此前已通过（{score0} 分），跳过并进入下一章")
+            chapters_done.append(f"{title}({score0})")
+            chapter = {**chapter, "uuid": str(nxt0)}
+            continue
+
+        # ---- 1) 进入该章并为它开链（拿到本章的作答记录）----
+        log(f"进入章节「{title or chapter_uuid[:8]}」")
+        info = enter_chapter(session, base, chapter_uuid)
+        if info.get("title"):
+            title = str(info["title"])
+            chapter = {**chapter, "title": title}
+        chapter_record = init_chapter_chain(session, base, chapter_uuid,
+                                            fallback_record=str(chapter.get("chapterRecordUuid") or ""))
+        log(f"「{title}」作答记录 {chapter_record[:8]}…")
+
+        # 该章自己的数据（含 requirement —— load-data 带 chapterRecordUuid 才有，
+        # get-nodes / go-chapter 都拿不到）
+        cdata = fetch_story_data(session, study_url, course, base["recordUuid"],
+                                 chapter_record)
+        requirement = cdata.get("requirement") or chapter.get("requirement") or ""
+        if cdata.get("title"):
+            title = str(cdata["title"])
+        if not requirement:
+            logger.warning("「{}」未取到 requirement，生成内容会缺少题目背景", title)
+
+        # ---- 2) 对话（受 story_max_rounds 限制）----
+        chats = get_chats(session, base, chapter_uuid)
+        roles = get_roles(session, base)
+        role_uuid = pick_role_uuid(chats, roles)
+        if not role_uuid:
+            raise StoryAbort("未能确定学生角色 roleUuid，无法发言")
+        requirement = chapter.get("requirement") or ""
+        rounds_here = 0
+        while rounds_here < max_rounds:
+            prompt = build_round_prompt(chapter, rounds_here + 1, [], requirement)
+            content = generator.generate_chat_reply(prompt, history=[],
+                                                    role_hint=requirement[:300])
+            if not content or not str(content).strip():
+                raise StoryAbort(f"「{title}」第 {rounds_here + 1} 轮未生成内容，已中止")
+            before = student_message_count(
+                fetch_story_data(session, study_url, course, base["recordUuid"],
+                                 chapter_record))
+            add_chat(session, base, chapter_record, role_uuid, str(content).strip())
+            time.sleep(delay)
+            after = student_message_count(
+                fetch_story_data(session, study_url, course, base["recordUuid"],
+                                 chapter_record))
+            if after <= before:
+                raise StoryError(
+                    f"add-chat 返回成功但学生消息未落库（{before}→{after}）；已停止")
+            rounds_here += 1
+            done_rounds += 1
+            log(f"「{title}」第 {rounds_here}/{max_rounds} 轮已写入"
+                f"（{len(str(content))} 字，学生发言累计 {after} 条）")
+
+        # ---- 3) 交卷 ----
+        log(f"「{title}」交卷…")
+        submit_chapter(session, study_url, course, base["recordUuid"],
+                       chapter_uuid, chapter_record)
+        time.sleep(3.0)
+
+        # ---- 4) 评分 ----
+        log(f"「{title}」触发 AI 评分…")
+        text = evaluate_chapter(session, study_url, course, data.get("aiEnc") or "",
+                                chapter_uuid, chapter_record)
+        ai_score = parse_total_score(text)
+
+        # ---- 5) 判定与推进 ----
+        chapter = current_chapter(get_progress(session, base)) or chapter
+        # ⚠️ answerRecord 是**多次尝试**的列表；必须取与本次 chapter_record 匹配的那条，
+        # 取 recs[0] 会读到上一次尝试的分数（实测把旧成绩 100 当成了本次成绩）。
+        recs = chapter.get("answerRecord") or []
+        cur = next((r for r in recs if str(r.get("uuid")) == chapter_record),
+                   recs[-1] if recs else {})
+        real_score = cur.get("score")
+        threshold = condition_threshold(chapter)
+        nxt = ((chapter.get("condition") or [{}])[0]).get("nextChapterUuid")
+
+        # ⚠️ 必须先回落再判定：流式文本的解析可能失败（实测就失败过 —— 分片把
+        # `"totalScore"` 拆成了 `"total` + `Score"`，导致正则没命中）。若先判定
+        # 再回落，就会把「100 分」判成「未达到 90 分」。
+        if ai_score is None:
+            if text:
+                logger.debug("评分文本未解析出 totalScore，前 200 字: {!r}", text[:200])
+            ai_score = real_score
+        if not isinstance(ai_score, (int, float)) or isinstance(ai_score, bool):
+            try:
+                ai_score = float(ai_score)
+            except (TypeError, ValueError):
+                ai_score = None
+        passed = (ai_score is not None and threshold is not None
+                  and float(ai_score) >= float(threshold)) or chapter_hit(chapter)
+        log(f"「{title}」得分 {ai_score}（达到 {threshold} 分即通过）")
+
+        if not passed:
+            return False, (f"「{title}」得分 {ai_score}，未达到 "
+                           f"{threshold if threshold is not None else '?'} 分；"
+                           f"已完成 {len(chapters_done)} 章，按设置停手")
+        chapters_done.append(f"{title}({ai_score})")
+        log(f"「{title}」通过 ✅")
+
+        if not nxt:
+            return True, (f"AI剧情已全部完成：{'；'.join(chapters_done)}"
+                          f"（共 {done_rounds} 轮对话）")
+        enter_chapter(session, base, str(nxt))
+        chapter = current_chapter(get_progress(session, base)) or chapter
+        # go-chapter 后 get-progress 可能仍指向上一章；用 nextChapterUuid 兜底
+        if str(chapter.get("uuid") or "") == chapter_uuid:
+            home = go_home(session, base)
+            if str(home.get("chapterUuid") or "") == chapter_uuid:
+                chapter = {**chapter, "uuid": str(nxt)}
+        if not chapter:
+            return True, (f"AI剧情已完成：{'；'.join(chapters_done)}")

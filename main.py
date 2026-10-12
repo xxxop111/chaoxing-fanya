@@ -90,6 +90,24 @@ def parse_args():
         help="遇到关闭任务点时的行为: retry-重试, ask-询问, continue-继续"
     )
 
+    # ---- 泛雅「任务」模块（任务引擎）自动化 ----
+    parser.add_argument(
+        "--fanya-tasks", action="store_true",
+        help="处理课程「任务」标签下的任务点（AI实践/主题讨论/作业/文档/视频等），默认只盘点不执行",
+    )
+    parser.add_argument(
+        "--fanya-execute", action="store_true",
+        help="配合 --fanya-tasks：真正执行自动完成（不加则只输出盘点结果）",
+    )
+    parser.add_argument(
+        "--fanya-plans", type=str, default=None,
+        help="只处理指定的任务点 planId，以逗号分隔",
+    )
+    parser.add_argument(
+        "--also-study", action="store_true",
+        help="配合 --fanya-tasks：处理完「任务」后继续原有的章节学习",
+    )
+
     # 在解析之前捕获 -h 的行为
     if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
         parser.print_help()
@@ -157,9 +175,9 @@ def build_config_from_args(args):
     return common_config, {}, {}
 
 
-def init_config():
+def init_config(args=None):
     """初始化配置"""
-    args = parse_args()
+    args = args if args is not None else parse_args()
     
     if args.config:
         return load_config_from_file(args.config)
@@ -283,6 +301,13 @@ class JobProcessor:
         self.threads: list[threading.Thread] = []
         self.worker_num = config["jobs"]
         self.config = config
+        # 优雅停止信号：置位后不再领取新章节，正在跑的章节收尾后退出
+        self.stop_event = (config or {}).get("stop_event")
+        self.stopped_tasks: list[ChapterTask] = []
+
+    def _stop_requested(self) -> bool:
+        """是否已请求停止（来自前端的「停止」按钮）。"""
+        return self.stop_event is not None and self.stop_event.is_set()
 
     def run(self):
         for task in self.tasks:
@@ -298,6 +323,12 @@ class JobProcessor:
         self.task_queue.join()
         time.sleep(0.5)
 
+        if self._stop_requested():
+            logger.warning(
+                "停止请求生效：已处理 {} 个章节，剩余 {} 个章节未开始",
+                len(self.tasks) - len(self.stopped_tasks), len(self.stopped_tasks),
+            )
+
 
     @log_error
     def worker_thread(self):
@@ -308,6 +339,14 @@ class JobProcessor:
             except ShutDown:
                 logger.info("Queue shut down")
                 return
+
+            # 优雅停止：不再开始新章节。这里依然 task_done() 把队列消费干净，
+            # 使 task_queue.join() 能正常返回，而不是硬杀工作线程。
+            if self._stop_requested():
+                self.stopped_tasks.append(task)
+                logger.info("已请求停止，跳过未开始的章节: {}", task.point.get("title"))
+                self.task_queue.task_done()
+                continue
 
             # 处理单个章节，并在需要时通过 config 中的回调上报章节完成进度
             task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed, self.config)
@@ -444,6 +483,22 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     for i, point in enumerate(point_list["points"]):
         task = ChapterTask(point=point, index=i)
         tasks.append(task)
+
+    # 章节上限：只处理前 N 章（按章节序号），其余章节完全不请求、不修改。
+    # 注意已完成的章节也算在序号里 —— 它们会被瞬间跳过，但不占用“新刷”的额度。
+    max_chapters = (config or {}).get("max_chapters")
+    if max_chapters:
+        try:
+            max_chapters = int(max_chapters)
+        except (TypeError, ValueError):
+            max_chapters = 0
+        if max_chapters > 0 and len(tasks) > max_chapters:
+            logger.warning(
+                "章节上限 {}: 本课程共 {} 章，本次只处理前 {} 章，剩余 {} 章保持原样",
+                max_chapters, len(tasks), max_chapters, len(tasks) - max_chapters,
+            )
+            tasks = tasks[:max_chapters]
+
     p = JobProcessor(chaoxing, course, tasks, config)
     p.run()
 
@@ -511,11 +566,103 @@ def format_time(num, suffix='', divisor=''):
     return f"{mins:02d}:{sec:02d}"
 
 
+def _fmt_progress(value) -> str:
+    """任务进度格式化。
+
+    多数任务返回 0~1 的比例，但实测个别任务（COM0018A 的项目1/项目2）返回的是
+    8.33 这样的百分数，一律乘 100 会显示成「833%」。
+    """
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if 0.0 <= num <= 1.0:
+        return f"{num * 100:.1f}%"
+    return f"{num:g}（服务端原始值，疑似百分数）"
+
+
+def run_fanya_tasks(chaoxing: Chaoxing, course_task: list, common_config: dict,
+                    tiku_config: dict, execute: bool, plan_ids: list[int] | None) -> None:
+    """处理课程「任务」模块（任务引擎）下的任务点。
+
+    默认只做只读盘点并把结果打印出来；加 ``--fanya-execute`` 才真正执行。
+    """
+    from api.fanya_task import (
+        ContentGenerator, FanyaTaskClient, FanyaTaskRunner, build_task_preview,
+    )
+
+    client = FanyaTaskClient()
+
+    if not execute:
+        logger.info("开始盘点课程「任务」模块（只读，不会修改任何学习记录）")
+        preview = build_task_preview(chaoxing, course_task, client=client)
+        summary = preview["summary"]
+        print("\n" + "=" * 72)
+        print(f"课程「任务」盘点结果：{summary['courseCount']} 门课程存在任务，"
+              f"{summary['taskCount']} 个任务")
+        print(f"待完成任务点 {summary['pendingCount']} 个："
+              f"可自动完成 {summary['completableCount']} 个，"
+              f"需人工 {summary['manualCount']} 个，"
+              f"暂未支持 {summary['unsupportedCount']} 个")
+        print("=" * 72)
+        for course in preview["courses"]:
+            if not course["hasTaskEngine"]:
+                continue
+            print(f"\n■ {course['title']}  ({course['courseId']})")
+            if course.get("error"):
+                print(f"    ! {course['error']}")
+            for task in course["tasks"]:
+                print(f"  · {task['name']}  进度 {_fmt_progress(task['progress'])}"
+                      f"{'' if task['allowStudy'] else '  [不在学习时间内]'}")
+                for item in task["items"]:
+                    if item["isFinish"]:
+                        continue
+                    mark = {"auto": "√", "partial": "△", "manual": "×",
+                            "pending": "?"}.get(item["status"], "?")
+                    print(f"      {mark} [{item['typeLabel']}] {item['name'][:48]}"
+                          f"  — {item['note'] or item['skipReason']}")
+        print("\n提示：加上 --fanya-execute 才会真正执行自动完成。\n")
+        return
+
+    generator = ContentGenerator.from_tiku_config(tiku_config)
+    if generator.available:
+        logger.info(f"作答内容生成已启用：{generator.model}")
+    else:
+        logger.warning("未配置 AI 接口，需要文字作答的任务将使用模板文本")
+
+    runner = FanyaTaskRunner(chaoxing=chaoxing, client=client, generator=generator)
+
+    if plan_ids:
+        wanted = {int(x) for x in plan_ids}
+        logger.info(f"只处理指定的 {len(wanted)} 个任务点")
+        for course in course_task:
+            try:
+                tasks = client.get_course_tasks(course["courseId"], course["clazzId"])
+            except Exception as exc:
+                logger.error(f"课程「{course.get('title')}」任务读取失败: {exc}")
+                continue
+            for task in tasks:
+                runner.run_task(course, task, only_plan_ids=list(wanted))
+    else:
+        runner.run_courses(course_task)
+
+    results = runner.results
+    ok = len([r for r in results if r["ok"]])
+    skipped = len([r for r in results if r["skipped"]])
+    failed = len(results) - ok - skipped
+    logger.info(f"「任务」模块处理结束：成功 {ok} 个，失败 {failed} 个，跳过 {skipped} 个")
+    for r in results:
+        if not r["ok"] and not r["skipped"]:
+            logger.warning(f"未完成：{r['courseTitle']} / {r['taskName']} / "
+                           f"{r['name']} — {r['message']}")
+
+
 def main():
     """主程序入口"""
     try:
         # 初始化配置
-        common_config, tiku_config, notification_config = init_config()
+        args = parse_args()
+        common_config, tiku_config, notification_config = init_config(args)
         
         # 强制播放按照配置文件调节
         common_config["speed"] = min(2.0, max(1.0, common_config.get("speed", 1.0)))
@@ -540,6 +687,22 @@ def main():
         
         # 过滤要学习的课程
         course_task = filter_courses(all_course, common_config.get("course_list"))
+        
+        # 处理课程「任务」模块（任务引擎：AI实践 / 主题讨论 / 作业 / 文档 / 视频 …）
+        if getattr(args, "fanya_tasks", False):
+            plan_ids = None
+            if args.fanya_plans:
+                try:
+                    plan_ids = [int(x.strip()) for x in args.fanya_plans.split(",") if x.strip()]
+                except ValueError:
+                    raise InputFormatError("--fanya-plans 需要以逗号分隔的数字 planId")
+            run_fanya_tasks(
+                chaoxing, course_task, common_config, tiku_config,
+                execute=bool(args.fanya_execute), plan_ids=plan_ids,
+            )
+            if not args.also_study:
+                logger.info("「任务」模块处理完毕（未指定 --also-study，跳过章节学习）")
+                return
         
         # 开始学习
         logger.info(f"课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")

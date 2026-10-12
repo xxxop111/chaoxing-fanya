@@ -16,6 +16,10 @@ eggs/
 .eggs/
 lib/
 lib64/
+# 例外：前端源码目录。上面的 Python 规则 `lib/` 会连带忽略 web/src/lib/，
+# 导致 src/lib/utils.js 从未被提交，vite 构建报 "Could not resolve ../../lib/utils"。
+!web/src/lib/
+!web/src/lib/**
 parts/
 sdist/
 var/
@@ -167,3 +171,34 @@ get-pip.py
 web/node_modules/
 web/dist/
 web/.vite/
+
+# ---- 逆向排查产物（含账号标识，绝不提交）----
+_*.md
+_*.py
+_*.json
+_*.html
+_*.out
+_*.err
+_*_probe/
+_js/
+.chaoxing_app.pid
+*.log
+chaoxing.log
+desktop_app.log
+current-screen.png
+devtools.png
+作品/
+
+pip-metadata-*/
+pip-unpack-*/
+fanya-foreground.png
+
+
+# 本地调试脚本与截图
+_*.ps1
+_*.png
+
+
+# 本机 npm 源配置（不该强加给其他用户）
+web/.npmrc
+
