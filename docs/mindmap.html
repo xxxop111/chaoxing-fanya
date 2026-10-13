@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>超星学习通课程自动化助手 · 功能思维导图</title>
+<style>
+  :root{
+    --bg:#0f1419; --panel:#151b23; --line:#2a3441; --fg:#e6edf3; --dim:#8b98a5;
+    --c-auto:#2ea043;      /* 全自动 */
+    --c-semi:#d29922;      /* 半自动 */
+    --c-manual:#6e7681;    /* 需人工 */
+    --c-core:#58a6ff;      /* 核心 */
+    --c-new:#a371f7;       /* 本项目新增 */
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.6 "PingFang SC","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1560px;margin:0 auto;padding:30px 22px 40px}
+
+  header{text-align:center;padding:4px 0 22px}
+  h1{margin:0 0 6px;font-size:27px;letter-spacing:.5px}
+  .sub{color:var(--dim);font-size:13px}
+  .legend{display:flex;gap:18px;justify-content:center;flex-wrap:wrap;margin-top:18px;font-size:12.5px}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+
+  /* ── 根节点 ── */
+  .root{
+    margin:24px auto 0; max-width:760px; text-align:center;
+    background:linear-gradient(135deg,#1f6feb22,#a371f722);
+    border:1px solid var(--c-core); border-radius:14px; padding:18px 26px;
+  }
+  .root h2{margin:0 0 4px;font-size:19px}
+  .root p{margin:0;color:var(--dim);font-size:12.5px}
+  .stem{width:2px;height:22px;background:var(--line);margin:0 auto}
+
+  /* ── 主干网格 ── */
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:13px;align-items:start}
+  .branch{
+    background:var(--panel); border:1px solid var(--line); border-radius:11px;
+    padding:13px 15px; position:relative;
+  }
+  .branch::before{
+    content:""; position:absolute; left:0; top:13px; bottom:13px; width:3px;
+    border-radius:3px; background:var(--accent,var(--c-core));
+  }
+  .branch.sp{grid-column:span 3}
+  .branch.sp ul{display:grid;grid-template-columns:repeat(3,1fr);gap:0 22px}
+  .branch > h3{
+    margin:0 0 9px; font-size:14px; display:flex; align-items:center; gap:7px;
+    color:var(--accent,var(--c-core));
+  }
+  .branch > h3 .tag{
+    font-size:10.5px;font-weight:400;padding:1px 7px;border-radius:20px;
+    background:#ffffff12;color:var(--dim);letter-spacing:.3px;
+  }
+  ul{list-style:none;margin:0;padding:0}
+  li{position:relative;padding:3.5px 0 3.5px 15px;font-size:12.5px;color:#c9d1d9;line-height:1.45}
+  li::before{
+    content:"";position:absolute;left:0;top:12px;width:6px;height:6px;
+    border-radius:50%;background:var(--line);
+  }
+  li.auto::before{background:var(--c-auto)}
+  li.semi::before{background:var(--c-semi)}
+  li.manual::before{background:var(--c-manual)}
+  li b{color:var(--fg);font-weight:600}
+  li small{display:block;color:var(--dim);font-size:11px;line-height:1.5;margin-top:1px}
+  .badge{
+    display:inline-block;font-size:9.5px;padding:1px 6px;border-radius:4px;
+    vertical-align:1px;margin-left:5px;font-weight:700;letter-spacing:.2px;
+    white-space:nowrap;
+  }
+  .b-auto{background:#1f6f2e;color:#7ee787;border:1px solid #2ea043}
+  .b-semi{background:#6b4a09;color:#f0c674;border:1px solid #d29922}
+  .b-manual{background:#3a4048;color:#b8c0c8;border:1px solid #6e7681}
+  .b-score{background:#12406e;color:#79c0ff;border:1px solid #58a6ff}
+
+  /* ── 数据条 ── */
+  .stats{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin:24px 0 0}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 10px;text-align:center}
+  .stat b{display:block;font-size:22px;color:var(--c-core);line-height:1.25}
+  .stat span{font-size:11px;color:var(--dim)}
+
+  footer{margin-top:30px;padding-top:16px;border-top:1px solid var(--line);
+         color:var(--dim);font-size:11px;text-align:center;line-height:1.85}
+
+  @media (max-width:1280px){
+    .grid{grid-template-columns:repeat(2,1fr)}
+    .branch.sp{grid-column:span 2}
+    .branch.sp ul{grid-template-columns:repeat(2,1fr)}
+    .stats{grid-template-columns:repeat(3,1fr)}
+  }
+  @media (max-width:860px){
+    .grid{grid-template-columns:1fr}
+    .branch.sp{grid-column:span 1}
+    .branch.sp ul{grid-template-columns:1fr}
+    .stats{grid-template-columns:repeat(2,1fr)}
+  }
+  @media print{
+    body{background:#fff;color:#111}
+    .branch,.root,.stat{background:#fff;border-color:#ccc;break-inside:avoid}
+    li{color:#222} li small{color:#666}
+    .branch > h3{color:#000}
+    .no-print{display:none}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>超星学习通课程自动化助手</h1>
+  <div class="sub">功能思维导图 · chaoxing-fanya（基于 Samueli924/chaoxing 二次开发 · GPL-3.0）</div>
+  <div class="legend">
+    <span><i class="dot" style="background:var(--c-auto)"></i>全自动</span>
+    <span><i class="dot" style="background:var(--c-semi)"></i>半自动 / 需审批</span>
+    <span><i class="dot" style="background:var(--c-manual)"></i>需人工</span>
+    <span><i class="dot" style="background:var(--c-core)"></i>本项目新增</span>
+  </div>
+</header>
+
+<!-- ══════════ 根 ══════════ -->
+<div class="root">
+  <h2>chaoxing-fanya</h2>
+  <p>GUI 化的超星课程自动化助手 · Web / Windows 桌面版 / 命令行三入口</p>
+  <p style="margin-top:6px;color:#8b98a5">
+    <code>app.py</code>（Flask） · <code>desktop_app.py</code>（桌面） · <code>main.py</code>（CLI）
+  </p>
+</div>
+<div class="stem"></div>
+
+<!-- ══════════ 六大主干 ══════════ -->
+<div class="grid">
+
+  <!-- ── 1 ── -->
+  <div class="branch" style="--accent:var(--c-core)">
+    <h3>① 登录与账号<span class="tag">入口</span></h3>
+    <ul>
+      <li><b>手机号 + 密码</b><small>可勾选「记住密码」存本机 localStorage，界面明确提示可随时清除</small></li>
+      <li><b>Cookies 登录</b><small><code>use_cookies = true</code> 时忽略账号密码</small></li>
+      <li><b>验证码识别</b><small><code>api/captcha.py</code></small></li>
+      <li><b>加密与字体反爬</b><small><code>api/cipher.py</code> · <code>api/cxsecret_font.py</code> · <code>api/font_decoder.py</code></small></li>
+      <li><b>会话保活</b><small><code>api/base.py</code> SessionManager</small></li>
+    </ul>
+  </div>
+
+  <!-- ── 2 ── -->
+  <div class="branch" style="--accent:var(--c-auto)">
+    <h3>② 章节任务点<span class="tag">原项目已有</span></h3>
+    <ul>
+      <li><b>课程列表 / 多选</b><small>勾选即同步，无需先保存配置</small></li>
+      <li class="auto"><b>视频</b> — 进度上报 + 心跳<span class="badge b-auto">自动</span>
+        <small>播放倍速 1.0–2.0，并发章节数可调</small></li>
+      <li class="auto"><b>文档 / 阅读</b><span class="badge b-auto">自动</span></li>
+      <li class="auto"><b>音频</b><span class="badge b-auto">自动</span></li>
+      <li class="semi"><b>作业 / 测验</b> — 题库作答<span class="badge b-semi">审批后提交</span>
+        <small>逐题作答 → 覆盖率校验 → 提交</small></li>
+      <li><b>实时进度监控</b><small>课程进度 / 章节统计 / 任务状态，支持「优雅停止」：不再开新章节，当前章节收尾后退出</small></li>
+      <li><b>未开放章节策略</b><small><code>notopen_action = retry | continue</code></small></li>
+    </ul>
+  </div>
+
+  <!-- ── 3 ── -->
+  <div class="branch" style="--accent:var(--c-new)">
+    <h3>③ 「任务」模块 <span class="tag">本项目新增</span></h3>
+    <ul>
+      <li><b>两套互不相通的系统</b>
+        <small><code>mooc1</code> 章节任务点 vs <code>task.chaoxing.com</code>「任务」标签 —— 原项目完全没有后者，本项目补了整层：任务点发现 → 类型适配注册表 → 12 个处理器</small></li>
+      <li><b>只读盘点 <code>预览</code></b><small>摊开每个任务点的类型、进度、完成条件、<b>能否自动完成</b>，以及不能的话为什么（<code>需先备材料</code> / <code>暂未支持</code> / <code>学习窗口未开放</code>）</small></li>
+      <li><b>类型适配注册表</b><small><code>planType → AdapterSpec(handler, status, label, note)</code>，14 种类型</small></li>
+      <li><b>诚实降级</b><small><code>effective_status()</code>：注册表声明的是<b>目标</b>状态，处理器没写就自动降级为「尚未实现」，界面绝不虚报全能</small></li>
+      <li><b>命令行</b><small><code>--fanya-tasks</code>（只读盘点）· <code>--fanya-execute</code>（执行）· <code>--fanya-plans 1,2</code></small></li>
+    </ul>
+  </div>
+
+  <!-- ── 4 ── -->
+  <div class="branch sp" style="--accent:var(--c-semi)">
+    <h3>④ 12 个任务处理器<span class="tag">能力矩阵 · 按实测状态标注</span></h3>
+    <ul>
+      <li class="auto"><b>视频</b>（planType 10）<span class="badge b-auto">已实测</span>
+        <small>任务引擎自有播放页 <code>videoStudy/learnPage</code>，上报 <code>videoDataLog</code> 一次到位，<code>isFinish</code> 立即翻转</small></li>
+      <li class="auto"><b>文档</b>（11）<span class="badge b-auto">已实测</span><small><code>documentStudy/readEnd</code></small></li>
+      <li class="auto"><b>章节 / 知识点</b>（8 / 1）<span class="badge b-auto">已实测</span><small>复用章节任务点流程</small></li>
+      <li class="auto"><b>作业</b>（4）<span class="badge b-semi">审批后提交</span>
+        <small>mooc2 课程作业，需单独适配器（<code>knowledgeid=0</code> 不在章节里）</small></li>
+      <li class="auto"><b>主题讨论</b>（14）<span class="badge b-auto">已实测</span>
+        <small>AI 生成回复并提交；提交前先检测是否已回复，避免重复</small></li>
+      <li class="auto"><b>音频</b>（22）<span class="badge b-auto">未验证</span><small>与视频同构；本账号无样本</small></li>
+      <li class="semi"><b>自测 / 测验</b>（17 / 5）<span class="badge b-semi">默认只暂存</span>
+        <small>题库作答；须显式开「考试交卷」才提交。过期样本无法补完成</small></li>
+      <li class="semi"><b>分组任务</b>（18）<span class="badge b-semi">默认不提交</span>
+        <small>提交会覆盖全组已有内容，故默认拒绝覆盖；完成取决于评分 ≥60</small></li>
+      <li class="manual"><b>问卷</b>（6）· <b>线下课堂</b>（20）· <b>AI课堂</b>（10042）<span class="badge b-manual">需人工</span>
+        <small>走超星 OA 表单 / 教师侧记录 / 第三方棱镜课堂，客户端不上报泛雅</small></li>
+    </ul>
+  </div>
+
+  <!-- ── 5 ── -->
+  <div class="branch" style="--accent:var(--c-new)">
+    <h3>⑤ AI 实践 <span class="tag">5 个子模式</span></h3>
+    <ul>
+      <li class="auto"><b>代码实践</b>（mode 4）<span class="badge b-score">实测 76 分</span>
+        <small>AI 生成代码 → 自测运行校验 → 建卷交卷 → SSE 出分</small></li>
+      <li class="auto"><b>思维阶梯</b>（mode 2）<span class="badge b-score">实测 85 分</span>
+        <small>拆题 → 8 轮逐题作答（含多选）→ 交卷 → 结题报告出分</small></li>
+      <li class="semi"><b>上传作品</b>（mode 1）<span class="badge b-score">实测 93 分</span>
+        <small>生成作品 → 渲染 PNG → 传网盘 → 挂附件 → 交卷 → AI 评分；<br>交卷前<b>回读校验附件确实挂上</b>，挂不上则中止（不会交空记录）</small></li>
+      <li class="semi"><b>情景对话</b>（mode 0）<span class="badge b-semi">未真机验证</span>
+        <small>生成场景 → 多轮对话 → 交卷 → 评估出分；带中止保护</small></li>
+      <li class="semi"><b>AI剧情</b>（mode 7）<span class="badge b-semi">链路已打通</span>
+        <small>章节 + 节点结构（4 段对话 + 1 个上传报告）。<b>交卷不可逆</b>（部分课程 <code>enableReset=false</code>），故不代提交，需你确认</small></li>
+    </ul>
+  </div>
+
+  <!-- ── 6 ── -->
+  <div class="branch" style="--accent:var(--c-auto)">
+    <h3>⑥ 安全护栏与可靠性<span class="tag">本项目新增</span></h3>
+    <ul>
+      <li class="semi"><b>生成 → 审批 → 提交</b>
+        <small>凡会写进你账号的内容（作业答案、讨论回复、AI 实践作答）<b>默认只生成、不提交</b>，在「待审批」面板摊开，你逐条核对过才真正提交。<br>动机很实际：早期版本直接把内容交上去过，<b>出过事故</b>。</small></li>
+      <li><b>拒答识别硬防线</b>
+        <small>题库偶尔把「我看不到题目，请提供文字描述」当成答案返回；这类元回复会被识别并按「未命中」处理，<b>绝不会写进作业</b>。全部未命中时直接拒绝提交。</small></li>
+      <li><b>修掉过的静默失败</b>
+        <small>「报告成功、其实做错」比崩溃更糟，因为你会信任它。已修：判断题必须发 <code>true</code>/<code>false</code>（发「对/错」服务端拒绝整份提交）；上传作品附件载荷是<b>扁平数组</b>而非卡片结构。</small></li>
+      <li><b>单元测试</b><small><code>tests/test_parsers.py</code> 解析层 24 个用例 + <code>tools/smoke_test.py</code> 冒烟 + GitHub Actions</small></li>
+      <li><b>通知</b><small>PushPlus / Bark / 钉钉 / 飞书 / 企业微信</small></li>
+    </ul>
+  </div>
+
+  <!-- ── 7 ── -->
+  <div class="branch" style="--accent:var(--c-core)">
+    <h3>⑦ 题库与 AI 能力<span class="tag">可插拔</span></h3>
+    <ul>
+      <li><b>题库提供商</b><small>言溪题库 · LIKE 知识库 · AI 大模型 · 硅基流动 · TikuAdapter · 不使用</small></li>
+      <li><b>覆盖率策略</b><small><code>cover_rate</code> 低于阈值不提交；<code>min_interval_seconds</code> 限速</small></li>
+      <li><b>AI 配置</b><small>endpoint / key / model / 单卷最大并发题目数</small></li>
+      <li><b>OCR</b><small>独立 OCR 提供商配置（图片题）</small></li>
+      <li><b>内容生成器</b><small><code>ContentGenerator</code>：讨论回复、AI 实践作答等文本统一走这里</small></li>
+    </ul>
+  </div>
+
+  <!-- ── 8 ── -->
+  <div class="branch" style="--accent:var(--c-new)">
+    <h3>⑧ 交付与部署<span class="tag">三入口</span></h3>
+    <ul>
+      <li><b>Web 版</b><small><code>app.py</code>（Flask :5000）+ React 18 / Vite 5 / Tailwind 3.4 / Headless UI（:3000）</small></li>
+      <li><b>Windows 桌面版</b><small><code>build_desktop_app.bat deploy</code> → <code>dist\chaoxing-fanya\chaoxing-fanya.exe</code>，无控制台黑框，双击即用</small></li>
+      <li><b>命令行</b><small><code>python main.py</code> / <code>--fanya-tasks</code> / <code>--fanya-execute</code> / <code>--fanya-plans</code></small></li>
+      <li><b>Docker</b><small><code>docker run -v /本地/config.ini:/config/config.ini chaoxing</code></small></li>
+      <li><b>一键启动</b><small><code>start.bat</code> / <code>stop.bat</code> / <code>clean_cache.bat</code></small></li>
+    </ul>
+  </div>
+
+  <!-- ── 9 ── -->
+  <div class="branch" style="--accent:var(--c-new)">
+    <h3>⑨ 逆向产出的文档<span class="tag">别人没有的部分</span></h3>
+    <ul>
+      <li><b>任务引擎接口文档</b><small><code>docs/FANYA_TASK_API.md</code> —— 逐条标注「已验证 / 推断 / 未验证」</small></li>
+      <li><b>上传作品型完整配方</b><small><code>docs/AI实践-上传作品型-配方.md</code> —— 从起浏览器到交卷的五个环节可复现步骤</small></li>
+      <li><b>被推翻的结论也留着</b><small>例：曾写「AI剧情评分必须由浏览器建立会话」——实测证明是错的，根因只是 <code>evaluate/stream</code> 的 <code>recordUuid</code> 传错了记录；传章节记录得到「会话不存在」，传外层记录服务端正常应答。更正理由写在原地，不悄悄删。</small></li>
+      <li><b>上游文档归档</b><small><code>docs/legacy/</code> 9 篇</small></li>
+    </ul>
+  </div>
+
+</div>
+
+<!-- ══════════ 数据条 ══════════ -->
+<div class="stats">
+  <div class="stat"><b>14</b><span>planType 类型</span></div>
+  <div class="stat"><b>12</b><span>任务处理器</span></div>
+  <div class="stat"><b>5</b><span>AI 实践子模式</span></div>
+  <div class="stat"><b>122 / 127</b><span>可自动完成任务点</span></div>
+  <div class="stat"><b>24</b><span>解析层单元测试</span></div>
+  <div class="stat"><b>3</b><span>运行入口</span></div>
+</div>
+
+<footer>
+  <b>已知边界</b>（任何逆向实现的工具都会随平台改版静默失效）：<br>
+  主题讨论的实际发帖 / 测验的正式交卷 / 上传作品的多附件 / 情景对话 —— 未实测或半自动；<br>
+  作业与测验的<b>自动重做</b>不支持（平台重做是自有 UI 流程，请求格式未探明）；<br>
+  解析层有 24 个单元测试，<b>接口层没有自动化测试</b>；部分题目原文要求「用自己的话整理、禁止复制 AI 输出」，工具默认只出草稿。<br>
+  <br>
+  许可证 GPL-3.0 · 仅供学习交流 · 使用本项目产生的一切后果由使用者自行承担
+</footer>
+
+</div>
+</body>
+</html>

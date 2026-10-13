@@ -128,6 +128,12 @@ python main.py --fanya-tasks --fanya-execute    # 盘点并执行
 
 ## 📸 界面
 
+**功能全景** —— 一张图看清三个入口、12 个任务处理器、5 个 AI 实践子模式，
+以及每个模块到底做到什么程度（绿=已实现、黄=半自动、红=暂未支持）。
+点图看原尺寸：[`docs/mindmap.html`](docs/mindmap.html)（可打印的矢量版）。
+
+<a href="docs/mindmap.png"><img src="docs/mindmap.png" alt="功能思维导图" width="820"></a>
+
 **任务盘点** —— 摊开每个任务点的类型、进度和**能做到什么程度**。
 留意 `需先备材料`、`暂未支持` 这类标注：工具会直接告诉你它哪里做不到，
 而不是假装全能。
