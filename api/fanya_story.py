@@ -61,6 +61,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import urllib.parse
 from typing import Any, Callable, Optional
 
 import requests
@@ -76,6 +77,45 @@ PLAN_TYPE_UPLOAD = 1        # subtype=1 → 上传作品节点
 ROLE_NARRATOR = 2           # get-roles 的 type：2=旁白
 ROLE_AGENT = 1              # 1=智能体
 ROLE_STUDENT = 0            # 0=学生（⚠️ 是 0，注意 falsy）
+
+# 页面令牌：写在 /ai-evaluate/v2/answer 的 302 Location 里（不需要浏览器）
+PAGE_TOKEN_KEYS = ("t", "enc", "aiEnc", "fileEnc", "asrEnc")
+
+
+def fetch_page_tokens(session: requests.Session, entry_url: str) -> dict:
+    """从入口 URL 的 302 跳转里取出页面令牌。
+
+    ``story-host-agent`` 需要页面 URL 上的 ``t`` / ``enc``（缺了直接 HTTP 400），
+    而它们就写在 ``/ai-evaluate/v2/answer`` 的 302 ``Location`` 里：
+
+        Location: /mooc2-ans-vue/taskChain/student?...&t=<毫秒>&enc=<32hex>
+                  &aiEnc=<32hex>&fileEnc=<32hex>&asrEnc=<32hex>
+
+    ★ 早前这个模块里写过「``enc``/``fileEnc``/``asrEnc`` 不在任何已知接口的
+    响应里，疑似由上游页面签发」——**那是错的**，一次 GET 就全拿到了。
+
+    返回 ``{"t": ..., "enc": ..., "aiEnc": ..., "fileEnc": ..., "asrEnc": ...}``，
+    取不到时返回空字典（调用方应能容忍，只是 host-agent 会 400）。
+    """
+    url = (entry_url or "").strip()
+    if not url:
+        return {}
+    try:
+        r = session.get(url, allow_redirects=False, timeout=60.0, headers=HEADERS)
+    except requests.RequestException as exc:
+        logger.debug("取页面令牌失败: {}", exc)
+        return {}
+    loc = r.headers.get("Location") or ""
+    if not loc and r.status_code == 200:
+        loc = r.url or ""
+    if not loc:
+        logger.debug("取页面令牌：入口未返回 Location（HTTP {}）", r.status_code)
+        return {}
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+    tokens = {k: (q.get(k) or [""])[0] for k in PAGE_TOKEN_KEYS}
+    if not tokens.get("enc"):
+        logger.debug("取页面令牌：Location 里没有 enc —— {}", loc[:160])
+    return tokens
 
 
 class StoryError(Exception):
@@ -437,7 +477,8 @@ def read_uid(session: requests.Session) -> str:
 
 def host_agent(session: requests.Session, base: dict, chapter_uuid: str,
                chapter_record_uuid: str, uid: str, user_content: str,
-               *, speak_role_type: int = ROLE_STUDENT, timeout: float = 180.0):
+               *, speak_role_type: int = ROLE_STUDENT, timeout: float = 180.0,
+               tokens: Optional[dict] = None):
     """把学生消息发给「AI 主持人」并**流式**读出事件。
 
     这才是剧情对话的真正通道（``add-chat`` 只是把消息写进记录）：
@@ -461,6 +502,12 @@ def host_agent(session: requests.Session, base: dict, chapter_uuid: str,
         "chapterRecordUuid": chapter_record_uuid,
         "npcReply": "false",
     }
+    # ★ 页面令牌：服务端要求 URL 上带 t / enc，缺了直接 HTTP 400。
+    #   来源见 fetch_page_tokens()（入口 URL 的 302 Location）。
+    for k in ("t", "enc"):
+        v = (tokens or {}).get(k)
+        if v:
+            params[k] = v
     try:
         r = session.post(f"{AI_ANS}/story-host-agent", params=params,
                          json={"userContent": user_content or ""},
@@ -470,20 +517,40 @@ def host_agent(session: requests.Session, base: dict, chapter_uuid: str,
     if r.status_code != 200:
         raise StoryError(f"story-host-agent 返回 HTTP {r.status_code}")
 
+    # ★★ 必须强制 utf-8：该接口的 Content-Type 不带 charset，requests 会回退到
+    #    ISO-8859-1，于是 iter_lines(decode_unicode=True) 把 UTF-8 中文解成乱码，
+    #    json.loads 直接失败 —— 智能体的应答事件会被整条丢掉，
+    #    表现成"学生自说自话、智能体从不回应"。原始字节本身是完好的 UTF-8。
+    r.encoding = "utf-8"
+
+    # ★ SSE 解析：按规范，**同一个事件可以拆成多个 `data:` 行**，要用换行拼接，
+    #   直到遇到空行才算一个完整事件。此前是「一行一个 JSON」，结果智能体的
+    #   应答事件（字段多、payload 长）被拆开解析失败，被整条丢掉 ——
+    #   表现就是"学生发完消息、智能体一直不出现"。
+    buf: list = []
     try:
         for raw in r.iter_lines(decode_unicode=True):
-            if not raw:
+            if raw is None:
                 continue
-            line = raw.strip()
-            if not line.startswith("data:"):
+            line = raw.rstrip("\r")
+            if line == "":                      # 空行 = 事件结束
+                if buf:
+                    payload = "\n".join(buf)
+                    buf = []
+                    try:
+                        yield json.loads(payload)
+                    except ValueError:
+                        logger.debug("SSE 事件无法解析（前 200 字）: {}", payload[:200])
                 continue
-            payload = line[5:].strip()
-            if not payload:
+            if line.startswith(":"):            # 注释 / 心跳行
                 continue
+            if line.startswith("data:"):
+                buf.append(line[5:].lstrip())
+        if buf:                                 # 流结束但没以空行收尾
             try:
-                yield json.loads(payload)
+                yield json.loads("\n".join(buf))
             except ValueError:
-                logger.debug("SSE 行无法解析: {}", line[:120])
+                logger.debug("SSE 尾部事件无法解析")
     finally:
         r.close()
 
@@ -593,6 +660,15 @@ def complete_story_task(session: requests.Session, course: dict, study_url: dict
     if not uid:
         logger.warning("cookie 里没有 _uid/UID —— story-host-agent 可能拒绝请求")
 
+    # ★ 页面令牌（t / enc）：story-host-agent 缺了它直接 HTTP 400。
+    #   来源是入口 URL 的 302 Location，一次 GET 即可，不需要浏览器。
+    entry_url = str((study_url or {}).get("url") or "")
+    tokens = fetch_page_tokens(session, entry_url)
+    if tokens.get("enc"):
+        log("已取得页面令牌（t / enc）—— 可以驱动智能体应答")
+    else:
+        logger.warning("未取得页面令牌，智能体应答可能失败（host-agent 会返回 400）")
+
     progress = get_progress(session, base)
     chapter = current_chapter(progress)
     if not chapter:
@@ -690,6 +766,28 @@ def complete_story_task(session: requests.Session, course: dict, study_url: dict
             done_rounds += 1
             log(f"「{title}」第 {rounds_here}/{max_rounds} 轮已写入"
                 f"（{len(str(content))} 字，学生发言累计 {after} 条）")
+
+            # ★★ 关键：add-chat 只是把消息写进记录，**不会让智能体应答**。
+            #    真正的对话通道是 story-host-agent（SSE）：它驱动智能体回复，
+            #    并在条件达成时推出 {"triggered": true}。
+            #    实测漏掉这一步的后果：章节里只有学生自说自话，
+            #    而题目要求「保存AI回复 / 提交物含 AI 对话文本」→ 得分 0。
+            try:
+                fired, why = agent_triggered(
+                    host_agent(session, base, chapter_uuid, chapter_record, uid,
+                               str(content).strip(),
+                               speak_role_type=ROLE_STUDENT, tokens=tokens),
+                    on_event=lambda ev: logger.debug("host-agent 事件: {}",
+                                                     str(ev)[:160]))
+                if fired:
+                    log(f"「{title}」智能体判定条件达成：{why}")
+                else:
+                    logger.debug("「{}」本轮 host-agent 未报告 triggered", title)
+            except StoryError as exc:
+                # 智能体没应答不该让整章失败 —— 记录警告，交卷评分照走
+                logger.warning("「{}」驱动智能体应答失败：{}", title, exc)
+                log(f"「{title}」智能体应答未成功（{exc}），继续后续步骤")
+            time.sleep(delay)
 
         # ---- 3) 交卷 ----
         log(f"「{title}」交卷…")
