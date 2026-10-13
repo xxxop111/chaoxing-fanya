@@ -14,22 +14,44 @@
 | 章节交卷 | ✅ 可用 —— `POST /v2/answer/submit` 带 `chapterUuid`+`chapterRecordUuid`，章节 status 0→1 |
 | 触发评分 | ✅ **可达** —— `evaluate/stream` 会给出真实业务状态（见下方修正） |
 
-★★ 2026-10-12 修正（此前写错并写进过 README / 协议文档）★★
+★★ 2026-10-13 架构澄清（前后两次结论各对一半，这里给出准确的）★★
 
-旧结论说「评分必须由浏览器建立对答会话，纯 HTTP 调 `evaluate/stream`
-返回『会话不存在』，因此无法自动化」——**这是错的**。
+| 环节 | 通道 | 需要浏览器/WebSocket？ |
+| --- | --- | --- |
+| 取页面令牌 t/enc | 入口 URL 的 **302 Location** | ❌ 不需要（一次 GET）|
+| 学生发言 add-chat | HTTP | ❌ |
+| 章节交卷 answer/submit | HTTP | ❌ |
+| **评分 evaluate/stream** | HTTP GET | ❌ **不需要** |
+| 章节条件 story-host-agent | HTTP SSE | ❌ |
+| **智能体回复正文 aiResponse** | **WebSocket 音频转写** | ✅ **需要** |
 
-真正的根因是**参数传错**：``evaluate/stream`` 的 ``recordUuid`` 必须传
-**外层记录**（``load-data`` 返回的那个），章节记录只放在 ``chapterRecordUuid``。
-对话页 ``TaskChainChat.startEvaluate()`` 用的就是 ``currentRecordUuid``（外层）。
+两条曾被写错的结论，都已纠正：
 
-对照实测（同一接口、同一条记录）：
+1. ❌「评分必须由浏览器建立对答会话」—— 错。评分只要 ``recordUuid`` 传对
+   （外层记录）就能跑；传章节记录得到「会话不存在」，那只是参数错误的症状。
+2. ❌「整套流程不需要 WebSocket」—— 也不全对。评分确实不需要，但
+   **智能体的回复正文只能从 WebSocket 的音频转写里拿**。
 
-* 传**外层记录** → 服务端回 `任务未提交，无法开始评估`（真实业务状态）
-* 传**章节记录** → 服务端回 `会话不存在`（参数对不上，看着像"没有会话"）
+依据（通话页 chunk 6190）：
 
-所以「会话不存在」是**参数错误的症状**，不是"缺少浏览器会话"。
-不存在必须使用 WebSocket / 浏览器才能评分这回事。
+.. code-block:: javascript
+
+    case "response_done":                    // WebSocket 事件
+        var n = s || t.lastUserTranscript;
+        t.checkChapterCondition(n, 0)        // SSE: story-host-agent
+         .then(function(){ t.addMessage(n, t.aiResponse) });  // aiResponse=智能体回复
+
+即：学生语音 → WS → 智能体语音回复 → 转写进 ``aiResponse`` → ``response_done``
+时连同学生转写一起 ``add-chat`` 落库。
+
+⚠️ 纯文字路径的**已知不足**：学生的话不会进入 WS（WS 是语音驱动的），
+智能体只会回应开场白，于是没有"AI 回复正文"可落库；而题目要求
+「保存AI回复 / 提交物含 AI 对话文本」，因此这样的作答实测得 0 分。
+要补全需在 WS 侧把学生文本合成音频帧（``{"type":"audio", audio:<base64>}``）送进去。
+
+其它实测要点：``realtimeDialogEnc`` 必须用 JS 里硬编码的 ``test_enc_2026``
+（``load-data`` 返回的真实值会被判「enc 鉴权错误」）；``config`` 消息的
+``speaker``/``botName``/``systemRole``/``speakingStyle`` 四项必填。
 
 ⚠️ 交卷不可逆：本模块会发言、交卷、评分，但调用方必须自行确认
 （部分课程的作答记录 ``enableReset=false``，提交后无法重置）。
