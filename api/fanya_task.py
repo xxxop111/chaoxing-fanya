@@ -691,13 +691,18 @@ def _ai_practice_status(ai_mode: dict) -> tuple[str, str]:
         return STATUS_AUTO, ("代码实践型：AI 生成代码 → 自测运行校验 → 建卷交卷 → 评估出分"
                              "（已实测完成，得分 76）")
     if mode == MODE_STORY:
-        # 真机结论（2026-10-12）：发学生消息 ✅、章节交卷 ✅（status 0→1），
-        # 但**评分拿不到** —— `evaluate/stream` 返回「会话不存在」，因为评分绑定在
-        # WebSocket 实时会话上（`conversationId` 纯 HTTP 路径下始终为空）。
-        # 故分数恒为 0，据实标注为「需人工」，不做夸大。
-        return STATUS_MANUAL, ("AI剧情型：协议已完整逆向（章节结构 / 参数 / 37 个端点，"
-                               "见协议文档）；发消息与交卷实测可用，但评分需 WebSocket "
-                               "实时会话（未实现），拿不到分数，需手动完成")
+        # ★ 2026-10-12 更正：此前这里写「评分拿不到，因为评分绑定在 WebSocket
+        #   实时会话上」——**该结论是错的**。真实原因只是 evaluate/stream 的
+        #   recordUuid 传错了记录：
+        #       传章节记录 → 「会话不存在」   传外层记录 → 正常应答
+        #   对照实测见 api/fanya_story.py 模块说明与 docs/FANYA_TASK_API.md。
+        #
+        #   链路本身已通：add-chat 发言 → answer/submit 交卷 → evaluate/stream 评分。
+        #   仍不标「全自动」的原因：交卷**不可逆**（部分课程 enableReset=false），
+        #   不该由程序替用户按下去。
+        return STATUS_MANUAL, ("AI剧情型：链路已打通（发言 → 交卷 → 评分）；"
+                               "但交卷不可逆（部分课程 enableReset=false），"
+                               "故不代为提交，需你确认后再执行")
     return STATUS_PENDING, f"{ai_mode.get('modeLabel') or '未知模式'}：暂未支持自动完成"
 
 

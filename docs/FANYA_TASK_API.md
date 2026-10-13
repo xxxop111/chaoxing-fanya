@@ -358,7 +358,7 @@ type-2 分支；作答接口在 SPA 的懒加载 chunk 里。与另外两种模�
 | 1 | 上传作品 | 已实现（**实测得分 93**）|
 | 2 | 思维阶梯 | 已实现（**实测得分 85**，2026-10-12 planId 7881197）|
 | 4 | 代码实践 | 已实现（**实测得分 76**）|
-| **7** | **AI剧情** | 协议已**完整逆向**（章节结构 / 参数 / 37 个端点，见 [协议文档](docs/FANYA_TASK_API.md)）；发消息与章节交卷实测可用，但**评分必须由浏览器建立对答会话**（纯 HTTP 调 `evaluate/stream` 返回「会话不存在」），故自动作答拿不到分数 → **需人工**。实测人工粘贴高质量内容可得 **100 分** |
+| **7** | **AI剧情** | 链路已打通：发言 → 章节交卷 → 评分（见[下方更正](#启动任务链的两条路-已验证)）。此前写的「评分必须由浏览器建立对答会话」**是错的**，根因只是 `evaluate/stream` 的 `recordUuid` 传错记录。⚠️ 交卷不可逆，故默认不代提交。实测人工粘贴高质量内容可得 **100 分** |
 
 ### type=7「AI剧情」是什么 [已验证]
 
@@ -446,9 +446,31 @@ type-2 分支；作答接口在 SPA 的懒加载 chunk 里。与另外两种模�
   而 `load-data` 报的 `type` 是 7）。
   ⚠️ 已有未完成记录时会被拒：`{"status":false,"msg":"已存在未完成的作答记录"}`
   （`type=6` 放 query 或 body 都一样被拒）。
-* **⚠️ 关键限制（实测）**：用纯 HTTP 的 `init-chain-answer` 建出来的章节记录，
-  调 `evaluate/stream` 会返回「**会话不存在**」，**永远拿不到分数**；只有经过
-  浏览器交互（建立对答会话）的记录才能被评分。因此本模式**无法纯 HTTP 自动化**。
+* **★ 更正（2026-10-12）**：本文件此前在此处写过「用纯 HTTP 建出的章节记录调
+  `evaluate/stream` 会返回『会话不存在』，永远拿不到分数，因此无法纯 HTTP 自动化」
+  —— **该结论是错的，已作废**。
+
+  真正的原因是**参数传错**，不是缺浏览器会话：
+
+  | 传给 `recordUuid` 的值 | 服务端回答 |
+  | --- | --- |
+  | **外层记录**（`load-data` 返回的 `recordUuid`）✅ | `任务未提交，无法开始评估` |
+  | 章节记录（`chapterRecordUuid`）❌ | `会话不存在` |
+
+  判据来自对话页 `TaskChainChat.startEvaluate()`：
+
+  ```javascript
+  var a = {courseId, clazzId, cpi, aiEnc,
+           recordUuid: e.currentRecordUuid,      // ★ 外层记录
+           chapterRecordUuid: e.chapterRecordUuid,
+           isPreview, useJsonScheme: true};
+  e.evaluateEventSource = qX(a, {...});          // 内部是 EventSource => GET
+  ```
+
+  也就是说「会话不存在」只是**参数对不上的症状**。传对之后服务端立刻给出
+  真实业务状态，例如「**任务未提交，无法开始评估**」—— 那说明它已经认得这条记录，
+  只差 `answer/submit` 那一步。**不存在"必须用 WebSocket/浏览器才能评分"这回事。**
+
 * **沿用**：直接把 `load-data` 返回的 `recordUuid` 传给 story 系列接口即可
   —— 实测 `go-home` / `go-chapter` / `get-nodes` 都正常工作。
 

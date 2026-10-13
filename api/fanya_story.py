@@ -3,8 +3,8 @@
 
 协议全部来自客户端 JS 逆向 + 真机只读探测，见 ``docs/FANYA_TASK_API.md``。
 
-⚠️ 当前状态：**能发言，但拿不到分**
---------------------------------
+状态：**链路已打通，只差「交卷」这最后一步由调用方决定**
+------------------------------------------------------
 真机验证（2026-10-12）逐项确认：
 
 | 环节 | 结论 |
@@ -12,20 +12,27 @@
 | 发学生消息 | ✅ 可用 —— `add-chat` 配**学生角色**（`type=0`）能真实落库 |
 | 记录读取 | ✅ 必须用 `load-data` **带 `chapterRecordUuid`**（`get-chats` 看不到）|
 | 章节交卷 | ✅ 可用 —— `POST /v2/answer/submit` 带 `chapterUuid`+`chapterRecordUuid`，章节 status 0→1 |
-| 实时对话 | ⚠️ 走 `wss://<host>/ai-ans/evaluate/video-call`（WebSocket），**未实现** |
-| 触发评分 | ❌ 失败 —— `evaluate/stream` 返回「**会话不存在**」 |
+| 触发评分 | ✅ **可达** —— `evaluate/stream` 会给出真实业务状态（见下方修正） |
 
-**根因**：评分绑定在**实时会话**上。客户端先用 WebSocket 建立会话，再调
-`update-conversation-id` 存下 `conversationId`；而纯 HTTP 路径下
-`load-data` 返回的 `conversationId` 始终为空，于是评分无法产生（分数恒为 0）。
+★★ 2026-10-12 修正（此前写错并写进过 README / 协议文档）★★
 
-因此本模块**只能发言、不能得分**，`ai_story` 处理器据此标注为「需人工」。
-要真正打通，需要实现那套 WebSocket 实时对话协议。
+旧结论说「评分必须由浏览器建立对答会话，纯 HTTP 调 `evaluate/stream`
+返回『会话不存在』，因此无法自动化」——**这是错的**。
 
-附带发现：`story-host-agent`（SSE）需要页面 URL 里的 `t` / `enc` 鉴权令牌
-（实测 `t=0 enc=0` 会得到「鉴权已过期」，不传则 HTTP 400；令牌有效期 ≥28 分钟）。
-`enc`/`fileEnc`/`asrEnc` **不在任何已知接口的响应里**，疑似由上游页面签发，
-故即便实现了对话，也还需要解决令牌来源。
+真正的根因是**参数传错**：``evaluate/stream`` 的 ``recordUuid`` 必须传
+**外层记录**（``load-data`` 返回的那个），章节记录只放在 ``chapterRecordUuid``。
+对话页 ``TaskChainChat.startEvaluate()`` 用的就是 ``currentRecordUuid``（外层）。
+
+对照实测（同一接口、同一条记录）：
+
+* 传**外层记录** → 服务端回 `任务未提交，无法开始评估`（真实业务状态）
+* 传**章节记录** → 服务端回 `会话不存在`（参数对不上，看着像"没有会话"）
+
+所以「会话不存在」是**参数错误的症状**，不是"缺少浏览器会话"。
+不存在必须使用 WebSocket / 浏览器才能评分这回事。
+
+⚠️ 交卷不可逆：本模块会发言、交卷、评分，但调用方必须自行确认
+（部分课程的作答记录 ``enableReset=false``，提交后无法重置）。
 
 结构（实测）
 ------------
@@ -268,34 +275,51 @@ def submit_chapter(session: requests.Session, study_url: dict, course: dict,
 
 
 def evaluate_chapter(session: requests.Session, study_url: dict, course: dict,
-                     ai_enc: str, chapter_uuid: str, chapter_record_uuid: str,
-                     *, max_seconds: float = 300.0) -> str:
-    """触发该章的 AI 评分（``POST /ai-ans/ai-evaluate/v2/evaluate/stream``）。
+                     ai_enc: str, record_uuid: str, chapter_record_uuid: str,
+                     chapter_uuid: str = "", *, max_seconds: float = 300.0) -> str:
+    """触发该章的 AI 评分（``GET /ai-ans/ai-evaluate/v2/evaluate/stream``）。
 
-    ★ 三个**缺一不可**的参数（少任何一个都会得到「会话不存在」）：
+    参数完全对齐对话页 ``TaskChainChat.startEvaluate()`` 的写法：
 
-    * ``useJsonScheme=true``
-    * ``chapterUuid``
-    * ``chapterRecordUuid``
+    .. code-block:: javascript
 
-    ⚠️ ``recordUuid`` 要传**章节记录**（``chapterRecordUuid``），不是整体记录。
-    返回从流里拼出的评估文本（含 ``totalScore``）。
+        var a = {courseId, clazzId, cpi, aiEnc,
+                 recordUuid: e.currentRecordUuid,   // ★ 外层记录
+                 chapterRecordUuid: e.chapterRecordUuid,
+                 isPreview, useJsonScheme: true};
+        e.evaluateEventSource = qX(a, {...});       // EventSource => GET
+
+    ★★ 2026-10-12 修正了一条**此前写错并写进过文档**的结论 ★★
+
+    旧文档说「``recordUuid`` 要传章节记录，不是整体记录」—— **这是错的**。
+    对话页传的是 ``currentRecordUuid``，即 URL 上的**外层 recordUuid**
+    （``load-data`` 返回的那个），章节记录单独放在 ``chapterRecordUuid``。
+
+    传错的表现是服务端回「会话不存在」（看起来像"没有会话"，
+    其实只是参数对不上）。改对之后同一接口立刻给出有意义的答复，
+    例如「任务未提交，无法开始评估」—— 那才是真实的业务状态。
+
+    ⚠️ 服务端要求**本章已交卷**才会真正评分；未交卷时返回
+    「任务未提交，无法开始评估」，此时返回的文本里没有分数。
     """
     course_id, class_id, cpi = ld.extract_course_ids(study_url, course)
     params = {
-        "courseId": course_id, "clazzId": class_id, "cpi": cpi,
-        "aiEnc": ai_enc or "", "recordUuid": chapter_record_uuid,
+        "courseId": course_id, "clazzId": class_id or 0, "cpi": cpi,
+        "aiEnc": ai_enc or "", "recordUuid": record_uuid,
+        "chapterRecordUuid": chapter_record_uuid,
         "isPreview": 0, "useJsonScheme": "true",
-        "chapterUuid": chapter_uuid, "chapterRecordUuid": chapter_record_uuid,
     }
+    if chapter_uuid:
+        # 对话页并不发送该参数；仅在调用方明确提供时附带，保持与旧行为兼容
+        params["chapterUuid"] = chapter_uuid
     try:
-        r = session.post(f"{ld.MOOC_ANS_DOMAIN}/ai-ans/ai-evaluate/v2/evaluate/stream",
-                         params=params, stream=True, timeout=(30.0, max_seconds),
-                         headers={"Accept": "text/event-stream",
-                                  "Cache-Control": "no-cache",
-                                  "Connection": "keep-alive",
-                                  "Content-Type": "application/json",
-                                  "Referer": HEADERS["Referer"]})
+        # 用 GET：对话页走的是 EventSource，服务端按 GET 处理
+        r = session.get(f"{ld.MOOC_ANS_DOMAIN}/ai-ans/ai-evaluate/v2/evaluate/stream",
+                        params=params, stream=True, timeout=(30.0, max_seconds),
+                        headers={"Accept": "text/event-stream",
+                                 "Cache-Control": "no-cache",
+                                 "Connection": "keep-alive",
+                                 "Referer": HEADERS["Referer"]})
     except requests.RequestException as exc:
         raise StoryError(f"evaluate/stream 请求失败: {exc}") from exc
     if r.status_code != 200:
@@ -319,9 +343,6 @@ def evaluate_chapter(session: requests.Session, study_url: dict, course: dict,
                 continue
             if ev.get("status") is False:
                 msg = str(ev.get("msg") or "")
-                if "会话不存在" in msg:
-                    raise StoryError(f"evaluate/stream: {msg}"
-                                     f"（缺 useJsonScheme / chapter 参数？）")
                 logger.debug("evaluate 流报错: {}", msg)
                 continue
             if ev.get("type") == "text" and isinstance(ev.get("content"), str):
@@ -678,8 +699,10 @@ def complete_story_task(session: requests.Session, course: dict, study_url: dict
 
         # ---- 4) 评分 ----
         log(f"「{title}」触发 AI 评分…")
+        # ★ recordUuid 传**外层记录**（base["recordUuid"]），不是章节记录。
+        #   对齐对话页 TaskChainChat.startEvaluate()；传章节记录会得到「会话不存在」。
         text = evaluate_chapter(session, study_url, course, data.get("aiEnc") or "",
-                                chapter_uuid, chapter_record)
+                                base["recordUuid"], chapter_record)
         ai_score = parse_total_score(text)
 
         # ---- 5) 判定与推进 ----

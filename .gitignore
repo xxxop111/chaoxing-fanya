@@ -198,6 +198,14 @@ fanya-foreground.png
 _*.ps1
 _*.png
 
+# ★ 根目录下任何以 _ 开头的**目录**一律不提交。
+# 教训（2026-10-12）：上面只忽略了 _*.md / _*.py 这类**文件**，
+# 而 CDP 调试留下的 _cdp_story_profile/ 是个**目录**，漏了进来 ——
+# 那里面是完整的 Edge 配置，含 Cookies / Login Data / Web Data（真实登录凭证）。
+# 当时恰好因为 Cookies 文件被占用、git add 报错才没有提交成功。
+# 这条规则把整个类别堵死，避免以后再有类似的目录溜进去。
+/_*/
+
 
 # 本机 npm 源配置（不该强加给其他用户）
 web/.npmrc

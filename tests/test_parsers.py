@@ -209,6 +209,90 @@ def test_story_build_round_prompt_uses_given_prompt_first():
     later = build_round_prompt(ch, 2, [], req)
     assert "第 2 轮" in later and "审计抽样建模校验" in later
 
+
+# ---------------- AI剧情 评分参数（回归：2026-10-12 修正的 bug）----------------
+
+class _StubResp:
+    """最小可用的响应替身：evaluate_chapter 只用到 iter_lines/close。"""
+
+    status_code = 200
+
+    def iter_lines(self, decode_unicode=True):  # noqa: ARG002
+        return iter(())
+
+    def close(self):
+        pass
+
+
+class _StubSession:
+    """记录最后一次请求的参数，用于断言。"""
+
+    def __init__(self):
+        self.url = None
+        self.kw = None
+
+    def get(self, url, **kw):  # noqa: ARG002
+        self.url = url
+        self.kw = kw
+        return _StubResp()
+
+
+def test_story_evaluate_record_uuid_is_outer_record():
+    """★ 回归测试：evaluate/stream 的 ``recordUuid`` 必须是**外层记录**。
+
+    背景（2026-10-12）：这里曾经传成**章节记录**，服务端回「会话不存在」，
+    于是得出了一个错误结论 ——「评分必须由浏览器建立对答会话，无法纯 HTTP 自动化」，
+    并把它写进了 README 与协议文档。
+
+    真实原因只是参数传错。对照实测（同一条记录、同一个接口）：
+
+    * 传外层记录 → ``任务未提交，无法开始评估``（真实业务状态）
+    * 传章节记录 → ``会话不存在``
+
+    本测试把「外层记录 / 章节记录各归其位」钉住，防止再次退化。
+    """
+    from api.fanya_story import evaluate_chapter
+
+    sess = _StubSession()
+    study_url = {"url": "https://x/answer?courseid=111&clazzid=222&cpi=333"}
+    evaluate_chapter(sess, study_url, {}, "AIENC",
+                     "OUTER-RECORD", "CHAPTER-RECORD")
+    params = sess.kw["params"]
+    assert params["recordUuid"] == "OUTER-RECORD", \
+        "recordUuid 必须是外层记录；传章节记录会得到「会话不存在」"
+    assert params["chapterRecordUuid"] == "CHAPTER-RECORD"
+    assert params["courseId"] == "111" and params["clazzId"] == "222"
+    assert params["cpi"] == "333" and params["aiEnc"] == "AIENC"
+    assert params["useJsonScheme"] == "true"
+
+
+def test_story_evaluate_omits_chapter_uuid_by_default():
+    """对话页并不发送 ``chapterUuid``；只有调用方明确提供时才附带。"""
+    from api.fanya_story import evaluate_chapter
+
+    sess = _StubSession()
+    evaluate_chapter(sess, {"url": "?courseid=1&clazzid=2&cpi=3"}, {}, "E",
+                     "OUTER", "CHAPTER")
+    assert "chapterUuid" not in sess.kw["params"]
+
+    sess2 = _StubSession()
+    evaluate_chapter(sess2, {"url": "?courseid=1&clazzid=2&cpi=3"}, {}, "E",
+                     "OUTER", "CHAPTER", "CH-UUID")
+    assert sess2.kw["params"]["chapterUuid"] == "CH-UUID"
+
+
+def test_story_evaluate_uses_get_not_post():
+    """评分走 EventSource，即 **GET**（此前用的是 POST）。"""
+    from api.fanya_story import evaluate_chapter
+
+    sess = _StubSession()
+    evaluate_chapter(sess, {"url": "?courseid=1&clazzid=2&cpi=3"}, {}, "E",
+                     "OUTER", "CHAPTER")
+    assert sess.kw.get("stream") is True
+    assert "evaluate/stream" in sess.url
+    assert not hasattr(sess, "post"), "不应再使用 POST"
+
+
 # ----------------------------------------------------------------------
 # 内置 runner：没装 pytest 也能跑（本仓库刻意保持零测试依赖）
 # ----------------------------------------------------------------------
