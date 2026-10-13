@@ -788,6 +788,12 @@ def complete_story_task(session: requests.Session, course: dict, study_url: dict
         # ⚠️ 这里曾用 ``recs0[0]``（= **最早**一次尝试）判分，会读错记录。
         #    改用全部尝试里的**最高分**：只要有过一次达标就算通过，
         #    避免把已经拿到的分数白重做一遍。
+        #
+        # ★ 例外：调用方用 ``story_chapter_uuid`` **显式指定**了本章 ——
+        #   那就是要重做，绝不能因为"历史上通过过"而跳过。
+        #   实测踩过的坑：平台的"当前作答"若是一条失败记录，本章
+        #   ``condition.hit`` 会是 false，任务链就卡住不让进下一章；
+        #   此时唯一的解法是重做本章拿到通过分。
         conds = chapter.get("condition") or []
         nxt0 = conds[0].get("nextChapterUuid") if conds else None
         recs0 = chapter.get("answerRecord") or []
@@ -796,7 +802,10 @@ def complete_story_task(session: requests.Session, course: dict, study_url: dict
                    and not isinstance(r.get("score"), bool)]
         best0 = max(scores0) if scores0 else None
         thr0 = condition_threshold(chapter)
-        if (int(chapter.get("status") or 0) == 2 and best0 is not None
+        explicit = bool(forced) and chapter_uuid == forced
+        if explicit:
+            log(f"「{title}」被显式指定重做，忽略'此前已通过'的跳过逻辑")
+        elif (int(chapter.get("status") or 0) == 2 and best0 is not None
                 and thr0 is not None and float(best0) >= thr0 and nxt0):
             log(f"「{title}」此前已通过（最高 {best0} 分），跳过并进入下一章")
             chapters_done.append(f"{title}({best0})")
