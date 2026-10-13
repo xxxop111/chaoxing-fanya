@@ -651,6 +651,64 @@ def student_message_count(data: dict) -> int:
 
 
 # ---------------------------------------------------------------- 主流程
+def chapter_max_round(chats: dict, chapter_uuid: str) -> Optional[int]:
+    """从 ``get-chats`` 里取该章节点的 ``maxRound``（取最小值 = 最严格的限制）。
+
+    ★ 这个限制必须遵守，实测教训：第 2 章「期望方差数值计算」的节点
+    ``maxRound=1``（第 1 章是 5），而流程硬编码发了 3 轮 —— 结果智能体
+    从第 1 轮起就反复回「已达到最大对话轮次，安排专家进行总结收尾」，
+    学生还在硬发内容，**整段对话被判 0 分**。
+
+    ``get-chats`` 返回的是剧情模板：每个节点形如
+    ``{"id": "<chapterUuid>-<n>", "chapterUuid": ..., "maxRound": 5|1}``。
+    """
+    nodes = (chats or {}).get("chat") or []
+    vals = []
+    for n in nodes:
+        if str(n.get("chapterUuid") or "") != chapter_uuid:
+            continue
+        try:
+            v = int(n.get("maxRound") or 0)
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            vals.append(v)
+    return min(vals) if vals else None
+
+
+def _enter_and_load_chapter(session: requests.Session, base: dict,
+                            chapter_uuid: str) -> dict:
+    """进入指定章节并**重建它的状态字典**（绝不复用上一章的字段）。
+
+    ★ 这里修的是一个真实 bug：旧代码推进时只写
+    ``chapter = {**chapter, "uuid": next_uuid}`` —— uuid 换了，但
+    ``condition`` / ``answerRecord`` / ``title`` 仍然是**上一章的**。
+    于是下一轮又拿旧章的数据判定"已通过"，再次跳过，uuid 原地打转，
+    最后撞上防死循环保护并停手（实测日志里连续出现两次"此前已通过"）。
+
+    ``go-chapter`` 会返回目标章自己的 ``condition`` / ``title`` / ``content``，
+    用它重建即可。**不要指望 ``get-progress``** —— 实测它有严重滞后：
+    切章之后仍然持续报上一章（连报多次都不变）。
+    """
+    info: dict = {}
+    try:
+        info = enter_chapter(session, base, chapter_uuid) or {}
+    except StoryError as exc:
+        logger.warning("go-chapter({}) 失败：{}", chapter_uuid[:8], exc)
+    return {
+        "uuid": chapter_uuid,
+        "title": str(info.get("title") or ""),
+        "content": str(info.get("content") or ""),
+        "condition": info.get("condition") or [],
+        # subtype 不在 go-chapter 的返回里；取不到时按对话节点处理，
+        # 真遇到上传节点会在后续阶段暴露出来（那时会明确停手并说明）。
+        "subtype": int(info.get("subtype") or 0),
+        "chapterRecordUuid": "",
+        "answerRecord": [],
+        "status": 0,
+    }
+
+
 def complete_story_task(session: requests.Session, course: dict, study_url: dict,
                         generator: Any, *, options: Optional[dict] = None,
                         on_log: Optional[Callable] = None) -> tuple[bool, str]:
@@ -727,16 +785,22 @@ def complete_story_task(session: requests.Session, course: dict, study_url: dict
                 f"请手动上传报告")
 
         # ---- 0) 已通过的章直接跳过 ----
+        # ⚠️ 这里曾用 ``recs0[0]``（= **最早**一次尝试）判分，会读错记录。
+        #    改用全部尝试里的**最高分**：只要有过一次达标就算通过，
+        #    避免把已经拿到的分数白重做一遍。
         conds = chapter.get("condition") or []
         nxt0 = conds[0].get("nextChapterUuid") if conds else None
-        recs0 = chapter.get("answerRecord") or [{}]
-        score0 = recs0[0].get("score")
+        recs0 = chapter.get("answerRecord") or []
+        scores0 = [r.get("score") for r in recs0
+                   if isinstance(r.get("score"), (int, float))
+                   and not isinstance(r.get("score"), bool)]
+        best0 = max(scores0) if scores0 else None
         thr0 = condition_threshold(chapter)
-        if (int(chapter.get("status") or 0) == 2 and score0 is not None
-                and thr0 is not None and float(score0) >= thr0 and nxt0):
-            log(f"「{title}」此前已通过（{score0} 分），跳过并进入下一章")
-            chapters_done.append(f"{title}({score0})")
-            chapter = {**chapter, "uuid": str(nxt0)}
+        if (int(chapter.get("status") or 0) == 2 and best0 is not None
+                and thr0 is not None and float(best0) >= thr0 and nxt0):
+            log(f"「{title}」此前已通过（最高 {best0} 分），跳过并进入下一章")
+            chapters_done.append(f"{title}({best0})")
+            chapter = _enter_and_load_chapter(session, base, str(nxt0))
             continue
 
         # ---- 1) 进入该章并为它开链（拿到本章的作答记录）----
@@ -766,8 +830,16 @@ def complete_story_task(session: requests.Session, course: dict, study_url: dict
         if not role_uuid:
             raise StoryAbort("未能确定学生角色 roleUuid，无法发言")
         requirement = chapter.get("requirement") or ""
+        # ★ 本题允许的对话轮数取「用户设置」与「平台 maxRound」的较小值。
+        #   无视平台上限会把对话灌坏（实测第 2 章 maxRound=1 却发了 3 轮 → 0 分）。
+        cap = chapter_max_round(chats, chapter_uuid)
+        rounds_limit = max_rounds
+        if cap:
+            rounds_limit = min(max_rounds, cap)
+            if cap < max_rounds:
+                log(f"「{title}」本题限 {cap} 轮对话（平台限制），按 {rounds_limit} 轮执行")
         rounds_here = 0
-        while rounds_here < max_rounds:
+        while rounds_here < rounds_limit:
             prompt = build_round_prompt(chapter, rounds_here + 1, [], requirement)
             content = generator.generate_chat_reply(prompt, history=[],
                                                     role_hint=requirement[:300])
@@ -786,7 +858,7 @@ def complete_story_task(session: requests.Session, course: dict, study_url: dict
                     f"add-chat 返回成功但学生消息未落库（{before}→{after}）；已停止")
             rounds_here += 1
             done_rounds += 1
-            log(f"「{title}」第 {rounds_here}/{max_rounds} 轮已写入"
+            log(f"「{title}」第 {rounds_here}/{rounds_limit} 轮已写入"
                 f"（{len(str(content))} 字，学生发言累计 {after} 条）")
 
             # ★★ 关键：add-chat 只是把消息写进记录，**不会让智能体应答**。
@@ -862,12 +934,8 @@ def complete_story_task(session: requests.Session, course: dict, study_url: dict
         if not nxt:
             return True, (f"AI剧情已全部完成：{'；'.join(chapters_done)}"
                           f"（共 {done_rounds} 轮对话）")
-        enter_chapter(session, base, str(nxt))
-        chapter = current_chapter(get_progress(session, base)) or chapter
-        # go-chapter 后 get-progress 可能仍指向上一章；用 nextChapterUuid 兜底
-        if str(chapter.get("uuid") or "") == chapter_uuid:
-            home = go_home(session, base)
-            if str(home.get("chapterUuid") or "") == chapter_uuid:
-                chapter = {**chapter, "uuid": str(nxt)}
+        # ★ 必须**重建**下一章的状态，不能拿着本章的 condition/answerRecord 继续跑，
+        #   否则下一轮会再次认为"已通过"而无限跳过（旧 bug）。
+        chapter = _enter_and_load_chapter(session, base, str(nxt))
         if not chapter:
             return True, (f"AI剧情已完成：{'；'.join(chapters_done)}")
