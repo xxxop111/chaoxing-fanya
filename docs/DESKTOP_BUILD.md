@@ -113,10 +113,15 @@ cd D:\03-开发\项目\ds\chaoxing-fanya
 | --- | --- |
 | 原生窗口 | ✅ 窗口标题「超星学习通助手」，`/api/health` 返回 `{"status":true,"msg":"OK"}`，`/` 200，前端资源正常加载 |
 | 打包产物 | ✅ `dist\chaoxing-fanya\chaoxing-fanya.exe` 独立运行（含 WebView2/CLR 加载），窗口与源码模式一致 |
-| 冒烟测试 | ✅ `tools\smoke_desktop.py` 六项检查全过、`--stop` 干净退出，退出码 0（连跑两次，覆盖 dist 产物） |
-| 安装包编译 | ✅ `Successful compile`，`chaoxing-fanya-setup-1.0.0.exe` 生成（60.5 MB） |
+| 出货界面 | ✅ 打包版窗口里就是 opendesign 的单文件界面；headless Edge 直连实测 `/`、`/api/health`、`/api/version`、`/api/heartbeat`、`/api/fanya/approvals` 全 200 |
+| **托盘常驻** | ✅ 实测：`CloseMainWindow()`（等于点 ✕）→ 进程仍活、窗口句柄变 0、`/api/health` 仍 200；日志依次出现「托盘图标已就绪」「窗口已隐藏到托盘」；`--stop` 0.01 s 退出、端口释放 |
+| 冒烟测试 | ✅ `tools\smoke_desktop.py` 全部检查通过（8 项接口/静态资源 + 关窗协议）、`--stop` 干净退出，退出码 0（覆盖 dist 产物与安装目录产物） |
+| 安装包编译 | ✅ `Successful compile`，`chaoxing-fanya-setup-1.0.0.exe` 生成（**63,426,422 字节**） |
 | **安装包载荷 + 自启动** | ✅ `tools\verify_installer.py` 全过：14 项检查 + 装出来的 exe 通过冒烟测试，退出码 0 |
 | 装到 `%LOCALAPPDATA%\Programs` | ❌ **本会话内做不了**：DSH 会话给我的进程是受限令牌（日志 `User privileges: None`），写安装目录里的 `unins000.dat` 得 `CreateFile failed; code 5`。必须你在资源管理器里双击；见 5.1 |
+
+> 看日志注意：**打包版把 `desktop_app.log` 写在自己（exe）旁边**，仓库根目录那份是源码模式跑的。
+> 排查打包版时看 `dist\chaoxing-fanya\desktop_app.log`。
 
 ### 5.1 为什么「我这边的会话」装不了，你自己双击就能成
 
