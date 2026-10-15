@@ -90,7 +90,12 @@
 
 * `GET /` → `web/dist/index.html`；`GET /<任意非 api 路径>` → 命中真实文件就返回该文件，
   否则回退 `index.html`（SPA 客户端路由可用）。
-* `GET /api/...` 永远不会命中静态回退：不存在就是 404 JSON。
+* `GET /api/...` 永远不会命中静态回退。
+* **但「路径不存在」的 404 有两种形态**，前端要都能吃：
+  * 已知接口内部找不到资源（例如 `task_id` 过期）→ 本规范定义的 **JSON** `{"status": false, "msg": ...}`；
+  * 路径本身没注册（例如拼错）→ **Flask 默认的 HTML 404**
+    （`<!doctype html>…<title>404 Not Found</title>`，实测 `/api/nope` 就是这样）。
+    所以取响应体前先看 `Content-Type`，别无条件 `response.json()`。
 * HTML 响应带 `Cache-Control: no-store`；哈希过的静态资源可以正常缓存。
 * **不要假设后端有前端构建**：没有 `web/dist` 时 `/` 返回 404 JSON
   `{"status": false, "msg": "前端未构建…"}`。
@@ -488,6 +493,9 @@
   `require_approval`）。
 * `exam_submit` / `group_submit` 分别控制**考试/测验**与**分组任务**是否真的交卷，
   默认 false（只做不打分/不交卷的部分）。
+* `browser_headless` 默认 **true**：需要真实浏览器的任务点（阅读时长等）用系统
+  Edge/Chrome **后台隐藏运行**（playwright `headless=True`），用户看不到窗口；
+  只有排查问题时才传 `false` 让窗口可见。
 * 响应 `data`：`{ "task_id": "fanya-run-2023xxxx-1760000000" }`。
 
 ### 4.16 `GET /api/fanya/result/<task_id>`
