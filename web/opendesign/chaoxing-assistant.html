@@ -1,0 +1,1583 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>超星学习通助手 · 桌面版</title>
+<!--
+  本文件是「超星学习通助手」桌面版**实际打包出货**的界面（单文件自包含：
+  样式与脚本全部内联，不引用任何外部资源，因此离线也能开）。
+
+  来源：opendesign 项目 d047c42f-335a-4b2f-9549-47b91bee5a29 的产出
+  （chaoxing-assistant.html），接入时按本仓库后端契约做了修正，逐条见
+  docs/DESKTOP_BUILD.md 的「前端来源」一节。
+
+  约束（改这个文件时请遵守）：
+  * 只调 ``/api/*`` 的相对路径，绝不写死主机名或端口（打包版端口是动态选的）；
+  * 后端返回统一信封 {status, message, data}，session 失效时 status == "not logged in"；
+  * 没有真实后端时自动进「演示模式」展示示例数据，别把这层去掉 —— 那是评审用的。
+-->
+
+<style>
+  /* ─────────────────────────────────────────────────────────────────
+     Apple design system tokens — pasted verbatim (binding contract).
+     Every colour below is referenced through var(--*) only.
+     ───────────────────────────────────────────────────────────────── */
+  :root {
+    --bg: #ffffff;
+    --surface: #f5f5f7;
+    --surface-warm: #fbfbfd;
+
+    --fg: #1d1d1f;
+    --fg-2: #424245;
+    --muted: #6e6e73;
+    --meta: #86868b;
+
+    --border: #d2d2d7;
+    --border-soft: #e8e8ed;
+
+    --accent: #0071e3;
+    --accent-on: #ffffff;
+
+    --accent-hover: #0077ed;
+    --accent-active: #0066cc;
+
+    --success: #16a34a;
+    --warn:    #eab308;
+    --danger:  #dc2626;
+
+    --font-display:
+      "SF Pro Display", "SF Pro Icons", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    --font-body:
+      "SF Pro Text", "SF Pro Icons", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    --font-mono:
+      "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Monaco, Consolas, monospace;
+
+    --text-xs:   12px;
+    --text-sm:   14px;
+    --text-base: 17px;
+    --text-lg:   21px;
+    --text-xl:   28px;
+    --text-2xl:  40px;
+    --text-3xl:  56px;
+    --text-4xl:  80px;
+
+    --leading-body:  1.47;
+    --leading-tight: 1.05;
+    --tracking-display: -0.015em;
+
+    --space-1:  4px;
+    --space-2:  8px;
+    --space-3:  12px;
+    --space-4:  16px;
+    --space-5:  20px;
+    --space-6:  24px;
+    --space-8:  32px;
+    --space-12: 48px;
+
+    --section-y-desktop: 100px;
+    --section-y-tablet:  64px;
+    --section-y-phone:   40px;
+
+    --radius-sm:   8px;
+    --radius-md:   12px;
+    --radius-lg:   18px;
+    --radius-pill: 980px;
+
+    --elev-flat:   none;
+    --elev-ring:   0 0 0 1px var(--border);
+    --elev-raised: 0 12px 32px rgba(0, 0, 0, 0.08);
+
+    --focus-ring: 0 0 0 4px color-mix(in oklab, var(--accent), transparent 65%);
+
+    --motion-fast:   150ms;
+    --motion-base:   220ms;
+    --ease-standard: cubic-bezier(0.28, 0, 0.22, 1);
+
+    --container-max:            1024px;
+    --container-gutter-desktop: 22px;
+    --container-gutter-tablet:  18px;
+    --container-gutter-phone:   16px;
+  }
+
+  /* ─── reset & base ─────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    font-size: var(--text-base);
+    line-height: var(--leading-body);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  h1, h2, h3, h4 { margin: 0; font-family: var(--font-display); letter-spacing: var(--tracking-display); line-height: 1.15; }
+  h1 { font-size: var(--text-xl); font-weight: 600; }
+  h2 { font-size: var(--text-lg); font-weight: 600; }
+  h3 { font-size: var(--text-base); font-weight: 600; }
+  p { margin: 0; text-wrap: pretty; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-active); text-decoration: underline; }
+  img, svg { display: block; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  [hidden] { display: none !important; }
+  :focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
+
+  /* ─── app shell ────────────────────────────────────────────────── */
+  .app { display: grid; grid-template-columns: 248px 1fr; height: 100vh; overflow: hidden; }
+  .sidebar {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    padding: var(--space-4) var(--space-3);
+    gap: var(--space-3);
+  }
+  .brand { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3); }
+  .brand-mark {
+    width: 32px; height: 32px; flex: none;
+    display: grid; place-items: center;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg);
+    color: var(--accent);
+  }
+  .brand-mark svg { width: 18px; height: 18px; }
+  .brand-name { font-family: var(--font-display); font-size: var(--text-base); font-weight: 600; }
+  .brand-sub { font-size: var(--text-xs); color: var(--muted); }
+  .brand-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .brand-text .brand-name, .brand-text .brand-sub { display: block; }
+  .nav-close {
+    display: none; align-items: center; justify-content: center;
+    width: 36px; height: 36px; flex: none; padding: 0; margin-left: auto;
+    border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--fg-2);
+    transition: background var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard);
+  }
+  .nav-close:hover { background: color-mix(in oklab, var(--fg) 6%, transparent); color: var(--fg); }
+  .nav-close svg { width: 18px; height: 18px; }
+
+  .nav { display: flex; flex-direction: column; gap: 2px; }
+  .nav .nav-label { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--meta); padding: 0 var(--space-3); margin: var(--space-3) 0 var(--space-1); }
+  .nav button {
+    display: flex; align-items: center; gap: var(--space-3);
+    width: 100%; min-height: 44px; padding: 0 var(--space-3);
+    border: 0; border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--fg-2); font-size: var(--text-sm); font-weight: 500;
+    text-align: left;
+    transition: background var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard);
+  }
+  .nav button svg { width: 18px; height: 18px; flex: none; }
+  .nav button:hover { background: color-mix(in oklab, var(--fg) 6%, transparent); color: var(--fg); }
+  .nav button[aria-current="page"] {
+    background: color-mix(in oklab, var(--accent) 12%, transparent);
+    color: var(--accent-active);
+  }
+  .nav button .nav-badge {
+    margin-left: auto; min-width: 20px; height: 20px; padding: 0 6px;
+    border-radius: var(--radius-pill); background: var(--danger); color: var(--accent-on);
+    font-size: 11px; font-weight: 600;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .sidebar-foot { margin-top: auto; padding: var(--space-3); border-top: 1px solid var(--border); }
+  .sidebar-foot .statusline { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-xs); color: var(--muted); }
+  .statusline .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--meta); flex: none; }
+  .statusline.is-live .dot { background: var(--success); }
+  .statusline.is-demo .dot { background: var(--warn); }
+
+  .main { display: flex; flex-direction: column; min-width: 0; height: 100vh; overflow: hidden; }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between; gap: var(--space-4);
+    padding: var(--space-3) var(--space-8);
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in oklab, var(--bg) 82%, transparent);
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+  }
+  .topbar .crumb { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--muted); letter-spacing: 0.04em; }
+  .topbar-right { display: flex; align-items: center; gap: var(--space-3); }
+  .user-chip {
+    display: inline-flex; align-items: center; gap: var(--space-2);
+    padding: 4px 12px; border: 1px solid var(--border); border-radius: var(--radius-pill);
+    font-size: var(--text-xs); color: var(--fg-2); background: var(--bg);
+  }
+  .user-chip .avatar { width: 20px; height: 20px; border-radius: 50%; background: color-mix(in oklab, var(--accent) 14%, transparent); color: var(--accent-active); display: grid; place-items: center; font-size: 10px; font-weight: 700; }
+
+  .topbar-left { display: flex; align-items: center; gap: var(--space-3); min-width: 0; }
+  .topbar-left .crumb { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .nav-toggle {
+    display: none; align-items: center; justify-content: center;
+    width: 44px; height: 44px; flex: none; padding: 0;
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--bg); color: var(--fg-2);
+    transition: background var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard);
+  }
+  .nav-toggle:hover { background: var(--surface-warm); border-color: var(--meta); color: var(--fg); }
+  .nav-toggle svg { width: 20px; height: 20px; }
+  .nav-backdrop {
+    position: fixed; inset: 0; z-index: 40;
+    background: color-mix(in oklab, var(--fg) 45%, transparent);
+    opacity: 0; visibility: hidden;
+    transition: opacity var(--motion-base) var(--ease-standard), visibility var(--motion-base) var(--ease-standard);
+  }
+  .nav-backdrop.show { opacity: 1; visibility: visible; }
+
+  .demo-banner {
+    display: flex; align-items: center; gap: var(--space-3);
+    padding: var(--space-2) var(--space-8);
+    background: color-mix(in oklab, var(--warn) 16%, var(--bg));
+    border-bottom: 1px solid color-mix(in oklab, var(--warn) 38%, var(--border));
+    font-size: var(--text-xs); color: color-mix(in oklab, var(--warn) 62%, var(--fg));
+  }
+  .demo-banner strong { color: color-mix(in oklab, var(--warn) 45%, var(--fg)); }
+  .demo-banner button { margin-left: auto; border: 0; background: transparent; font-size: var(--text-xs); color: inherit; text-decoration: underline; }
+
+  .viewport { flex: 1; overflow-y: auto; padding: var(--space-8); scroll-behavior: smooth; }
+  .view { display: none; animation: fade var(--motion-base) var(--ease-standard); }
+  .view.active { display: block; }
+  @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--space-6); flex-wrap: wrap; margin-bottom: var(--space-6); }
+  .page-head h1 { margin-bottom: var(--space-2); }
+  .page-head .lede { color: var(--muted); font-size: var(--text-sm); max-width: 62ch; }
+  .head-actions { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+
+  /* ─── primitives (shared with the seed class system) ───────────── */
+  .stack { display: flex; flex-direction: column; }
+  .stack > * + * { margin-top: var(--space-5); }
+  .row { display: flex; align-items: center; gap: var(--space-3); }
+  .row-between { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
+  .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--space-4); }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--space-4); }
+  .grid-1-2 { display: grid; grid-template-columns: 340px 1fr; gap: var(--space-6); align-items: start; }
+  .wrap { flex-wrap: wrap; }
+
+  .eyebrow { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  .meta { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--muted); }
+  .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .lede { color: var(--muted); font-size: var(--text-sm); }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--space-6); }
+  .card-plain { background: var(--bg); }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-5); }
+  .card-head h2 { font-size: var(--text-base); }
+  .card-head .sub { font-size: var(--text-xs); color: var(--muted); margin-top: 2px; }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    min-height: 44px; padding: 0 18px;
+    border-radius: var(--radius-md);
+    border: 1px solid transparent;
+    font-size: var(--text-sm); font-weight: 500;
+    transition: background var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard), transform 80ms var(--ease-standard), color var(--motion-fast) var(--ease-standard);
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn:disabled, .btn[aria-disabled="true"] { opacity: 0.45; cursor: not-allowed; transform: none; }
+  .btn-primary { background: var(--accent); color: var(--accent-on); }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+  .btn-primary:active:not(:disabled) { background: var(--accent-active); }
+  .btn-secondary { background: var(--bg); color: var(--fg); border-color: var(--border); }
+  .btn-secondary:hover:not(:disabled) { border-color: var(--meta); background: var(--surface-warm); }
+  .btn-ghost { background: transparent; color: var(--fg-2); }
+  .btn-ghost:hover:not(:disabled) { background: color-mix(in oklab, var(--fg) 6%, transparent); color: var(--fg); }
+  .btn-danger { background: transparent; color: var(--danger); border-color: color-mix(in oklab, var(--danger) 40%, var(--border)); }
+  .btn-danger:hover:not(:disabled) { background: color-mix(in oklab, var(--danger) 10%, transparent); border-color: var(--danger); }
+  .btn-sm { min-height: 36px; padding: 0 12px; font-size: var(--text-xs); border-radius: var(--radius-sm); }
+  .btn .spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid color-mix(in oklab, currentColor 30%, transparent); border-top-color: currentColor; animation: spin 700ms linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px; border-radius: var(--radius-pill);
+    font-size: var(--text-xs); font-weight: 500; white-space: nowrap;
+  }
+  .pill-idle { background: color-mix(in oklab, var(--fg) 7%, transparent); color: var(--fg-2); }
+  .pill-run  { background: color-mix(in oklab, var(--accent) 14%, transparent); color: var(--accent-active); }
+  .pill-ok   { background: color-mix(in oklab, var(--success) 16%, transparent); color: color-mix(in oklab, var(--success) 68%, var(--fg)); }
+  .pill-warn { background: color-mix(in oklab, var(--warn) 20%, transparent); color: color-mix(in oklab, var(--warn) 48%, var(--fg)); }
+  .pill-err  { background: color-mix(in oklab, var(--danger) 14%, transparent); color: color-mix(in oklab, var(--danger) 72%, var(--fg)); }
+  .pill-muted{ background: color-mix(in oklab, var(--meta) 16%, transparent); color: color-mix(in oklab, var(--meta) 70%, var(--fg)); }
+  .tag {
+    display: inline-flex; align-items: center; padding: 2px 8px;
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    font-size: var(--text-xs); color: var(--muted); background: var(--bg);
+  }
+
+  .field { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
+  .field > label { font-size: var(--text-sm); color: var(--fg-2); font-weight: 500; }
+  .field .help { font-size: var(--text-xs); color: var(--muted); }
+  .input, .select, .textarea {
+    width: 100%; min-height: 44px; padding: 10px 14px;
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--bg); color: var(--fg);
+    font-family: var(--font-body); font-size: var(--text-sm);
+    transition: border-color var(--motion-fast) var(--ease-standard), box-shadow var(--motion-fast) var(--ease-standard);
+  }
+  .textarea { min-height: 96px; resize: vertical; line-height: 1.5; }
+  .select {
+    appearance: none; padding-right: 34px;
+    background-image:
+      linear-gradient(45deg, transparent 50%, var(--meta) 50%),
+      linear-gradient(135deg, var(--meta) 50%, transparent 50%);
+    background-position: calc(100% - 18px) calc(50% + 1px), calc(100% - 13px) calc(50% + 1px);
+    background-size: 5px 5px, 5px 5px;
+    background-repeat: no-repeat;
+  }
+  .input:hover, .select:hover, .textarea:hover { border-color: var(--meta); }
+  .input:focus-visible, .select:focus-visible, .textarea:focus-visible { border-color: var(--accent); box-shadow: var(--focus-ring); }
+
+  .switch { display: inline-flex; align-items: center; gap: var(--space-3); min-height: 44px; cursor: pointer; user-select: none; }
+  .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .switch-ui { position: relative; width: 44px; height: 26px; flex: none; border-radius: var(--radius-pill); background: color-mix(in oklab, var(--fg) 16%, transparent); transition: background var(--motion-fast) var(--ease-standard); }
+  .switch-ui .thumb { position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: var(--bg); box-shadow: var(--elev-raised); transition: transform var(--motion-fast) var(--ease-standard); }
+  .switch input:checked ~ .switch-ui { background: var(--accent); }
+  .switch input:checked ~ .switch-ui .thumb { transform: translateX(18px); }
+  .switch input:focus-visible ~ .switch-ui { box-shadow: var(--focus-ring); }
+  .switch .switch-text { font-size: var(--text-sm); color: var(--fg-2); }
+
+  .seg { display: inline-flex; gap: 2px; padding: 2px; border-radius: var(--radius-sm); background: color-mix(in oklab, var(--fg) 7%, transparent); }
+  .seg button { min-height: 36px; padding: 0 16px; border: 0; border-radius: 6px; background: transparent; color: var(--fg-2); font-size: var(--text-sm); font-weight: 500; transition: all var(--motion-fast) var(--ease-standard); }
+  .seg button[aria-pressed="true"] { background: var(--bg); color: var(--fg); box-shadow: var(--elev-raised); }
+
+  .ds-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+  .ds-table th, .ds-table td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--border-soft); vertical-align: middle; }
+  .ds-table th { color: var(--muted); font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 500; }
+  .ds-table tbody tr:hover { background: var(--surface-warm); }
+  .ds-table .num-col { font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right; }
+  .table-wrap { overflow-x: auto; }
+
+  .metric .metric-num { font-family: var(--font-display); font-size: var(--text-2xl); font-weight: 600; letter-spacing: var(--tracking-display); line-height: 1.02; }
+  .metric .metric-label { font-size: var(--text-xs); color: var(--muted); margin-top: var(--space-1); }
+  .metric.accent .metric-num { color: var(--accent); }
+
+  .bar { height: 8px; border-radius: var(--radius-pill); background: color-mix(in oklab, var(--fg) 9%, transparent); overflow: hidden; }
+  .bar > i { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width var(--motion-base) var(--ease-standard); }
+  .bar.ok > i { background: var(--success); }
+
+  .console { background: var(--fg); border-radius: var(--radius-lg); padding: var(--space-4); max-height: 340px; overflow-y: auto; font-family: var(--font-mono); font-size: var(--text-xs); line-height: 1.7; }
+  .log-line { display: flex; gap: 10px; }
+  .log-line time { color: color-mix(in oklab, var(--meta) 55%, var(--surface)); flex: none; }
+  .log-info { color: var(--surface); }
+  .log-success { color: color-mix(in oklab, var(--success) 42%, var(--surface)); }
+  .log-warning { color: color-mix(in oklab, var(--warn) 52%, var(--surface)); }
+  .log-error { color: color-mix(in oklab, var(--danger) 46%, var(--surface)); }
+  .console .empty { color: color-mix(in oklab, var(--meta) 55%, var(--surface)); }
+
+  .list { display: flex; flex-direction: column; }
+  .list-item { display: flex; gap: var(--space-3); align-items: flex-start; padding: var(--space-3); border-radius: var(--radius-md); transition: background var(--motion-fast) var(--ease-standard); }
+  .list-item + .list-item { border-top: 1px solid var(--border-soft); border-radius: 0; }
+  .list-item:hover { background: var(--surface-warm); }
+  .list-item .grow { flex: 1; min-width: 0; }
+  .list-item .title { font-size: var(--text-sm); font-weight: 500; }
+  .list-item .sub { font-size: var(--text-xs); color: var(--muted); margin-top: 2px; }
+
+  .empty-state { text-align: center; padding: var(--space-12) var(--space-6); color: var(--muted); }
+  .empty-state .es-icon { width: 44px; height: 44px; margin: 0 auto var(--space-4); display: grid; place-items: center; border: 1px solid var(--border); border-radius: var(--radius-md); color: var(--meta); }
+  .empty-state h3 { color: var(--fg-2); margin-bottom: 6px; }
+  .empty-state p { font-size: var(--text-sm); max-width: 44ch; margin: 0 auto; }
+
+  .tree-group + .tree-group { margin-top: var(--space-4); border-top: 1px solid var(--border-soft); padding-top: var(--space-4); }
+  .tree-task { border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; background: var(--bg); }
+  .tree-task + .tree-task { margin-top: var(--space-3); }
+  .tree-task-head { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); background: var(--surface-warm); border-bottom: 1px solid var(--border-soft); }
+  .tree-item { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); }
+  .tree-item + .tree-item { border-top: 1px solid var(--border-soft); }
+  .tree-item.is-disabled { opacity: 0.62; }
+  .check { width: 18px; height: 18px; accent-color: var(--accent); flex: none; }
+
+  .approval { border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--bg); padding: var(--space-5); }
+  .approval + .approval { margin-top: var(--space-4); }
+  .approval .preview { margin: var(--space-4) 0; padding: var(--space-4); background: var(--surface); border: 1px solid var(--border-soft); border-radius: var(--radius-md); font-size: var(--text-sm); color: var(--fg-2); max-height: 150px; overflow: auto; white-space: pre-wrap; line-height: 1.6; }
+
+  .kv { display: grid; grid-template-columns: 160px 1fr; gap: var(--space-2) var(--space-4); font-size: var(--text-sm); }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; font-family: var(--font-mono); font-size: var(--text-xs); color: var(--fg-2); word-break: break-all; }
+
+  .toast-region { position: fixed; right: var(--space-6); bottom: var(--space-6); display: flex; flex-direction: column; gap: var(--space-3); z-index: 60; }
+  .toast {
+    min-width: 260px; max-width: 380px; padding: var(--space-3) var(--space-4);
+    background: var(--fg); color: var(--surface);
+    border-radius: var(--radius-md); box-shadow: var(--elev-raised);
+    font-size: var(--text-sm); animation: fade var(--motion-base) var(--ease-standard);
+  }
+  .toast.ok { border-left: 3px solid var(--success); }
+  .toast.warn { border-left: 3px solid var(--warn); }
+  .toast.err { border-left: 3px solid var(--danger); }
+
+  .mono-note { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--muted); }
+
+  @media (max-width: 1080px) { .grid-1-2 { grid-template-columns: 1fr; } }
+  @media (max-width: 920px) {
+    .app { grid-template-columns: 1fr; }
+    .nav-toggle { display: inline-flex; }
+    .nav-close { display: inline-flex; }
+    .sidebar {
+      position: fixed; top: 0; left: 0; bottom: 0; z-index: 45;
+      width: min(280px, 84vw);
+      transform: translateX(-102%);
+      border-right: 1px solid var(--border);
+      box-shadow: var(--elev-raised);
+      transition: transform var(--motion-base) var(--ease-standard);
+    }
+    .sidebar.open { transform: none; }
+    .topbar { padding-left: var(--space-4); padding-right: var(--space-4); }
+    .demo-banner { padding-left: var(--space-4); padding-right: var(--space-4); }
+    .viewport { padding: var(--space-5) var(--space-4); }
+    .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+    .kv { grid-template-columns: 1fr; }
+    .page-head { gap: var(--space-4); }
+  }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar" data-od-id="sidebar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 5h7a3 3 0 0 1 3 3v11a2 2 0 0 0-2-2H4V5Z"/><path d="M20 5h-4a3 3 0 0 0-3 3v11a2 2 0 0 1 2-2h5V5Z"/></svg>
+      </span>
+      <span class="brand-text">
+        <span class="brand-name">学习通助手</span>
+        <span class="brand-sub">桌面版 · 自动学习</span>
+      </span>
+      <button class="nav-close" id="nav-close" type="button" aria-label="关闭导航" data-od-id="nav-close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+    <nav class="nav" data-od-id="main-nav" aria-label="主导航">
+      <span class="nav-label">工作区</span>
+      <button data-view="account" aria-current="page">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-3.3 3.6-6 8-6s8 2.7 8 6"/></svg>
+        账号
+      </button>
+      <button data-view="courses">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+        课程与任务点
+      </button>
+      <button data-view="run">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M5 4v16l14-8L5 4Z"/></svg>
+        运行与日志
+        <span class="nav-badge" id="run-badge" hidden>0</span>
+      </button>
+      <button data-view="approvals">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M20 6 9 17l-5-5"/></svg>
+        待审批
+        <span class="nav-badge" id="approvals-badge" hidden>0</span>
+      </button>
+      <span class="nav-label">系统</span>
+      <button data-view="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6h8M20 6h-4M4 12h3M11 12h9M4 18h6M16 18h4"/><circle cx="14" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="14" cy="18" r="2"/></svg>
+        设置
+      </button>
+      <button data-view="about">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>
+        关于与诊断
+      </button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="statusline" id="conn-status" data-od-id="conn-status">
+        <span class="dot"></span>
+        <span id="conn-text">正在探测本地服务…</span>
+      </div>
+      <p class="mono-note" id="build-line" style="margin-top:8px;">构建 —</p>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar" data-od-id="topbar">
+      <div class="topbar-left">
+        <button class="nav-toggle" id="nav-toggle" type="button" aria-label="打开导航" aria-controls="sidebar" aria-expanded="false" data-od-id="nav-toggle">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+        </button>
+        <span class="crumb" id="crumb">工作区 / 账号</span>
+      </div>
+      <div class="topbar-right">
+        <span class="user-chip" id="user-chip" data-od-id="user-chip"><span class="avatar">—</span><span>未登录</span></span>
+      </div>
+    </header>
+
+    <div class="demo-banner" id="demo-banner" hidden data-od-id="demo-banner">
+      <strong>演示模式</strong>
+      <span>未检测到 <span class="num">127.0.0.1</span> 上的本地服务，界面展示的是示例数据；接入真实后端后会自动切换。</span>
+      <button type="button" id="demo-dismiss">知道了</button>
+    </div>
+
+    <div class="viewport" id="viewport">
+      <!-- ══ 账号 ══ -->
+      <section class="view active" id="view-account" data-od-id="view-account">
+        <div class="page-head">
+          <div>
+            <h1>账号</h1>
+            <p class="lede">后端无会话：每次需要账号的请求都要重新带上用户名 / 密码，或勾选「复用本机登录状态」使用已保存的 cookies.txt。</p>
+          </div>
+        </div>
+        <div class="grid-1-2">
+          <div class="card card-plain" data-od-id="account-form-card">
+            <div class="card-head"><div><h2>登录凭据</h2><div class="sub">仅保存在本机，用于拉取课程</div></div></div>
+            <form class="stack" id="login-form" style="gap:16px;">
+              <div class="field">
+                <label for="acc-username">用户名 / 学号</label>
+                <input class="input" id="acc-username" name="username" autocomplete="username" placeholder="2023xxxxxxxx" />
+              </div>
+              <div class="field">
+                <label for="acc-password">密码</label>
+                <input class="input" id="acc-password" name="password" type="password" autocomplete="current-password" placeholder="••••••••" />
+                <span class="help" id="pw-help">勾选下方开关时可留空，直接用已保存的登录状态。</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="acc-cookies" />
+                <span class="switch-ui"><span class="thumb"></span></span>
+                <span class="switch-text">复用本机登录状态（use_cookies）</span>
+              </label>
+              <div class="row wrap" style="gap:12px;">
+                <button class="btn btn-primary" type="submit" id="btn-login-courses">登录并获取课程</button>
+                <button class="btn btn-secondary" type="button" id="btn-login-only">仅校验账号</button>
+              </div>
+              <p class="mono-note" id="account-msg">登录成功会把 cookies 落到本机 cookies.txt，之后可免密使用。</p>
+            </form>
+          </div>
+          <div class="stack">
+            <div class="card" data-od-id="account-session-card">
+              <div class="card-head"><div><h2>当前会话</h2><div class="sub">内存态，重启进程即失效</div></div></div>
+              <dl class="kv">
+                <dt>登录状态</dt><dd id="session-state">未登录</dd>
+                <dt>账号</dt><dd id="session-user">—</dd>
+                <dt>cookies.txt</dt><dd id="session-cookies">未知</dd>
+                <dt>课程缓存</dt><dd id="session-courses">0 门</dd>
+              </dl>
+            </div>
+            <div class="card" data-od-id="account-tips-card">
+              <div class="card-head"><div><h2>接入说明</h2></div></div>
+              <div class="stack" style="gap:12px;">
+                <p class="lede">全部请求使用相对路径 <span class="mono-note">/api/…</span>，端口由运行时动态分配，切勿写死端口。</p>
+                <p class="lede">登录被超星拒绝会返回 HTTP 401，其 <span class="mono-note">msg</span> 是超星原话（如要求短信验证码 / 滑块验证）。</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══ 课程与任务点 ══ -->
+      <section class="view" id="view-courses" data-od-id="view-courses">
+        <div class="page-head">
+          <div>
+            <h1>课程与任务点</h1>
+            <p class="lede">先勾选课程，再对 <span class="mono-note">task.chaoxing.com</span> 的「任务」做只读盘点；盘点绝不会改动学习记录。</p>
+          </div>
+          <div class="head-actions">
+            <button class="btn btn-secondary" id="btn-fetch-courses">刷新课程列表</button>
+          </div>
+        </div>
+        <div class="grid-1-2">
+          <div class="card card-plain" data-od-id="courses-list-card">
+            <div class="card-head">
+              <div><h2>课程</h2><div class="sub" id="courses-count">尚未加载</div></div>
+            </div>
+            <div class="row-between" style="margin-bottom:12px;">
+              <button class="btn btn-sm btn-ghost" id="btn-select-all">全选</button>
+              <button class="btn btn-sm btn-ghost" id="btn-clear-all">清空</button>
+            </div>
+            <div class="list" id="courses-list"></div>
+          </div>
+          <div class="stack">
+            <div class="card card-plain" data-od-id="taskpoints-card">
+              <div class="card-head">
+                <div><h2>任务点清单</h2><div class="sub" id="preview-sub">选择课程后开始盘点</div></div>
+                <div class="row" style="gap:8px;">
+                  <span class="switch-text mono-note">包含已完成</span>
+                  <label class="switch" style="min-height:auto;">
+                    <input type="checkbox" id="preview-redo" />
+                    <span class="switch-ui"><span class="thumb"></span></span>
+                  </label>
+                </div>
+              </div>
+              <div class="row wrap" style="gap:12px; margin-bottom:16px;">
+                <button class="btn btn-primary" id="btn-preview">盘点任务点</button>
+                <button class="btn btn-secondary" id="btn-start-learn">开始章节任务点学习</button>
+              </div>
+              <div id="preview-summary" class="grid-3" style="margin-bottom:16px;"></div>
+              <div id="preview-tree"></div>
+              <div id="preview-footer" class="row-between" style="margin-top:16px;" hidden>
+                <span class="meta" id="preview-selected-count">已选 0 个任务点</span>
+                <button class="btn btn-primary" id="btn-execute">确认并执行</button>
+              </div>
+            </div>
+            <div class="card card-plain" id="courses-progress-card" hidden data-od-id="courses-progress-card">
+              <div class="card-head"><div><h2>盘点进度</h2><div class="sub" id="courses-progress-sub">—</div></div></div>
+              <div class="bar"><i id="courses-progress-bar" style="width:0%"></i></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══ 运行与日志 ══ -->
+      <section class="view" id="view-run" data-od-id="view-run">
+        <div class="page-head">
+          <div>
+            <h1>运行与日志</h1>
+            <p class="lede">任务状态与日志各 1 秒轮询一次；日志是队列消费，取走即清空，请以本页缓冲为准。</p>
+          </div>
+          <div class="head-actions" id="run-actions"></div>
+        </div>
+        <div class="stack">
+          <div class="card card-plain" id="run-summary-card">
+            <div id="run-summary"></div>
+          </div>
+          <div class="card card-plain" id="run-active-card" hidden data-od-id="run-active-card">
+            <div class="card-head"><div><h2>当前视频进度</h2><div class="sub">超过 10 秒无心跳的条目会被后端自动移除</div></div></div>
+            <div id="run-active-jobs"></div>
+          </div>
+          <div class="card card-plain" data-od-id="run-log-card">
+            <div class="card-head">
+              <div><h2>实时日志</h2><div class="sub">等宽字体 · 四色级别 · 自动滚底</div></div>
+              <label class="switch" style="min-height:auto;">
+                <input type="checkbox" id="log-autoscroll" checked />
+                <span class="switch-ui"><span class="thumb"></span></span>
+                <span class="switch-text mono-note">自动滚动</span>
+              </label>
+            </div>
+            <div class="console" id="console" role="log" aria-live="polite"><div class="empty">暂无日志。开始一个任务后，日志会在这里滚动。</div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══ 待审批 ══ -->
+      <section class="view" id="view-approvals" data-od-id="view-approvals">
+        <div class="page-head">
+          <div>
+            <h1>待审批</h1>
+            <p class="lede">所有会写入账号的内容先在这里登记、逐条批准后才提交；队列只在内存里，重启后清空。</p>
+          </div>
+          <div class="head-actions">
+            <label class="switch" style="min-height:auto;">
+              <input type="checkbox" id="appr-show-decided" />
+              <span class="switch-ui"><span class="thumb"></span></span>
+              <span class="switch-text mono-note">显示已决策</span>
+            </label>
+            <button class="btn btn-secondary" id="btn-approvals-clear">清空队列</button>
+          </div>
+        </div>
+        <div id="approvals-list"></div>
+      </section>
+
+      <!-- ══ 设置 ══ -->
+      <section class="view" id="view-settings" data-od-id="view-settings">
+        <div class="page-head">
+          <div>
+            <h1>设置</h1>
+            <p class="lede">POST /api/config 是整份覆盖写：这里保存的是完整的配置对象。字段名不要改动。</p>
+          </div>
+          <div class="head-actions">
+            <button class="btn btn-secondary" id="btn-config-reload">重新读取</button>
+            <button class="btn btn-primary" id="btn-config-save">保存配置</button>
+          </div>
+        </div>
+        <div class="stack">
+          <div class="card card-plain" data-od-id="settings-ai-card">
+            <div class="card-head">
+              <div><h2>AI 问答接口（tiku_config）</h2><div class="sub">endpoint / key / model 同时非空才算配好</div></div>
+              <button class="btn btn-secondary" id="btn-ai-test">测试连接</button>
+            </div>
+            <div class="grid-2">
+              <div class="field"><label for="ai-provider">供应商（provider）</label>
+                <select class="select" id="ai-provider"><option value="">（不使用题库）</option><option>AI</option><option>SiliconFlow</option><option>TikuAdapter</option></select>
+              </div>
+              <div class="field"><label for="ai-model">模型（model）</label><input class="input" id="ai-model" placeholder="deepseek-chat" /></div>
+              <div class="field" style="grid-column:1/-1;"><label for="ai-endpoint">接口地址（endpoint）</label><input class="input" id="ai-endpoint" placeholder="https://api.deepseek.com/v1/chat/completions" /></div>
+              <div class="field" style="grid-column:1/-1;"><label for="ai-key">密钥（key）</label><input class="input" id="ai-key" type="password" placeholder="sk-…" /></div>
+              <div class="field"><label for="ai-cover">覆盖率阈值（cover_rate）</label><input class="input" id="ai-cover" type="number" step="0.05" min="0" max="1" /></div>
+              <div class="field"><label for="ai-delay">查询延迟 / 秒（delay）</label><input class="input" id="ai-delay" type="number" step="0.5" min="0" /></div>
+              <div class="field"><label for="ai-conc">并发数（ai_concurrency）</label><input class="input" id="ai-conc" type="number" step="1" min="1" /></div>
+              <div class="field"><label for="ai-interval">最小间隔 / 秒（min_interval_seconds）</label><input class="input" id="ai-interval" type="number" step="0.5" min="0" /></div>
+            </div>
+            <label class="switch" style="margin-top:16px;">
+              <input type="checkbox" id="ai-submit" />
+              <span class="switch-ui"><span class="thumb"></span></span>
+              <span class="switch-text">自动提交答题（submit）</span>
+            </label>
+            <p class="mono-note" id="ai-test-result" style="margin-top:12px;">尚未测试。</p>
+          </div>
+
+          <div class="card card-plain" data-od-id="settings-run-card">
+            <div class="card-head"><div><h2>运行参数</h2></div></div>
+            <div class="grid-2">
+              <div class="field"><label for="run-speed">视频倍速（speed，1.0–2.0）</label><input class="input" id="run-speed" type="number" step="0.1" min="1" max="2" /></div>
+              <div class="field"><label for="run-jobs">并发视频数（jobs）</label><input class="input" id="run-jobs" type="number" step="1" min="1" /></div>
+              <div class="field" style="grid-column:1/-1;"><label for="run-maxch">每门课只刷前 N 章（max_chapters，0 = 不限制）</label><input class="input" id="run-maxch" type="number" step="1" min="0" /></div>
+              <div class="field" style="grid-column:1/-1;">
+                <label>未开启章节（notopen_action）</label>
+                <div class="seg" id="seg-notopen" role="group">
+                  <button type="button" data-val="retry" aria-pressed="true">重试几次后放弃</button>
+                  <button type="button" data-val="continue" aria-pressed="false">直接跳过</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="card card-plain" data-od-id="settings-notify-card">
+              <div class="card-head"><div><h2>通知（notification_config）</h2></div></div>
+              <div class="stack" style="gap:16px;">
+                <div class="field"><label for="nt-provider">供应商</label>
+                  <select class="select" id="nt-provider"><option value="">（不通知）</option><option>ServerChan</option><option>Qmsg</option><option>Bark</option><option>Telegram</option></select>
+                </div>
+                <div class="field"><label for="nt-url">send 地址（含 key）</label><input class="input" id="nt-url" placeholder="https://…" /></div>
+                <div class="field"><label for="nt-tg">Telegram chat_id</label><input class="input" id="nt-tg" placeholder="仅 Telegram 需要" /></div>
+              </div>
+            </div>
+            <div class="card card-plain" data-od-id="settings-ocr-card">
+              <div class="card-head"><div><h2>OCR（ocr_config）</h2><div class="sub">provider + key 会写入进程环境变量并即时生效</div></div></div>
+              <div class="stack" style="gap:16px;">
+                <div class="field"><label for="ocr-provider">供应商</label>
+                  <select class="select" id="ocr-provider"><option value="">（不使用）</option><option>siliconflow</option><option>openai</option><option>claude</option><option>qwen</option><option>openai_compatible</option></select>
+                </div>
+                <div class="field"><label for="ocr-key">密钥</label><input class="input" id="ocr-key" type="password" placeholder="sk-…" /></div>
+                <div class="field"><label for="ocr-endpoint">接口地址</label><input class="input" id="ocr-endpoint" placeholder="https://…" /></div>
+                <div class="field"><label for="ocr-model">模型</label><input class="input" id="ocr-model" placeholder="…" /></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══ 关于与诊断 ══ -->
+      <section class="view" id="view-about" data-od-id="view-about">
+        <div class="page-head">
+          <div>
+            <h1>关于与诊断</h1>
+            <p class="lede">用于确认「加载的是不是最新构建」，以及当前配置文件路径与运行端口。</p>
+          </div>
+          <div class="head-actions">
+            <button class="btn btn-secondary" id="btn-about-refresh">重新探测</button>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="card card-plain" data-od-id="about-health-card">
+            <div class="card-head"><div><h2>服务状态</h2><div class="sub">GET /api/health</div></div></div>
+            <dl class="kv">
+              <dt>存活探测</dt><dd id="about-health">—</dd>
+              <dt>前端构建（webBuild）</dt><dd id="about-build">—</dd>
+              <dt>运行模式</dt><dd id="about-mode">—</dd>
+              <dt>本地服务地址</dt><dd id="about-origin">—</dd>
+            </dl>
+          </div>
+          <div class="card card-plain" data-od-id="about-config-card">
+            <div class="card-head"><div><h2>配置与文件</h2></div></div>
+            <dl class="kv">
+              <dt>配置文件</dt><dd>web_config.json（可写）</dd>
+              <dt>登录状态</dt><dd>cookies.txt（本机）</dd>
+              <dt>任务状态存放</dt><dd>进程内存 · 重启即失效</dd>
+              <dt>审批队列</dt><dd>进程内存 · 重启即清空</dd>
+            </dl>
+          </div>
+        </div>
+        <div class="card card-plain" style="margin-top:24px;" data-od-id="about-desktop-card">
+          <div class="card-head"><div><h2>桌面壳回执</h2><div class="sub">仅桌面模式存在，浏览器 / 开发模式会 404，需容错处理</div></div></div>
+          <dl class="kv">
+            <dt>窗口心跳</dt><dd>GET /api/heartbeat · 每 5 秒</dd>
+            <dt>关窗通知</dt><dd>navigator.sendBeacon("/api/window-closed", "") · pagehide</dd>
+            <dt>心跳最后成功</dt><dd id="about-heartbeat">—</dd>
+          </dl>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+<div class="nav-backdrop" id="nav-backdrop" aria-hidden="true"></div>
+<div class="toast-region" id="toast-region" aria-live="polite"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  var $ = function (s, r) { return (r || document).querySelector(s); };
+  var $$ = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
+
+  var NAMES = { account: "账号", courses: "课程与任务点", run: "运行与日志", approvals: "待审批", settings: "设置", about: "关于与诊断" };
+  var DEMO_BUILD = 1760000000;
+
+  // ── 展示辅助 ────────────────────────────────────────────────────
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
+  function fmtTime(sec) { var d = new Date(sec * 1000); return d.toLocaleTimeString("zh-CN", { hour12: false }); }
+  function fmtDateTime(sec) { var d = new Date(sec * 1000); return d.toLocaleString("zh-CN", { hour12: false }); }
+  function fmtDur(sec) { sec = Math.max(0, Math.round(sec)); var m = Math.floor(sec / 60), s = sec % 60; return m + ":" + (s < 10 ? "0" : "") + s; }
+
+  var state = {
+    view: "account", demo: false, healthOk: null, version: null, lastHeartbeat: null, rawConfig: null,
+    username: "", hasCookies: false, courses: [], selected: {},
+    preview: null, previewTask: null, previewPending: false,
+    run: null, runKind: null, runId: null, console: [], autoScroll: true,
+    approvals: [], approvalsPending: 0, showingDecided: false,
+    config: null, notopen: "retry"
+  };
+
+  var toastRegion = $("#toast-region");
+  function toast(msg, kind, ms) {
+    var el = document.createElement("div");
+    el.className = "toast " + (kind || "ok");
+    el.textContent = msg;
+    toastRegion.appendChild(el);
+    setTimeout(function () { el.style.opacity = "0"; el.style.transition = "opacity 200ms"; setTimeout(function () { el.remove(); }, 220); }, ms || 3600);
+  }
+
+  // ── 网络层：真实接口 + 演示回退 ──────────────────────────────────
+  function call(path, opts) {
+    opts = opts || {};
+    if (state.demo) return demoApi(path, opts.method || "GET", opts.body);
+    return fetch(path, {
+      method: opts.method || "GET",
+      headers: opts.body ? { "Content-Type": "application/json" } : undefined,
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+      cache: "no-store"
+    }).then(function (res) {
+      var ct = res.headers.get("content-type") || "";
+      if (ct.indexOf("application/json") === -1) {
+        return { status: false, msg: "HTTP " + res.status + "：接口未注册或返回了非 JSON 响应" };
+      }
+      return res.json();
+    }).catch(function (e) { return { status: false, msg: "无法连接本地服务：" + e.message }; });
+  }
+
+  // ── 演示数据 ────────────────────────────────────────────────────
+  var DEMO_COURSES = [
+    { courseId: "246831735", clazzId: "107515845", cpi: "338350298", title: "数据结构与算法", teacher: "张三", displayTitle: "数据结构与算法（张三）" },
+    { courseId: "246831799", clazzId: "107515901", cpi: "338350412", title: "审计学", teacher: "李四", displayTitle: "审计学（李四）" },
+    { courseId: "246831820", clazzId: "107515960", cpi: "338350501", title: "大学英语（三）", teacher: "王五", displayTitle: "大学英语（三）" },
+    { courseId: "246831880", clazzId: "107516030", cpi: "338350644", title: "线性代数", teacher: "赵六", displayTitle: "线性代数（赵六）" }
+  ];
+  var DEMO_PREVIEW = {
+    summary: { courseCount: 2, taskCount: 4, pendingCount: 12, completableCount: 9, manualCount: 2, unsupportedCount: 1 },
+    courses: [
+      { courseId: "246831735", title: "数据结构与算法（张三）", hasTaskEngine: true, error: "", tasks: [
+        { taskId: "t1", name: "第三章 综合练习", progress: 0.35, pendingCount: 3, completableCount: 2, items: [
+          { planId: 12345, name: "综合实践小结上传", typeLabel: "AI剧情", status: "auto", note: "可全自动完成 AI 剧情实践并提交", supported: true, entryUrl: "#" },
+          { planId: 12346, name: "主题讨论：栈与队列", typeLabel: "主题讨论", status: "auto", note: "自动生成讨论回复，等待逐条审批", supported: true, entryUrl: "#" },
+          { planId: 12347, name: "章节测验", typeLabel: "考试", status: "manual", note: "考试窗口 2026-10-20 08:00 开放，暂不可作答", supported: false, entryUrl: "#" }
+        ] },
+        { taskId: "t2", name: "第四章 树与二叉树", progress: 0, pendingCount: 2, completableCount: 2, items: [
+          { planId: 12348, name: "视频：4.1 二叉树遍历", typeLabel: "视频", status: "partial", note: "仅计时长，倍速受平台限制", supported: true, entryUrl: "#" },
+          { planId: 12349, name: "阅读材料：线索二叉树", typeLabel: "文档", status: "auto", note: "自动滚动完成阅读时长", supported: true, entryUrl: "#" }
+        ] }
+      ] },
+      { courseId: "246831799", title: "审计学（李四）", hasTaskEngine: true, error: "", tasks: [
+        { taskId: "t3", name: "第三章 综合练习", progress: 0.8, pendingCount: 1, completableCount: 0, items: [
+          { planId: 12350, name: "AI实践：审计证据", typeLabel: "AI实践", status: "pending", note: "未能识别子模式，暂不支持自动完成", supported: false, entryUrl: "#" }
+        ] }
+      ] },
+      { courseId: "246831820", title: "大学英语（三）", hasTaskEngine: false, error: "", tasks: [] }
+    ]
+  };
+  var DEMO_CONFIG = {
+    speed: 1.0, jobs: 4, notopen_action: "retry", max_chapters: 0,
+    tiku_config: { provider: "AI", tokens: "", url: "", endpoint: "https://api.deepseek.com/v1/chat/completions", key: "", model: "deepseek-chat", submit: "false", cover_rate: 0.9, delay: 1.0, ai_concurrency: 3, min_interval_seconds: 1.0 },
+    notification_config: { provider: "Telegram", url: "", tg_chat_id: "123456789" },
+    ocr_config: { provider: "", key: "", endpoint: "", model: "" }
+  };
+  var DEMO_APPROVALS = [
+    { id: "ap-7", kind: "discussion", label: "数据结构与算法（张三） / 第三章 综合练习 / 主题讨论：栈与队列", preview: "栈是一种只允许在一端进行插入和删除的线性表，这一端称为栈顶。它遵循后进先出（LIFO）原则：最后入栈的元素最先出栈。\n\n典型应用包括函数调用栈、表达式求值与括号匹配。递归的本质就是系统栈的压栈与弹栈过程。", created: Math.floor(Date.now() / 1000) - 128, status: "pending", result: "" },
+    { id: "ap-6", kind: "course_work", label: "审计学（李四） / 第三章 综合练习 / AI实践：审计证据", preview: "本次实践中，我选取了被审计单位的销售与收款循环作为样本……（生成的作答正文，提交前等待确认）", created: Math.floor(Date.now() / 1000) - 420, status: "pending", result: "" }
+  ];
+
+  var demo = { tasks: {}, previews: {}, approvals: DEMO_APPROVALS.slice() };
+  var LOG_POOL = [
+    ["正在读取课程目录…", "info"],
+    ["进入任务点：第三章 综合练习", "info"],
+    ["视频计时完成，已写入学习记录", "success"],
+    ["生成讨论回复，已登记到待审批队列", "success"],
+    ["未开启章节，稍后重试（1/3）", "warning"],
+    ["考试窗口未开放，跳过该任务点", "warning"],
+    ["AI 接口返回 401，回退模板文本", "error"]
+  ];
+
+  function demoApi(path, method, body) {
+    return new Promise(function (resolve) {
+      setTimeout(function () { resolve(demoRoute(path, method, body || {})); }, 180 + Math.random() * 420);
+    });
+  }
+  function env(data, msg) { return { status: true, msg: msg || "OK", data: data }; }
+
+  function demoRoute(path, method, body) {
+    var m;
+    if (path === "/api/health") return env(undefined, "OK");
+    if (path === "/api/version") return env({ webBuild: DEMO_BUILD });
+    if (path === "/api/heartbeat" || path === "/api/window-closed") return { status: true };
+
+    if (path === "/api/login") {
+      if (!body.use_cookies && (!body.username || !body.password)) return { status: false, msg: "用户名或密码不能为空" };
+      var u = body.username || "2023xxxx";
+      state.username = u; state.hasCookies = true;
+      return env({ username: u }, "登录成功");
+    }
+    if (path === "/api/courses") {
+      if (!body.use_cookies && (!body.username || !body.password)) return { status: false, msg: "用户名或密码不能为空" };
+      if (body.username) { state.username = body.username; state.hasCookies = true; }
+      return env(DEMO_COURSES, "已获取 " + DEMO_COURSES.length + " 门课程");
+    }
+    if (path === "/api/config" && method === "GET") return env(state.config || DEMO_CONFIG);
+    if (path === "/api/config" && method === "POST") { state.config = body; return env(undefined, "保存成功"); }
+
+    if (path === "/api/ai/test") {
+      var tc = body.tiku_config || (state.config && state.config.tiku_config) || {};
+      if (!tc.endpoint || !tc.key || !tc.model) {
+        return { status: false, msg: "未配置 AI 接口：endpoint / key / model 需同时填写", data: { ok: false, model: tc.model || "", latency: 0 } };
+      }
+      return env({ ok: true, model: tc.model, latency: 812, sample: "OK" });
+    }
+
+    if (path === "/api/fanya/preview" && method === "POST") {
+      var id = "fanya-preview-demo-" + Date.now();
+      demo.previews[id] = { elapsed: 0, status: "running", progress: 0 };
+      return env({ task_id: id }, "盘点已开始");
+    }
+    if ((m = path.match(/^\/api\/fanya\/preview\/(.+)$/))) {
+      var pv = demo.previews[m[1]];
+      if (!pv) return { status: false, msg: "任务已结束或程序重启" };
+      if (pv.elapsed >= 2) return { status: true, data: { task: { status: "completed", progress: 2 }, preview: DEMO_PREVIEW } };
+      return { status: true, data: { task: { status: "running", progress: pv.progress, current_course: "数据结构与算法（张三）", stats: { pending: 12, done: 0, failed: 0, skipped: 0 } }, preview: null } };
+    }
+
+    if ((path === "/api/fanya/execute" || path === "/api/start") && method === "POST") {
+      var kind = path === "/api/start" ? "learn" : "fanya";
+      var tid = kind + "-demo-" + Date.now();
+      demo.tasks[tid] = makeDemoTask(kind);
+      return env({ task_id: tid }, "任务已启动");
+    }
+    if ((m = path.match(/^\/api\/fanya\/result\/(.+)$/))) return demoTaskEnv(m[1], "fanya");
+    if ((m = path.match(/^\/api\/task\/(.+)\/details$/))) return env({ courses: demoTasksToCourses(demo.tasks[m[1]]), active_jobs: demoTasksToJobs(demo.tasks[m[1]]) });
+    if ((m = path.match(/^\/api\/task\/(.+)\/stop$/))) {
+      var st = demo.tasks[m[1]];
+      if (!st) return { status: false, msg: "任务不存在" };
+      if (st.status !== "running") return { status: false, msg: "任务当前状态为 " + st.status + "，无需停止" };
+      st.stopRequested = true; return env({ task_id: m[1], stop_requested: true });
+    }
+    if ((m = path.match(/^\/api\/task\/(.+)$/))) return demoTaskEnv(m[1], "learn");
+    if ((m = path.match(/^\/api\/logs\/(.+)$/))) {
+      var t = demo.tasks[m[1]];
+      if (!t) return env([]);
+      var out = t.logs.slice(); t.logs = []; return env(out);
+    }
+
+    if (path.indexOf("/api/fanya/approvals/clear") === 0) {
+      demo.approvals = demo.approvals.filter(function (a) { return a.status !== "pending"; });
+      return env({ remaining: demo.approvals.length });
+    }
+    if (path.indexOf("/api/fanya/approvals") === 0) {
+      var inc = path.indexOf("include_decided=1") !== -1;
+      var items = inc ? demo.approvals : demo.approvals.filter(function (a) { return a.status === "pending"; });
+      return env({ pending: demo.approvals.filter(function (a) { return a.status === "pending"; }).length, items: items });
+    }
+    if (path === "/api/fanya/approve" && method === "POST") {
+      var a = demo.approvals.filter(function (x) { return x.id === body.id; })[0];
+      if (!a) return { status: false, msg: "该项不存在（队列仅在内存中，可能已随进程重启失效）" };
+      if (a.status !== "pending") return { status: false, msg: "该项已经是 " + a.status + " 状态，无需重复决策" };
+      a.status = body.approve ? "approved" : "rejected";
+      a.result = body.approve ? "已提交（演示：未真正写入）" : "已丢弃";
+      return env({ id: a.id, approve: !!body.approve });
+    }
+    return { status: false, msg: "HTTP 404：接口未注册" };
+  }
+
+  function makeDemoTask(kind) {
+    return { kind: kind, status: "running", progress: 0, total: kind === "learn" ? 4 : 6, stopRequested: false, start: Date.now(),
+      current_course: "数据结构与算法（张三）", current_chapter: "第三章 综合练习", current_task: "任务点：综合实践小结上传",
+      stats: kind === "learn"
+        ? { total_chapters: 42, completed_chapters: 6, total_tasks: 88, completed_tasks: 9, failed_tasks: 0, skipped_tasks: 1 }
+        : { pending: 6, done: 9, failed: 0, skipped: 1 },
+      logs: [], results: [], phase: 0 };
+  }
+  function demoTaskEnv(id, expectKind) {
+    var t = demo.tasks[id];
+    if (!t) return { status: false, msg: "任务已结束或程序重启" };
+    if (expectKind === "fanya") {
+      return { status: true, data: { task: { status: t.status, kind: "fanya_execute", progress: t.progress, current_course: t.current_course, current_task: t.current_task, stats: t.stats, start_time: t.start / 1000, error: t.error || undefined }, result: t.status === "completed" ? { results: t.results } : null } };
+    }
+    return { status: true, data: { status: t.status, progress: t.progress, total: t.total, current_course: t.current_course, current_chapter: t.current_chapter, current_task: t.current_task, start_time: t.start / 1000, stats: t.stats, stop_requested: t.stopRequested || undefined, error: t.error || undefined } };
+  }
+  function demoTasksToCourses(t) {
+    if (!t) return [];
+    return [
+      { id: "246831735", title: "数据结构与算法", status: t.progress >= 3 ? "completed" : "running", start_time: 1760000000.5, end_time: null,
+        chapters: [
+          { id: "c1", title: "第 1 章 绪论", status: "completed", has_finished: true, jobCount: 3 },
+          { id: "c2", title: "第 2 章 线性表", status: "completed", has_finished: true, jobCount: 4 },
+          { id: "c3", title: "第 3 章 栈与队列", status: "pending", has_finished: false, jobCount: 3 }
+        ] }
+    ];
+  }
+  function demoTasksToJobs(t) {
+    if (!t || t.status !== "running") return {};
+    var pct = Math.round((t.phase % 20) / 20 * 100);
+    return { "work-demo1": { course_name: "数据结构与算法", job_name: "3.2 栈的应用", current_time: 120, duration: 600, progress: 20, timestamp: Date.now() / 1000 },
+             "work-demo2": { course_name: "审计学", job_name: "4.1 审计抽样", current_time: 200, duration: 900, progress: pct, timestamp: Date.now() / 1000 } };
+  }
+
+  var demoTimer = null;
+  function tickDemo() {
+    Object.keys(demo.previews).forEach(function (k) { demo.previews[k].elapsed += 1; demo.previews[k].progress = Math.min(2, demo.previews[k].elapsed); });
+    Object.keys(demo.tasks).forEach(function (k) {
+      var t = demo.tasks[k];
+      if (t.status !== "running") return;
+      t.phase += 1;
+      var lp = LOG_POOL[t.phase % LOG_POOL.length];
+      t.logs.push({ message: lp[0], level: lp[1], timestamp: Date.now() / 1000 });
+      if (t.phase % 2 === 0 && t.progress < t.total) {
+        t.progress += 1;
+        if (t.kind === "learn") { t.stats.completed_chapters += 2; t.stats.completed_tasks += 5; }
+        else { t.stats.done += 1; t.stats.pending = Math.max(0, t.stats.pending - 1); t.results.push({ courseTitle: "数据结构与算法（张三）", taskName: "第三章 综合练习", name: "综合实践小结上传", typeLabel: "AI剧情", ok: true, skipped: false, verified: true, message: "任务点完成：已写入学习记录" }); }
+      }
+      if (t.progress >= t.total) {
+        t.status = t.stopRequested ? "stopped" : "completed";
+        t.logs.push({ message: t.status === "completed" ? "全部任务处理完毕" : "已按请求优雅停止，当前章节已收尾", level: "success", timestamp: Date.now() / 1000 });
+        if (!t.stopRequested) t.results.push({ courseTitle: "审计学（李四）", taskName: "第三章 综合练习", name: "AI实践：审计证据", ok: false, skipped: true, verified: null, message: "跳过：考试窗口未开放" });
+      }
+    });
+  }
+
+  // ── 启动探测 ────────────────────────────────────────────────────
+  function probe() {
+    setConn("probing");
+    return fetch("/api/health", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j && j.status) { state.demo = false; state.healthOk = true; setConn("live"); hideDemo(); stopDemoTimer(); return loadVersion(); }
+        throw new Error("health status false");
+      })
+      .catch(function () {
+        state.demo = true; state.healthOk = false; setConn("demo"); showDemo();
+        state.version = { webBuild: DEMO_BUILD }; renderBuild(); startDemoTimer();
+      });
+  }
+  function setConn(mode) {
+    var el = $("#conn-status"), txt = $("#conn-text");
+    el.classList.remove("is-live", "is-demo");
+    if (mode === "live") { el.classList.add("is-live"); txt.textContent = "已连接本地服务"; }
+    else if (mode === "demo") { el.classList.add("is-demo"); txt.textContent = "演示模式 · 未连接"; }
+    else { txt.textContent = "正在探测本地服务…"; }
+    if (state.view === "about") renderAbout();
+  }
+  function showDemo() { if (!localStorage.getItem("od-cx-demo-dismiss")) $("#demo-banner").hidden = false; }
+  function hideDemo() { $("#demo-banner").hidden = true; }
+  function startDemoTimer() { if (!demoTimer) demoTimer = setInterval(tickDemo, 1000); }
+  function stopDemoTimer() { if (demoTimer) { clearInterval(demoTimer); demoTimer = null; } }
+  function loadVersion() { return call("/api/version").then(function (r) { state.version = r.data || null; renderBuild(); }); }
+  function renderBuild() {
+    var b = state.version && state.version.webBuild;
+    $("#build-line").textContent = b ? "构建 " + fmtDateTime(b) : "构建 —";
+    if (state.view === "about") renderAbout();
+  }
+
+  // ── 心跳 + 关窗通知 ─────────────────────────────────────────────
+  function beat() {
+    fetch("/api/heartbeat", { cache: "no-store" }).then(function () {
+      state.lastHeartbeat = Date.now();
+      // 桌面壳才会注册 /api/heartbeat：它一旦应答，说明本地服务确实在跑，
+      // 若启动时探测失败落进了演示模式，这里要立刻切回真实接口。
+      if (state.demo) probe();
+      if (state.view === "about") renderAbout();
+    }).catch(function () {});
+  }
+  beat();
+  setInterval(beat, 5000);
+  window.addEventListener("pagehide", function () { try { navigator.sendBeacon("/api/window-closed", ""); } catch (e) {} });
+
+  // ── 视图切换 ────────────────────────────────────────────────────
+  function setView(v, opts) {
+    if (!NAMES[v]) v = "account";
+    state.view = v;
+    localStorage.setItem("od-cx-view", v);
+    $$(".view").forEach(function (s) { s.classList.toggle("active", s.id === "view-" + v); });
+    $$(".nav button[data-view]").forEach(function (b) { if (b.dataset.view === v) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current"); });
+    $("#crumb").textContent = "工作区 / " + NAMES[v];
+    if (v === "account") renderAccount();
+    if (v === "courses") renderCourses();
+    if (v === "run") renderRun();
+    if (v === "approvals") loadApprovals();
+    if (v === "settings") { if (!state.config) loadConfig(); }
+    if (v === "about") { renderAbout(); if (state.version == null) loadVersion(); }
+    if (!opts || !opts.keepScroll) $("#viewport").scrollTop = 0;
+  }
+
+  // ── 账号视图 ────────────────────────────────────────────────────
+  function renderAccount() {
+    $("#session-state").textContent = state.username ? "已登录" : "未登录";
+    $("#session-user").textContent = state.username || "—";
+    $("#session-cookies").textContent = state.hasCookies ? "已保存（可免密）" : "未知";
+    $("#session-courses").textContent = state.courses.length + " 门";
+    $("#user-chip").innerHTML = '<span class="avatar">' + esc(state.username ? state.username.slice(-2) : "—") + "</span><span>" + esc(state.username || "未登录") + "</span>";
+    $("#account-msg").dataset.base = "登录成功会把 cookies 落到本机 cookies.txt，之后可免密使用。";
+  }
+
+  function loginPayload() {
+    return { username: $("#acc-username").value.trim(), password: $("#acc-password").value, use_cookies: $("#acc-cookies").checked };
+  }
+  function setLoginBusy(busy, which) {
+    $$("#login-form button").forEach(function (b) { b.disabled = busy; });
+    if (busy) { var b = $(which); b.dataset.html = b.innerHTML; b.innerHTML = '<span class="spinner"></span> 处理中…'; }
+    else { $$("#login-form button").forEach(function (x) { if (x.dataset.html) { x.innerHTML = x.dataset.html; delete x.dataset.html; } }); }
+  }
+  function afterLogin(res) {
+    var msg = $("#account-msg");
+    if (!res.status) { msg.textContent = res.msg || "登录失败"; msg.style.color = "var(--danger)"; toast(res.msg, "err"); return false; }
+    state.username = (res.data && res.data.username) || state.username || $("#acc-username").value.trim();
+    if ($("#acc-cookies").checked) state.hasCookies = true;
+    msg.textContent = res.msg || "登录成功"; msg.style.color = "var(--success)";
+    toast(res.msg || "登录成功", "ok");
+    renderAccount();
+    return true;
+  }
+
+  $("#login-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var p = loginPayload();
+    if (!p.use_cookies && (!p.username || !p.password)) { $("#account-msg").textContent = "用户名或密码不能为空"; $("#account-msg").style.color = "var(--danger)"; toast("用户名或密码不能为空", "err"); return; }
+    setLoginBusy(true, $("#btn-login-courses"));
+    call("/api/courses", { method: "POST", body: p }).then(function (c) {
+      var msg = $("#account-msg");
+      if (!c.status) { msg.textContent = c.msg || "登录失败"; msg.style.color = "var(--danger)"; toast(c.msg || "登录失败", "err"); return; }
+      if (p.username) state.username = p.username;
+      state.hasCookies = true;
+      if (Array.isArray(c.data)) state.courses = c.data;
+      msg.textContent = c.msg || ("已获取 " + state.courses.length + " 门课程"); msg.style.color = "var(--success)";
+      toast(msg.textContent, "ok");
+      renderAccount();
+    }).finally(function () { setLoginBusy(false); });
+  });
+  $("#btn-login-only").addEventListener("click", function () {
+    var p = loginPayload();
+    setLoginBusy(true, $("#btn-login-only"));
+    call("/api/login", { method: "POST", body: p }).then(afterLogin).finally(function () { setLoginBusy(false); });
+  });
+
+  // ── 课程与任务点视图 ────────────────────────────────────────────
+  function renderCourses() {
+    var list = $("#courses-list");
+    $("#courses-count").textContent = state.courses.length ? state.courses.length + " 门课程" : "尚未加载";
+    if (!state.courses.length) {
+      list.innerHTML = '<div class="empty-state"><div class="es-icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6h16M4 12h16M4 18h10"/></svg></div><h3>还没有课程</h3><p>先在「账号」页登录并获取课程列表，或点击右上角「刷新课程列表」。</p></div>';
+      return;
+    }
+    list.innerHTML = state.courses.map(function (c) {
+      var on = !!state.selected[c.courseId];
+      return '<label class="list-item" data-od-id="course-' + esc(c.courseId) + '">' +
+        '<input class="check" type="checkbox" data-course="' + esc(c.courseId) + '"' + (on ? " checked" : "") + '>' +
+        '<span class="grow"><span class="title">' + esc(c.displayTitle) + '</span><span class="sub">' + esc(c.teacher || "") + " · courseId " + esc(c.courseId) + '</span></span></label>';
+    }).join("");
+    $$("#courses-list input[data-course]").forEach(function (cb) {
+      cb.addEventListener("change", function () { state.selected[cb.dataset.course] = cb.checked; renderCourses(); });
+    });
+  }
+  function selectedCourseIds() { return Object.keys(state.selected).filter(function (k) { return state.selected[k]; }); }
+
+  function renderPreviewSummary() {
+    var el = $("#preview-summary");
+    if (!state.preview) { el.innerHTML = ""; return; }
+    var s = state.preview.summary || {};
+    var cells = [
+      ["待完成", s.pendingCount, true], ["可自动完成", s.completableCount, false],
+      ["需人工", s.manualCount, false], ["暂不支持", s.unsupportedCount, false],
+      ["课程", s.courseCount, false], ["任务", s.taskCount, false]
+    ];
+    el.innerHTML = cells.map(function (c) {
+      return '<div class="metric' + (c[2] ? " accent" : "") + '"><div class="metric-num num">' + (c[1] == null ? "—" : c[1]) + '</div><div class="metric-label">' + c[0] + "</div></div>";
+    }).join("");
+  }
+  function statusPill(st) {
+    if (st === "auto") return '<span class="pill pill-run">可自动</span>';
+    if (st === "partial") return '<span class="pill pill-warn">部分自动</span>';
+    if (st === "manual") return '<span class="pill pill-muted">需人工</span>';
+    return '<span class="pill pill-idle">暂不支持</span>';
+  }
+  function renderPreviewTree() {
+    var el = $("#preview-tree"), foot = $("#preview-footer");
+    if (!state.preview) { el.innerHTML = ""; foot.hidden = true; return; }
+    var courses = state.preview.courses || [];
+    var anySelectable = false;
+    el.innerHTML = courses.map(function (co) {
+      var head = '<div class="row-between" style="margin:18px 0 10px;"><h3>' + esc(co.title) + '</h3>' + (co.error ? '<span class="pill pill-err">' + esc(co.error) + '</span>' : (co.hasTaskEngine ? '<span class="tag">任务引擎</span>' : '<span class="pill pill-idle">无任务引擎</span>')) + "</div>";
+      if (!co.tasks || !co.tasks.length) return '<div class="tree-group">' + head + '<p class="lede">该课程没有可盘点的任务点。</p></div>';
+      var tasks = co.tasks.map(function (t) {
+        var items = (t.items || []).map(function (it) {
+          var selectable = it.status === "auto" || it.status === "partial";
+          if (selectable) anySelectable = true;
+          return '<div class="tree-item' + (selectable ? "" : " is-disabled") + '" data-od-id="plan-' + esc(it.planId) + '">' +
+            '<input class="check" type="checkbox" data-plan="' + esc(it.planId) + '" data-course="' + esc(co.courseId) + '" data-task="' + esc(t.taskId) + '"' + (selectable ? " checked" : " disabled") + '>' +
+            '<span class="grow"><span class="title">' + esc(it.name) + " " + statusPill(it.status) + '</span><span class="sub">' + esc(it.note || "") + '</span></span>' +
+            '<span class="tag">' + esc(it.typeLabel || "任务点") + "</span>" +
+            '<button class="btn btn-sm btn-ghost" data-open="' + esc(it.entryUrl || "#") + '">打开</button></div>';
+        }).join("");
+        return '<div class="tree-task"><div class="tree-task-head"><span class="title" style="font-weight:600;">' + esc(t.name) + '</span><span class="grow"></span><span class="meta">未完成 ' + (t.pendingCount || 0) + "</span></div>" + items + "</div>";
+      }).join("");
+      return '<div class="tree-group">' + head + tasks + "</div>";
+    }).join("");
+    $$("#preview-tree input[data-plan]").forEach(function (cb) { cb.addEventListener("change", updatePreviewFooter); });
+    $$("#preview-tree [data-open]").forEach(function (b) { b.addEventListener("click", function () { openExternal(b.dataset.open); }); });
+    foot.hidden = !anySelectable;
+    updatePreviewFooter();
+  }
+  function updatePreviewFooter() {
+    var n = $$("#preview-tree input[data-plan]:checked").length;
+    $("#preview-selected-count").textContent = "已选 " + n + " 个任务点";
+    $("#btn-execute").disabled = n === 0;
+  }
+  function openExternal(url) {
+    if (!url || url === "#") { toast("示例入口：真实运行时可打开任务点页面", "warn"); return; }
+    // 桌面壳可能以两种方式注入：window.desktop（老壳）或 pywebview 的 window.pywebview.api（现用壳）。
+    if (window.desktop && window.desktop.openExternal) { window.desktop.openExternal(url); return; }
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.open_external) { window.pywebview.api.open_external(url); return; }
+    toast("当前不在桌面壳内，浏览器模式无法打开外部链接", "warn");
+  }
+
+  $("#btn-fetch-courses").addEventListener("click", function () {
+    var p = loginPayload();
+    if (!p.use_cookies && (!p.username || !p.password)) { toast("请先在「账号」页填写用户名与密码", "err"); setView("account"); return; }
+    var btn = this; btn.disabled = true; var html = btn.innerHTML; btn.innerHTML = '<span class="spinner"></span> 拉取中…';
+    call("/api/courses", { method: "POST", body: p }).then(function (r) {
+      if (r.status && Array.isArray(r.data)) { state.courses = r.data; if (p.username) state.username = p.username; toast("已获取 " + r.data.length + " 门课程", "ok"); renderCourses(); }
+      else { toast(r.msg || "获取课程失败", "err"); }
+    }).finally(function () { btn.disabled = false; btn.innerHTML = html; });
+  });
+  $("#btn-select-all").addEventListener("click", function () { state.courses.forEach(function (c) { state.selected[c.courseId] = true; }); renderCourses(); });
+  $("#btn-clear-all").addEventListener("click", function () { state.selected = {}; renderCourses(); });
+
+  $("#btn-preview").addEventListener("click", function () {
+    var ids = selectedCourseIds();
+    if (!ids.length) { toast("请先勾选至少一门课程", "err"); return; }
+    var btn = this; btn.disabled = true; var html = btn.innerHTML; btn.innerHTML = '<span class="spinner"></span> 盘点中…';
+    $("#courses-progress-card").hidden = false;
+    call("/api/fanya/preview", { method: "POST", body: { use_cookies: !$("#acc-password").value, username: $("#acc-username").value.trim(), password: $("#acc-password").value, course_list: ids, options: { redo: $("#preview-redo").checked } } }).then(function (r) {
+      if (!r.status) { toast(r.msg || "盘点失败", "err"); btn.disabled = false; btn.innerHTML = html; $("#courses-progress-card").hidden = true; return; }
+      var tid = r.data.task_id;
+      state.previewPending = true;
+      pollPreview(tid, btn, html);
+    });
+  });
+  function pollPreview(tid, btn, html) {
+    call("/api/fanya/preview/" + encodeURIComponent(tid)).then(function (r) {
+      if (!r.status) { toast(r.msg || "盘点失败", "err"); finishPreview(btn, html); return; }
+      var task = r.data.task || {};
+      var pct = task.progress != null ? Math.min(100, Math.round((task.progress / 2) * 100)) : 0;
+      $("#courses-progress-bar").style.width = pct + "%";
+      $("#courses-progress-sub").textContent = (task.current_course ? "正在盘点：" + task.current_course : "处理中…") + "（" + (task.status || "running") + "）";
+      if (r.data.preview) { state.preview = r.data.preview; state.previewPending = false; renderPreviewSummary(); renderPreviewTree(); $("#preview-sub").textContent = "盘点完成，按状态可勾选"; finishPreview(btn, html); }
+      else if (task.status === "completed" || task.status === "stopped" || task.status === "error") { toast("\u76d8\u70b9\u7ed3\u675f\u4f46\u672a\u8fd4\u56de\u7ed3\u679c", "warn"); finishPreview(btn, html); }
+      else setTimeout(function () { pollPreview(tid, btn, html); }, 1500);
+    });
+  }
+  function finishPreview(btn, html) { btn.disabled = false; btn.innerHTML = html; $("#courses-progress-card").hidden = true; }
+
+  $("#btn-start-learn").addEventListener("click", function () {
+    var ids = selectedCourseIds();
+    if (!ids.length) { toast("请先勾选至少一门课程", "err"); return; }
+    var p = loginPayload();
+    call("/api/start", { method: "POST", body: Object.assign({}, p, { course_list: ids, speed: numVal("run-speed", 1), jobs: numVal("run-jobs", 4), notopen_action: state.notopen, max_chapters: numVal("run-maxch", 0), tiku_config: state.config ? state.config.tiku_config : undefined }) }).then(function (r) {
+      if (!r.status) { toast(r.msg || "启动失败", "err"); return; }
+      beginRun("learn", r.data.task_id, ids.length + " 门课程 · 章节任务点学习");
+      toast("章节任务点学习已启动", "ok");
+    });
+  });
+
+  $("#btn-execute").addEventListener("click", function () {
+    var plans = $$("#preview-tree input[data-plan]:checked").map(function (cb) { return Number(cb.dataset.plan); });
+    if (!plans.length) { toast("请至少勾选一个任务点", "err"); return; }
+    var byCourse = {};
+    $$("#preview-tree input[data-plan]:checked").forEach(function (cb) { (byCourse[cb.dataset.course] = byCourse[cb.dataset.course] || []).push(cb.dataset.task); });
+    var p = loginPayload();
+    call("/api/fanya/execute", { method: "POST", body: { use_cookies: p.use_cookies, username: p.username, password: p.password, course_list: Object.keys(byCourse), plan_ids: plans, tasks_by_course: byCourse, options: { redo: $("#preview-redo").checked, require_approval: true, allow_ai_submit: false, exam_submit: false, group_submit: false, browser_headless: true } } }).then(function (r) {
+      if (!r.status) { toast(r.msg || "执行失败", "err"); return; }
+      beginRun("fanya", r.data.task_id, plans.length + " 个任务点 · 任务引擎");
+      toast("已开始执行，写入动作将登记到待审批", "ok");
+    });
+  });
+
+  // ── 运行与日志 ──────────────────────────────────────────────────
+  var runTimer = null, apprTimer = null;
+  function beginRun(kind, id, label) {
+    state.runKind = kind; state.runId = id; state.console = []; state.run = { label: label, status: "running", progress: 0, total: 0, stats: {}, current_course: "", current_task: "", activeJobs: {}, results: null };
+    setView("run");
+    renderConsole();
+    if (runTimer) clearInterval(runTimer);
+    pollRun();
+    runTimer = setInterval(pollRun, 1000);
+    if (kind === "fanya") { loadApprovals(true); apprTimer = setInterval(function () { loadApprovals(true); }, 2000); }
+  }
+  function stopRunPolling() {
+    if (runTimer) { clearInterval(runTimer); runTimer = null; }
+    if (apprTimer) { clearInterval(apprTimer); apprTimer = null; }
+  }
+  function pollRun() {
+    if (!state.runId) return;
+    if (state.runKind === "fanya") {
+      call("/api/fanya/result/" + encodeURIComponent(state.runId)).then(applyFanyaResult);
+    } else {
+      call("/api/task/" + encodeURIComponent(state.runId)).then(applyLearnResult);
+      call("/api/task/" + encodeURIComponent(state.runId) + "/details").then(function (r) {
+        if (r.status && r.data) { state.run.activeJobs = r.data.active_jobs || {}; renderRun(); }
+      });
+    }
+    call("/api/logs/" + encodeURIComponent(state.runId)).then(function (r) {
+      if (r.status && Array.isArray(r.data) && r.data.length) { state.console = state.console.concat(r.data); renderConsole(); }
+    });
+  }
+  function applyFanyaResult(r) {
+    if (!r.status) { if (/已结束|重启|不存在/.test(r.msg || "")) { toast("任务已结束或程序重启，已返回列表", "warn"); state.runId = null; stopRunPolling(); setView("courses"); } return; }
+    var t = r.data.task || {};
+    state.run.status = t.status; state.run.progress = t.progress || 0; state.run.current_course = t.current_course || ""; state.run.current_task = t.current_task || ""; state.run.stats = t.stats || {}; state.run.results = r.data.result ? r.data.result.results : null;
+    renderRun(); updateRunBadge();
+    if (isTerminal(t.status)) { stopRunPolling(); updateRunBadge(); toast(t.status === "completed" ? "任务执行完成" : (t.status === "stopped" ? "任务已停止" : "任务出错：" + (t.error || "")), t.status === "error" ? "err" : "ok"); }
+  }
+  function applyLearnResult(r) {
+    if (!r.status) return;
+    var d = r.data || {};
+    state.run.status = d.status; state.run.progress = d.progress || 0; state.run.total = d.total || 0; state.run.current_course = d.current_course || ""; state.run.current_task = d.current_chapter || d.current_task || ""; state.run.stats = d.stats || {};
+    renderRun(); updateRunBadge();
+    if (isTerminal(d.status)) { stopRunPolling(); updateRunBadge(); toast(d.status === "completed" ? "学习任务完成" : (d.status === "stopped" ? "学习任务已停止" : "学习任务出错"), d.status === "error" ? "err" : "ok"); }
+  }
+  function isTerminal(s) { return s === "completed" || s === "stopped" || s === "error"; }
+
+  function renderRun() {
+    var r = state.run;
+    var actions = $("#run-actions");
+    if (!r || !state.runId) {
+      $("#run-summary").innerHTML = '<div class="empty-state"><div class="es-icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M5 4v16l14-8L5 4Z"/></svg></div><h3>当前没有运行中的任务</h3><p>在「课程与任务点」页盘点后点「确认并执行」，或直接「开始章节任务点学习」。</p></div>';
+      actions.innerHTML = "";
+      $("#run-active-card").hidden = true;
+      return;
+    }
+    var running = r.status === "running";
+    actions.innerHTML = running
+      ? '<button class="btn btn-danger" id="btn-stop-run">停止（当前章节收尾后退出）</button>'
+      : '<span class="pill ' + terminalPill(r.status) + '">' + terminalText(r.status) + "</span>";
+    if (running) $("#btn-stop-run").addEventListener("click", function () {
+      var b = this; b.disabled = true; var h = b.innerHTML; b.innerHTML = '<span class="spinner"></span> 正在停止…';
+      call("/api/task/" + encodeURIComponent(state.runId) + "/stop", { method: "POST" }).then(function (res) {
+        if (!res.status) { toast(res.msg, "err"); b.disabled = false; b.innerHTML = h; return; }
+        toast("停止请求已发送，当前章节收尾后退出", "warn");
+      });
+    });
+
+    var statCells = r.stats ? Object.keys(r.stats).map(function (k) { return [STAT_LABEL[k] || k, r.stats[k]]; }) : [];
+    $("#run-summary").innerHTML =
+      '<div class="row-between wrap" style="margin-bottom:16px;">' +
+        '<div><h2 style="font-size:var(--text-lg);">' + esc(r.label || "任务") + '</h2>' +
+        '<p class="lede" style="margin-top:4px;">' + esc(r.current_course || "—") + (r.current_task ? " · " + esc(r.current_task) : "") + '</p></div>' +
+        '<span class="pill ' + (running ? "pill-run" : terminalPill(r.status)) + '">' + (running ? "进行中" : terminalText(r.status)) + '</span>' +
+      "</div>" +
+      '<div class="bar' + (r.status === "completed" ? " ok" : "") + '" style="margin-bottom:16px;"><i style="width:' + progressPct() + '%"></i></div>' +
+      '<div class="grid-4">' +
+        '<div class="metric accent"><div class="metric-num num">' + progressPct() + '%</div><div class="metric-label">总体进度</div></div>' +
+        statCells.map(function (c) { return '<div class="metric"><div class="metric-num num">' + (c[1] == null ? "—" : c[1]) + '</div><div class="metric-label">' + c[0] + "</div></div>"; }).join("") +
+      "</div>";
+
+    var jobs = r.activeJobs || {};
+    var jobKeys = Object.keys(jobs);
+    if (jobKeys.length) {
+      $("#run-active-card").hidden = false;
+      $("#run-active-jobs").innerHTML = jobKeys.map(function (k) {
+        var j = jobs[k], pct = Math.max(0, Math.min(100, j.progress || 0));
+        return '<div style="margin-bottom:14px;"><div class="row-between" style="margin-bottom:6px;"><span style="font-size:var(--text-sm);">' + esc(j.course_name) + " · " + esc(j.job_name) + '</span><span class="meta">' + fmtDur(j.current_time) + " / " + fmtDur(j.duration) + '</span></div><div class="bar"><i style="width:' + pct + '%"></i></div></div>';
+      }).join("");
+    } else $("#run-active-card").hidden = true;
+
+    if (r.results && r.results.length) {
+      $("#run-active-card").hidden = false;
+      $("#run-active-jobs").innerHTML = '<div class="table-wrap"><table class="ds-table"><thead><tr><th>课程 / 任务点</th><th>类型</th><th>结果</th></tr></thead><tbody>' +
+        r.results.map(function (x) {
+          var st = x.ok ? '<span class="pill pill-ok">完成</span>' : (x.skipped ? '<span class="pill pill-muted">跳过</span>' : '<span class="pill pill-err">失败</span>');
+          return "<tr><td>" + esc(x.courseTitle || "") + " · " + esc(x.name || x.taskName || "") + "</td><td>" + esc(x.typeLabel || "") + "</td><td>" + st + '<div class="meta" style="margin-top:4px;">' + esc(x.message || "") + "</div></td></tr>";
+        }).join("") + "</tbody></table></div>";
+    }
+    renderConsole();
+  }
+  var STAT_LABEL = { pending: "待处理", done: "已完成", failed: "失败", skipped: "跳过", total_chapters: "总章节", completed_chapters: "已完成章节", total_tasks: "总任务点", completed_tasks: "已完成任务点", failed_tasks: "失败任务点", skipped_tasks: "跳过任务点" };
+  function progressPct() {
+    var r = state.run; if (!r) return 0;
+    var p = r.progress || 0;
+    if (state.runKind === "fanya") { var s = r.stats || {}; var tot = (s.pending || 0) + (s.done || 0) + (s.failed || 0) + (s.skipped || 0); return tot ? Math.round(((s.done + s.failed + s.skipped) / tot) * 100) : 0; }
+    return r.total ? Math.round((p / r.total) * 100) : 0;
+  }
+  function terminalPill(s) { return s === "completed" ? "pill-ok" : (s === "stopped" ? "pill-warn" : "pill-err"); }
+  function terminalText(s) { return s === "completed" ? "已完成" : (s === "stopped" ? "已停止" : "出错"); }
+  function renderConsole() {
+    var el = $("#console");
+    if (!state.console.length) { el.innerHTML = '<div class="empty">暂无日志。开始一个任务后，日志会在这里滚动。</div>'; return; }
+    el.innerHTML = state.console.map(function (l) {
+      var lv = ["info", "success", "warning", "error"].indexOf(l.level) >= 0 ? l.level : "info";
+      return '<div class="log-line"><time>' + fmtTime(l.timestamp) + '</time><span class="log-' + lv + '">' + esc(l.message) + "</span></div>";
+    }).join("");
+    if (state.autoScroll) el.scrollTop = el.scrollHeight;
+  }
+  $("#log-autoscroll").addEventListener("change", function () { state.autoScroll = this.checked; });
+
+  function updateRunBadge() {
+    var running = state.run && state.run.status === "running";
+    var b = $("#run-badge"); if (running) { b.hidden = false; b.textContent = "•"; } else b.hidden = true;
+  }
+
+  // ── 审批视图 ────────────────────────────────────────────────────
+  function loadApprovals(silent) {
+    call("/api/fanya/approvals" + (state.showingDecided ? "?include_decided=1" : "")).then(function (r) {
+      if (!r.status) { if (!silent) toast(r.msg || "读取审批队列失败", "err"); return; }
+      state.approvals = (r.data.items || []);
+      state.approvalsPending = r.data.pending || 0;
+      var badge = $("#approvals-badge");
+      if (state.approvalsPending > 0) { badge.hidden = false; badge.textContent = state.approvalsPending; } else badge.hidden = true;
+      if (state.view === "approvals") renderApprovals();
+    });
+  }
+  function renderApprovals() {
+    var el = $("#approvals-list");
+    if (!state.approvals.length) {
+      el.innerHTML = '<div class="card card-plain"><div class="empty-state"><div class="es-icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M20 6 9 17l-5-5"/></svg></div><h3>没有待审批的项目</h3><p>当任务生成需要写入账号的内容时，会先登记到这里等待你批准。</p></div></div>';
+      return;
+    }
+    el.innerHTML = state.approvals.map(function (a) {
+      var st = a.status === "pending" ? '<span class="pill pill-warn">待审批</span>' : (a.status === "approved" ? '<span class="pill pill-ok">已批准</span>' : (a.status === "rejected" ? '<span class="pill pill-idle">已拒绝</span>' : '<span class="pill pill-err">失败</span>'));
+      var actions = a.status === "pending"
+        ? '<button class="btn btn-primary" data-approve="' + esc(a.id) + '">批准并提交</button><button class="btn btn-secondary" data-reject="' + esc(a.id) + '">拒绝</button>'
+        : '<span class="meta">' + esc(a.result || "") + "</span>";
+      return '<div class="approval" data-od-id="approval-' + esc(a.id) + '">' +
+        '<div class="row-between wrap" style="gap:12px;">' +
+          '<div><div class="title" style="font-weight:600;">' + esc(a.label) + '</div><div class="sub meta">' + esc(a.kind) + " · " + fmtDateTime(a.created) + '</div></div>' +
+          '<div class="row" style="gap:12px;">' + st + "</div>" +
+        "</div>" +
+        '<div class="preview">' + esc(a.preview) + "</div>" +
+        '<div class="row wrap" style="gap:12px;">' + actions + "</div>" +
+      "</div>";
+    }).join("");
+    $$("#approvals-list [data-approve]").forEach(function (b) { b.addEventListener("click", function () { decide(b, true); }); });
+    $$("#approvals-list [data-reject]").forEach(function (b) { b.addEventListener("click", function () { decide(b, false); }); });
+  }
+  function decide(btn, approve) {
+    var id = btn.dataset.approve || btn.dataset.reject;
+    var bar = btn.parentNode;
+    $$("button", bar).forEach(function (x) { x.disabled = true; });
+    btn.innerHTML = '<span class="spinner"></span> ' + (approve ? "提交中…" : "处理中…");
+    call("/api/fanya/approve", { method: "POST", body: { id: id, approve: approve } }).then(function (r) {
+      if (!r.status) { toast(r.msg || "决策失败", "err"); $$("button", bar).forEach(function (x) { x.disabled = false; }); btn.textContent = approve ? "批准并提交" : "拒绝"; return; }
+      toast(approve ? "已批准并提交" : "已拒绝，未写入任何内容", approve ? "ok" : "warn");
+      loadApprovals();
+    });
+  }
+  $("#appr-show-decided").addEventListener("change", function () { state.showingDecided = this.checked; loadApprovals(); });
+  $("#btn-approvals-clear").addEventListener("click", function () {
+    var b = this; b.disabled = true; var h = b.innerHTML; b.innerHTML = '<span class="spinner"></span> 清空中…';
+    call("/api/fanya/approvals/clear", { method: "POST", body: { keep_decided: state.showingDecided } }).then(function (r) {
+      if (!r.status) toast(r.msg || "清空失败", "err"); else { toast("队列已清空，剩余 " + r.data.remaining + " 条", "ok"); loadApprovals(); }
+    }).finally(function () { b.disabled = false; b.innerHTML = h; });
+  });
+
+  // ── 设置视图 ────────────────────────────────────────────────────
+  function loadConfig() {
+    call("/api/config").then(function (r) {
+      // GET /api/config 返回的是**整份 web_config.json**：
+      // {settings:{speed,jobs,notopen_action,tiku_config,...}, selectedCourses, rememberedLogin}
+      // 表单只编辑 settings，其余顶层键要原样留着 —— 保存是整份覆盖写，丢了就把
+      // 记住的登录信息 / 选中的课程清空了。
+      var raw = (r.status && r.data) ? r.data : {};
+      state.rawConfig = raw;
+      state.config = raw.settings ? raw.settings : raw;
+      fillConfig();
+    });
+  }
+  function fillConfig() {
+    var c = state.config || {};
+    var tc = c.tiku_config || {};
+    setVal("ai-provider", tc.provider || ""); setVal("ai-endpoint", tc.endpoint || ""); setVal("ai-key", tc.key || ""); setVal("ai-model", tc.model || "");
+    setVal("ai-cover", tc.cover_rate != null ? tc.cover_rate : 0.9); setVal("ai-delay", tc.delay != null ? tc.delay : 1.0);
+    setVal("ai-conc", tc.ai_concurrency != null ? tc.ai_concurrency : 3); setVal("ai-interval", tc.min_interval_seconds != null ? tc.min_interval_seconds : 1.0);
+    $("#ai-submit").checked = String(tc.submit) === "true";
+    var nc = c.notification_config || {};
+    setVal("nt-provider", nc.provider || ""); setVal("nt-url", nc.url || ""); setVal("nt-tg", nc.tg_chat_id || "");
+    var oc = c.ocr_config || {};
+    setVal("ocr-provider", oc.provider || ""); setVal("ocr-key", oc.key || ""); setVal("ocr-endpoint", oc.endpoint || ""); setVal("ocr-model", oc.model || "");
+    setVal("run-speed", c.speed != null ? c.speed : 1.0); setVal("run-jobs", c.jobs != null ? c.jobs : 4); setVal("run-maxch", c.max_chapters != null ? c.max_chapters : 0);
+    // notopen_action 只有 retry / continue 两个合法值；历史配置里出现过 "ask"，
+    // 落到未知值时要回退成 retry，否则分段控件两边都不亮。
+    state.notopen = (c.notopen_action === "continue") ? "continue" : "retry";
+    $$("#seg-notopen button").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.val === state.notopen)); });
+  }
+  function setVal(id, v) { var el = document.getElementById(id); if (el) el.value = v == null ? "" : v; }
+  function numVal(id, dflt) { var el = document.getElementById(id); var n = parseFloat(el && el.value); return isNaN(n) ? dflt : n; }
+
+  function collectConfig() {
+    return {
+      speed: numVal("run-speed", 1.0), jobs: numVal("run-jobs", 4), notopen_action: state.notopen, max_chapters: numVal("run-maxch", 0),
+      tiku_config: {
+        provider: $("#ai-provider").value, tokens: (state.config && state.config.tiku_config && state.config.tiku_config.tokens) || "",
+        url: (state.config && state.config.tiku_config && state.config.tiku_config.url) || "",
+        endpoint: $("#ai-endpoint").value.trim(), key: $("#ai-key").value, model: $("#ai-model").value.trim(),
+        submit: $("#ai-submit").checked ? "true" : "false", cover_rate: numVal("ai-cover", 0.9), delay: numVal("ai-delay", 1.0),
+        ai_concurrency: numVal("ai-conc", 3), min_interval_seconds: numVal("ai-interval", 1.0)
+      },
+      notification_config: { provider: $("#nt-provider").value, url: $("#nt-url").value.trim(), tg_chat_id: $("#nt-tg").value.trim() },
+      ocr_config: { provider: $("#ocr-provider").value, key: $("#ocr-key").value, endpoint: $("#ocr-endpoint").value.trim(), model: $("#ocr-model").value.trim() }
+    };
+  }
+  $$("#seg-notopen button").forEach(function (b) { b.addEventListener("click", function () { state.notopen = b.dataset.val; $$("#seg-notopen button").forEach(function (x) { x.setAttribute("aria-pressed", String(x === b)); }); }); });
+
+  function buildConfigPayload() {
+    // POST /api/config 是整份覆盖写：必须把 settings 包回去，并保留未知顶层键。
+    var raw = state.rawConfig || {};
+    var next = {};
+    Object.keys(raw).forEach(function (k) { next[k] = raw[k]; });
+    next.settings = collectConfig();
+    return next;
+  }
+
+  $("#btn-config-save").addEventListener("click", function () {
+    var b = this; b.disabled = true; var h = b.innerHTML; b.innerHTML = '<span class="spinner"></span> 保存中…';
+    var payload = buildConfigPayload();
+    call("/api/config", { method: "POST", body: payload }).then(function (r) {
+      if (!r.status) { toast(r.msg || "保存失败", "err"); return; }
+      state.config = payload.settings; state.rawConfig = payload;
+      toast(r.msg || "保存成功", "ok");
+    }).finally(function () { b.disabled = false; b.innerHTML = h; });
+  });
+  $("#btn-config-reload").addEventListener("click", function () { loadConfig(); toast("已重新读取本地配置", "ok"); });
+  $("#btn-ai-test").addEventListener("click", function () {
+    var b = this; b.disabled = true; var h = b.innerHTML; b.innerHTML = '<span class="spinner"></span> 测试中…';
+    var out = $("#ai-test-result"); out.textContent = "正在发送一条极短请求…"; out.style.color = "var(--muted)";
+    call("/api/ai/test", { method: "POST", body: { tiku_config: collectConfig().tiku_config } }).then(function (r) {
+      var d = r.data || {};
+      if (r.status) { out.textContent = "成功：" + (d.model || "模型") + " · " + d.latency + " ms · 回复「" + (d.sample || "") + "」"; out.style.color = "var(--success)"; toast("AI 接口可用（" + d.latency + " ms）", "ok"); }
+      else { out.textContent = "失败：" + (d.model ? d.model + " · " + d.latency + " ms · " : "") + (r.msg || "未知错误"); out.style.color = "var(--danger)"; toast("AI 接口测试失败", "err"); }
+    }).finally(function () { b.disabled = false; b.innerHTML = h; });
+  });
+
+  // ── 关于视图 ────────────────────────────────────────────────────
+  function renderAbout() {
+    $("#about-health").textContent = state.healthOk === true ? "正常（{\"status\":true}）" : (state.healthOk === false ? "未连接" : "探测中…");
+    $("#about-build").textContent = (state.version && state.version.webBuild) ? fmtDateTime(state.version.webBuild) : "—";
+    $("#about-mode").textContent = state.demo ? "演示模式（未连接本地服务）" : "桌面模式 / 已连接本地服务";
+    $("#about-origin").textContent = window.location.origin;
+    $("#about-heartbeat").textContent = state.lastHeartbeat ? fmtDateTime(Math.floor(state.lastHeartbeat / 1000)) : (state.demo ? "演示模式：未发送" : "等待首次心跳…");
+  }
+  $("#btn-about-refresh").addEventListener("click", function () { probe(); toast("已重新探测服务", "ok"); });
+
+  $("#demo-dismiss").addEventListener("click", function () { localStorage.setItem("od-cx-demo-dismiss", "1"); hideDemo(); });
+
+  // ── 窄屏导航抽屉 ────────────────────────────────────────────────
+  var sidebarEl = $("#sidebar"), backdropEl = $("#nav-backdrop"), navToggleEl = $("#nav-toggle");
+  function setNav(open) {
+    sidebarEl.classList.toggle("open", open);
+    backdropEl.classList.toggle("show", open);
+    navToggleEl.setAttribute("aria-expanded", open ? "true" : "false");
+    navToggleEl.setAttribute("aria-label", open ? "关闭导航" : "打开导航");
+  }
+  navToggleEl.addEventListener("click", function () { setNav(!sidebarEl.classList.contains("open")); });
+  backdropEl.addEventListener("click", function () { setNav(false); });
+  $("#nav-close").addEventListener("click", function () { setNav(false); });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape" && sidebarEl.classList.contains("open")) setNav(false); });
+
+  // ── 启动 ────────────────────────────────────────────────────────
+  $$(".nav button[data-view]").forEach(function (b) { b.addEventListener("click", function () { setView(b.dataset.view); setNav(false); }); });
+  var saved = localStorage.getItem("od-cx-view");
+  setView(NAMES[saved] ? saved : "account", { keepScroll: true });
+  probe().then(function () { loadApprovals(true); });
+})();
+</script>
+</body>
+</html>

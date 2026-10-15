@@ -234,13 +234,18 @@ def main() -> int:
 
         return _run
 
+    # 前端出货件是 opendesign 的单文件 HTML（web/opendesign/chaoxing-assistant.html
+    # → web/dist/index.html），根节点是 <div class="app">，没有 React 时代的 id="root"。
+    # 换界面时同步改这里：它是「/ 真的返回了打包进包的界面」的判据。
+    FRONTEND_MARKER = '<div class="app">'
+
     checks = [
         ("GET /api/health", http("GET", "/api/health")),
         ("GET /api/heartbeat（桌面壳）", http("GET", "/api/heartbeat")),
         ("POST /api/heartbeat（桌面壳）", http("POST", "/api/heartbeat")),
         ("GET /api/version", http("GET", "/api/version")),
-        ("GET /（前端已收进包）", http("GET", "/", expect_json=False, contains='id="root"')),
-        ("GET /tasks（客户端路由兜底到 index.html）", raw("/tasks", accept="text/html", contains='id="root"')),
+        ("GET /（前端已收进包）", http("GET", "/", expect_json=False, contains=FRONTEND_MARKER)),
+        ("GET /tasks（客户端路由兜底到 index.html）", raw("/tasks", accept="text/html", contains=FRONTEND_MARKER)),
         (
             "GET /assets/missing.js（缺失资源如实 404）",
             raw("/assets/missing.js", accept="*/*", expect_status=404, want_json=True),

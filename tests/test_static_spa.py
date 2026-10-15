@@ -31,6 +31,18 @@ HAVE_DIST = os.path.exists(web_app.STATIC_DIR)
 needs_dist = pytest.mark.skipif(not HAVE_DIST, reason="web/dist 未构建")
 
 
+def _index_bytes() -> bytes:
+    """``web/dist/index.html`` 的原字节。
+
+    界面是外部设计产出、由 ``tools/build_desktop.py`` 原样拷进 ``web/dist`` 的单文件，
+    所以这里断言「端出来的就是盘上那份」，而不是断言某个界面内部标记 ——
+    界面换版（React 版曾用 ``id="root"``，opendesign 版用 ``<div class="app">``）
+    不该让这条契约测试跟着改。打包件里是不是真界面，由 ``tools/smoke_desktop.py`` 判。
+    """
+    with open(os.path.join(web_app.STATIC_DIR, "index.html"), "rb") as fh:
+        return fh.read()
+
+
 @pytest.fixture()
 def client():
     web_app.app.config.update(TESTING=True)
@@ -42,7 +54,7 @@ def test_root_serves_index(client):
     resp = client.get("/")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["Content-Type"]
-    assert 'id="root"' in resp.get_data(as_text=True)
+    assert resp.get_data() == _index_bytes()
 
 
 @needs_dist
@@ -51,14 +63,14 @@ def test_client_route_falls_back_to_index(client):
     resp = client.get("/tasks", headers={"Accept": "text/html,application/xhtml+xml"})
     assert resp.status_code == 200
     assert "text/html" in resp.headers["Content-Type"]
-    assert 'id="root"' in resp.get_data(as_text=True)
+    assert resp.get_data() == _index_bytes()
 
 
 @needs_dist
 def test_nested_client_route_falls_back(client):
     resp = client.get("/courses/12345/detail", headers={"Accept": "text/html"})
     assert resp.status_code == 200
-    assert 'id="root"' in resp.get_data(as_text=True)
+    assert resp.get_data() == _index_bytes()
 
 
 @needs_dist
@@ -82,7 +94,7 @@ def test_missing_asset_is_json_404(client):
 def test_existing_asset_is_served(client):
     resp = client.get("/index.html")
     assert resp.status_code == 200
-    assert 'id="root"' in resp.get_data(as_text=True)
+    assert resp.get_data() == _index_bytes()
 
 
 def test_unknown_api_path_is_json_404(client):

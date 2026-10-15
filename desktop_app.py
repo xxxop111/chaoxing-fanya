@@ -5,12 +5,14 @@
 
 * 双击图标**不弹黑框**（打包为 --noconsole）；
 * 立刻出现应用窗口，先显示「正在启动…」，服务就绪后自动切到界面；
-* 窗口就是应用本身（内嵌 WebView2，无地址栏、无标签栏），关掉窗口即退出；
+* 窗口就是应用本身（内嵌 WebView2，无地址栏、无标签栏）；**关掉窗口＝缩到托盘继续跑**
+  （托盘菜单可显示 / 隐藏 / 退出），想直接退出就用托盘菜单或 ``--no-tray``；
 * 浏览器存储持久化（``private_mode=False``），「记住密码」和盘点缓存不会丢。
 
 命令行开关（都可选）：
 
 * ``--no-window``：只起服务、不开窗口（自动化脚本与冒烟测试用）；
+* ``--no-tray``：关掉窗口就退出（不常驻托盘；排障与自动化用）；
 * ``--stop``：停掉已在运行的实例 —— **默认不弹任何对话框**，结果写 ``desktop_app.log``
   （系统模态弹窗没人点就会把调用方卡死）；``--stop --dialog`` 才会弹回执；
 * ``CHAOXING_NO_WEBVIEW=1``：强制走浏览器兜底方案（排障用）。
@@ -36,6 +38,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 
 # ⚠️ 必须在本进程加载 pythonnet / pywebview 之前设置。
 # pythonnet 3.x 在 Windows 上默认优先使用 .NET Framework，而本机的
@@ -98,6 +101,151 @@ def message_box(title: str, text: str) -> None:
         ctypes.windll.user32.MessageBoxW(None, text, title, 0x40 | 0x1000)
     except Exception:  # noqa: BLE001
         pass
+
+
+class DesktopBridge:
+    """暴露给页面的原生能力（前端用 ``window.pywebview.api.*`` 调用）。
+
+    只提供**页面自己做不到**的事：任务点这类外链必须在系统默认浏览器里打开，
+    否则内嵌窗口会把学习通页面顶掉，应用本身就没法继续操作了。
+    """
+
+    def open_external(self, url: str) -> bool:
+        """用系统默认浏览器打开一个 http(s) 链接。"""
+        target = (url or "").strip()
+        if not target.lower().startswith(("http://", "https://")):
+            log(f"拒绝打开非 http(s) 链接：{target[:80]}")
+            return False
+        try:
+            webbrowser.open(target)
+            log(f"已在系统浏览器打开：{target[:120]}")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log(f"打开外链失败：{exc}")
+            return False
+
+
+class _TrayIcon:
+    """Windows 通知区域常驻图标（关窗不退出，进程留在后台继续跑）。
+
+    pywebview 的 ``closing`` 事件返回 ``False`` 即可取消关闭，所以「关窗」只是隐藏；
+    真正退出走托盘菜单。WinForms 需要一个消息循环，因此这里单开一条线程跑
+    ``Application.Run()``；跨线程调 ``window.show()/hide()/destroy()`` 是安全的，
+    pywebview 内部统一派发到 GUI 线程。
+    """
+
+    def __init__(self, window, state: dict, *, tooltip: str = WINDOW_TITLE) -> None:
+        self.window = window
+        self.state = state  # 与主线程共享：{"quitting": bool}
+        self.tooltip = tooltip
+        self.ready = threading.Event()
+        self.available = False
+        self._icon = None
+        self._notified = False
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, name="tray-icon", daemon=True).start()
+
+    def notify_hidden(self) -> None:
+        """首次缩到托盘时给个气泡提示，免得用户以为程序被关掉了。"""
+        icon = self._icon
+        if icon is None or self._notified:
+            return
+        self._notified = True
+        try:
+            from System.Windows.Forms import ToolTipIcon
+
+            icon.ShowBalloonTip(
+                4000,
+                self.tooltip,
+                "已最小化到托盘，程序仍在后台运行。双击图标可重新打开。",
+                ToolTipIcon.Info,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _run(self) -> None:  # pragma: no cover - 需要桌面会话
+        try:
+            from System.Drawing import Icon as DrawingIcon, SystemIcons
+            from System.Windows.Forms import (
+                Application,
+                ContextMenuStrip,
+                NotifyIcon,
+                ToolStripMenuItem,
+                ToolStripSeparator,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(f"托盘不可用（{exc}），关窗即退出")
+            self.ready.set()
+            return
+
+        def item(text, handler):
+            menu_item = ToolStripMenuItem(text)
+            menu_item.Click += lambda sender, args: handler()
+            return menu_item
+
+        def do_show():
+            try:
+                self.window.show()
+            except Exception as exc:  # noqa: BLE001
+                log(f"显示窗口失败：{exc}")
+
+        def do_hide():
+            try:
+                self.window.hide()
+            except Exception as exc:  # noqa: BLE001
+                log(f"隐藏窗口失败：{exc}")
+
+        def do_quit():
+            log("托盘菜单：退出")
+            self.state["quitting"] = True
+            try:
+                self.window.destroy()
+            except Exception as exc:  # noqa: BLE001
+                log(f"关闭窗口失败：{exc}")
+            try:
+                icon.Visible = False
+                icon.Dispose()
+            except Exception:  # noqa: BLE001
+                pass
+            Application.ExitThread()
+
+        try:
+            icon = NotifyIcon()
+            icon.Text = self.tooltip[:63]  # NotifyIcon.Text 上限 63 字符
+            icon.Icon = self._load_icon(DrawingIcon, SystemIcons)
+            menu = ContextMenuStrip()
+            menu.Items.Add(item("显示主窗口", do_show))
+            menu.Items.Add(item("隐藏到托盘", do_hide))
+            menu.Items.Add(ToolStripSeparator())
+            menu.Items.Add(item("退出", do_quit))
+            icon.ContextMenuStrip = menu
+            icon.DoubleClick += lambda sender, args: do_show()
+            icon.Visible = True
+            self._icon = icon
+            self.available = True
+            log("托盘图标已就绪（关窗后程序继续在后台运行）")
+        except Exception as exc:  # noqa: BLE001
+            log(f"创建托盘图标失败：{exc}")
+            self.ready.set()
+            return
+
+        self.ready.set()
+        try:
+            Application.Run()
+        except Exception as exc:  # noqa: BLE001
+            log(f"托盘消息循环异常：{exc}")
+        finally:
+            log("托盘已停止")
+
+    def _load_icon(self, drawing_icon, system_icons):  # pragma: no cover - 需要桌面会话
+        path = _icon_path()
+        if path and os.path.exists(path):
+            try:
+                return drawing_icon(path)
+            except Exception:  # noqa: BLE001
+                pass
+        return system_icons.Application
 
 
 def health_url(port: int) -> str:
@@ -386,8 +534,24 @@ def _native_window_disabled() -> bool:
     return os.environ.get("CHAOXING_USE_WEBVIEW") == "0"
 
 
-def _run_with_webview(url: str, server) -> int:
-    """原生窗口模式（默认）。"""
+def _should_close_to_tray(tray, tray_state: dict) -> bool:
+    """关窗时是否「缩到托盘」（True 表示取消关闭）。
+
+    * 正在退出（托盘菜单点了退出）→ 不拦；
+    * 没有托盘（``--no-tray``、复用已在运行实例的辅助窗口）→ 不拦；
+    * 托盘没起来（非 Windows / .NET 缺失 / 创建失败）→ 不拦，别让用户关不掉窗口。
+    """
+    if tray_state.get("quitting") or tray is None:
+        return False
+    return bool(tray.ready.wait(timeout=1.0) and tray.available)
+
+
+def _run_with_webview(url: str, server, *, close_to_tray: bool = True) -> int:
+    """原生窗口模式（默认）。
+
+    ``close_to_tray=True`` 时关窗＝缩到托盘继续跑（真正的退出走托盘菜单）；
+    为 ``False`` 时关窗即退出（``--no-tray``、以及「复用已在运行实例」的辅助窗口）。
+    """
     _ensure_dotnet_runtime()
     _run_pywebview_patches()
     import webview
@@ -397,7 +561,24 @@ def _run_with_webview(url: str, server) -> int:
         WINDOW_TITLE, html=SPLASH_HTML,
         width=1200, height=840, min_size=(980, 640),
         background_color="#f2f4f7",
+        js_api=DesktopBridge(),
     )
+
+    # 关窗不退出：closing 事件返回 False 会取消关闭，这里改成「隐藏到托盘」。
+    tray_state = {"quitting": False}
+    tray = _TrayIcon(window, tray_state) if close_to_tray else None
+
+    def _on_closing():
+        if not _should_close_to_tray(tray, tray_state):
+            return True                      # 真退出：放行关闭
+        window.hide()
+        log("窗口已隐藏到托盘（程序仍在后台运行，托盘菜单可退出）")
+        tray.notify_hidden()
+        return False                         # 取消关闭
+
+    window.events.closing += _on_closing
+    if tray is not None:
+        tray.start()
 
     def _go_live() -> None:
         if _wait_ready(int(url.rsplit(":", 1)[1])):
@@ -492,6 +673,7 @@ def main() -> int:
         # 默认静默（工具友好）；想看到回执弹窗就加 --dialog
         return stop_running(interactive="--dialog" in argv)
     headless = "--no-window" in argv
+    no_tray = "--no-tray" in argv
 
     os.makedirs(BASE_DIR, exist_ok=True)
     try:
@@ -555,7 +737,7 @@ def main() -> int:
         # 保证功能不受影响。想强制走浏览器：CHAOXING_NO_WEBVIEW=1。
         if not _native_window_disabled():
             try:
-                return _run_with_webview(url, server)
+                return _run_with_webview(url, server, close_to_tray=not no_tray)
             except Exception as exc:  # noqa: BLE001
                 log(f"原生窗口不可用（{exc}），改用浏览器窗口")
         else:

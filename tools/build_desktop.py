@@ -7,9 +7,11 @@
 1. 先跑 ``tools/patch_pywebview.py``：把 ``site-packages/webview/lib`` 里的 net462 版
    WebView2 托管程序集换成 .NET Core 版，并给 ``webview/platforms/winforms.py`` 打容错补丁。
    **必须在 PyInstaller 之前**，因为打进产物的是当时的 site-packages。
-2. 检查 ``web/dist`` 是否存在（前端由 opendesign 产出，缺失也能打包，但窗口会是空的）。
-3. 调 PyInstaller 按 ``chaoxing-fanya.spec`` 打包到 ``dist/chaoxing-fanya/``。
-4. 校验产物里确实带上了内嵌窗口需要的文件（webview 程序集、pythonnet 运行时、
+2. 把 ``web/opendesign/chaoxing-assistant.html``（opendesign 产出的**单文件**界面）同步成
+   ``web/dist/index.html``，并清掉旧 React 构建留下的 ``web/dist/assets``；
+3. 检查 ``web/dist`` 是否存在（缺失也能打包，但窗口会是空的）；
+4. 调 PyInstaller 按 ``chaoxing-fanya.spec`` 打包到 ``dist/chaoxing-fanya/``。
+5. 校验产物里确实带上了内嵌窗口需要的文件（webview 程序集、pythonnet 运行时、
    clr_loader、vendor/webview2、web/dist）。
 
 用法::
@@ -17,6 +19,7 @@
     .venv\\Scripts\\python.exe tools\\build_desktop.py            # 打包
     .venv\\Scripts\\python.exe tools\\build_desktop.py --run      # 打包并直接启动验证
     .venv\\Scripts\\python.exe tools\\build_desktop.py --no-patch # 跳过补丁（不推荐）
+    .venv\\Scripts\\python.exe tools\\build_desktop.py --no-sync  # 不覆盖 web/dist（调试用）
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -70,15 +74,54 @@ def step_patch() -> bool:
     return True
 
 
+OPENDESIGN_HTML = ROOT / "web" / "opendesign" / "chaoxing-assistant.html"
+WEB_DIST = ROOT / "web" / "dist"
+
+
+def step_sync_frontend() -> None:
+    """把 opendesign 的单文件界面同步成 web/dist/index.html。
+
+    这是「前端由外部设计产出、本仓库只负责端出来」这条约定的落地点：
+    换界面只需要替换 ``web/opendesign/chaoxing-assistant.html`` 再打包，
+    不必碰 Flask、也不必有 Node 工具链。
+    """
+    log("步骤 2/5：同步前端（opendesign 单文件 → web/dist/index.html）")
+    if not OPENDESIGN_HTML.is_file():
+        log(f"  [!] 缺少 {OPENDESIGN_HTML.relative_to(ROOT)} —— 沿用现有 web/dist")
+        return
+    WEB_DIST.mkdir(parents=True, exist_ok=True)
+    data = OPENDESIGN_HTML.read_bytes()
+    target = WEB_DIST / "index.html"
+    before = target.read_bytes() if target.is_file() else None
+    target.write_bytes(data)
+    tail = "（内容无变化）" if before == data else ""
+    log(f"  [ok] web/dist/index.html（{len(data)} 字节）{tail}")
+    stale = WEB_DIST / "assets"
+    if stale.is_dir():
+        shutil.rmtree(stale, ignore_errors=True)
+        log("  [ok] 清理旧的 web/dist/assets（单文件界面不再引用）")
+    for name in ("vite.svg",):  # 旧 React 构建的残留
+        leftover = WEB_DIST / name
+        if leftover.is_file():
+            leftover.unlink()
+            log(f"  [ok] 清理旧的 web/dist/{name}")
+
+
 def step_check_web() -> None:
-    log("步骤 2/4：检查前端产物 web/dist")
+    log("步骤 3/5：检查前端产物 web/dist")
     index = ROOT / "web" / "dist" / "index.html"
     if index.is_file():
         mtime = index.stat().st_mtime
         import datetime
 
         stamp = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-        log(f"  [ok] web/dist/index.html（{stamp}）")
+        # opendesign 的导出会带 data-od-id 标记，用它区分「新单文件界面」与旧 React 构建
+        try:
+            text = index.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        kind = "opendesign 单文件版" if "data-od-id" in text else "未知来源"
+        log(f"  [ok] web/dist/index.html（{stamp}，{kind}）")
     else:
         log("  [!] 缺少 web/dist/index.html —— 窗口会打开但页面为空")
 
@@ -117,7 +160,7 @@ REQUIRED = [
 
 
 def step_verify() -> bool:
-    log("步骤 4/4：校验产物")
+    log("步骤 5/5：校验产物")
     if not EXE.is_file():
         log(f"  [xx] 没有生成 {EXE}")
         return False
@@ -149,11 +192,14 @@ def main() -> int:
     parser.add_argument("--run", action="store_true", help="打包后直接启动做验证")
     parser.add_argument("--no-patch", action="store_true", help="跳过 pywebview 补丁")
     parser.add_argument("--skip-build", action="store_true", help="只做补丁与校验，不重新打包")
+    parser.add_argument("--no-sync", action="store_true", help="不把 opendesign 界面同步进 web/dist")
     args = parser.parse_args()
 
     log(f"仓库根目录: {ROOT}")
     if not args.no_patch:
         step_patch()
+    if not args.no_sync:
+        step_sync_frontend()
     step_check_web()
 
     if not args.skip_build:

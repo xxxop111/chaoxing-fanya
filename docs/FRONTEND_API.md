@@ -10,7 +10,7 @@
 
 ---
 
-## 0. 先看这 7 条（最容易踩）
+## 0. 先看这 8 条（最容易踩）
 
 1. **一律用相对路径** `/api/...`，绝对不要写死 `http://127.0.0.1:5000`。端口在运行时
    从 5000 起挑第一个空闲端口，写死端口会连不上（开发模式单独跑 `python app.py`
@@ -29,6 +29,9 @@
 7. **桌面模式要打心跳**：每 5 秒 `GET /api/heartbeat`，并在 `pagehide` 时
    `navigator.sendBeacon("/api/window-closed", "")`（§4.20 / §4.21）。这两个接口
    只在桌面壳里存在，浏览器/开发模式会 404 —— 要写成「有就调、没有就算了」。
+8. **`/api/config` 读写的是整份 `web_config.json`**：`data.settings` 才是设置项，
+   且 `POST` 是整份覆盖写 —— 只回传 `settings` 会把 `rememberedLogin`（记住的密码）
+   和 `selectedCourses` 清空。详见 §4.5 / §4.6。
 
 ---
 
@@ -197,26 +200,44 @@
 
 ### 4.5 `GET /api/config`
 
+`data` 是 **`web_config.json` 的整份内容**（不是只有设置项）：
+
 ```json
-{ "status": true, "data": { "speed": 1.0, "tiku_config": { … } } }
+{ "status": true, "data": {
+  "settings": { "speed": 1.0, "tiku_config": { … } },
+  "selectedCourses": [ … ],
+  "rememberedLogin": { "username": "…", "password": "…", "useCookies": false }
+} }
 ```
 
 文件不存在时 `data` 为 `{}`（不是错误）。配置存在可写的 `web_config.json`。
 
+> **踩过的坑（2026-10-16）**：本文档早先写成 `data` 直接就是 `{speed, tiku_config…}`，
+> 结果前端按 `data.speed` 读，全表单空白、保存还把 `rememberedLogin` / `selectedCourses` 清掉。
+> 判断方式是 `data.settings ? data.settings : data`，**并保留顶部其他键**（见 4.6）。
+
 ### 4.6 `POST /api/config`
 
-请求 = **整份配置对象**（不是补丁，后端是覆盖写）：
+请求 = **整份 `web_config.json`**（不是补丁，后端是覆盖写；`settings` 必须包回去）：
 
 ```json
 {
-  "speed": 1.0, "jobs": 4, "notopen_action": "retry", "max_chapters": 0,
-  "tiku_config": { … }, "notification_config": { … }, "ocr_config": { … }
+  "settings": {
+    "speed": 1.0, "jobs": 4, "notopen_action": "retry", "max_chapters": 0,
+    "tiku_config": { … }, "notification_config": { … }, "ocr_config": { … }
+  },
+  "selectedCourses": [ … ],
+  "rememberedLogin": { … }
 }
 ```
 
+**未知顶层键必须原样带回**：后端 `save_web_config(data)` 是整份覆盖写，
+只提交 `settings` 会把「记住的登录信息」（`rememberedLogin`）和已选课程清空。
+正确做法是先 `GET` 拿到原始对象，改掉 `settings` 再整体 `POST` 回去。
+
 响应 `{"status": true, "msg": "保存成功"}`。body 不是对象 → 400；写盘失败 → 500。
 
-**完整配置结构（前端照这个读写）**
+**`settings` 的完整结构（前端照这个读写）**
 
 ```jsonc
 {
@@ -659,11 +680,23 @@
 
 ### 7.3 桌面壳能力（窗口进程提供）
 
-1. **窗口上的注入对象**：外链、打开日志目录、最小化到托盘这类需求，桌面壳会在 `window` 上
-   注入 `window.desktop`（例如 `window.desktop.openExternal(url)`）。前端**必须**先判断存在性
-   （`window.desktop?.openExternal?.(url)`），这样浏览器/开发模式下同一份前端也能跑。
-2. **必须实现的两个回执**：`/api/heartbeat`（每 5 秒）与 `/api/window-closed`（`sendBeacon`），
-   契约见 §4.20 / §4.21。桌面壳靠它们做到「关掉窗口就退出」，没有它们进程会常驻。
+1. **外链**：桌面壳在窗口上注入 `window.desktop.openExternal(url)`（只放行 `http/https`，
+   交给系统默认浏览器打开）。前端**必须**先判断存在性，浏览器/开发模式下同一份前端也能跑：
+
+   ```js
+   function openExternal(url) {
+     if (window.desktop && window.desktop.openExternal) return window.desktop.openExternal(url);
+     if (window.pywebview && window.pywebview.api && window.pywebview.api.open_external) {
+       return window.pywebview.api.open_external(url);   // 桥就绪前的兜底路径
+     }
+     window.open(url, "_blank");                          // 纯浏览器环境
+   }
+   ```
+2. **关窗 = 缩到托盘，不退出**：桌面壳常驻通知区，右键菜单是「显示主窗口 / 隐藏到托盘 / 退出」。
+   也就是说 `/api/window-closed`（§4.21）现在只表示「窗口这一侧关了」，**不再等于进程退出**；
+   真正退出走托盘菜单（`--no-tray` 启动时才是「关窗即退出」的老行为）。
+3. **必须实现的两个回执**：`/api/heartbeat`（每 5 秒）与 `/api/window-closed`（`sendBeacon`），
+   契约见 §4.20 / §4.21。桌面壳靠心跳判断界面是否还活着（长时间没有心跳才兜底收摊）。
 
 ---
 
