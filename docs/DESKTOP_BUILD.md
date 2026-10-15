@@ -90,17 +90,31 @@ cd D:\03-开发\项目\ds\chaoxing-fanya
 | 原生窗口 | ✅ 窗口标题「超星学习通助手」，`/api/health` 返回 `{"status":true,"msg":"OK"}`，`/` 200，前端资源正常加载 |
 | 打包产物 | ✅ `dist\chaoxing-fanya\chaoxing-fanya.exe` 独立运行（含 WebView2/CLR 加载），窗口与源码模式一致 |
 | 冒烟测试 | ✅ `tools\smoke_desktop.py` 六项检查全过、`--stop` 干净退出，退出码 0（连跑两次，覆盖 dist 产物） |
-| 安装包编译 | ✅ `Successful compile`，`chaoxing-fanya-setup-1.0.0.exe` 生成 |
-| 安装到用户目录 | ⚠️ **本会话内无法完成**，见下 |
+| 安装包编译 | ✅ `Successful compile`，`chaoxing-fanya-setup-1.0.0.exe` 生成（60.5 MB） |
+| **安装包载荷 + 自启动** | ✅ `tools\verify_installer.py` 全过：14 项检查 + 装出来的 exe 通过冒烟测试，退出码 0 |
+| 装到 `%LOCALAPPDATA%\Programs` | ⚠️ **本会话内做不了**，需用户双击；见 5.1 |
 
-**为什么本会话装不了**：这台机器的 DSH 会话把「由我的进程再拉起的子进程」限制在受限令牌里，
-子进程对 `%LOCALAPPDATA%\Programs` 与 `HKCU` 的写入会被拒（实测 Python 写 HKCU 报
-`[WinError 5] 拒绝访问`，安装器日志报
+### 5.1 装不了的环境里，怎么证明安装包是对的
+
+完整静默安装要写 `HKCU\...\Uninstall\{AppId}_is1`（卸载项）与 `%APPDATA%`（开始菜单快捷方式），
+而这台机器的 DSH 会话把「我的进程再拉起的子进程」限制在受限令牌里 —— 这两处写入必被拒，
+Inno 于是整体回滚（日志：
 `Setup was unable to create the directory "C:\Users\35278\AppData\Local\Programs\ChaoxingFanya". Error 5`）。
-Inno 安装必须先写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{AppId}_is1`，
-所以**必须由用户自己在资源管理器里双击安装包**（用户会话不受该限制）。
-这属于会话环境限制，不是安装包缺陷；安装到工作区目录时，文件安装阶段是成功的
-（`Successfully installed the file` ×N），只在写卸载注册表项时被拒并回滚。
+
+`tools\verify_installer.py` 绕开的正是这一点：它派生一份**测试用 .iss**，只砍掉上面两处必然被拒的动作
+（`Uninstallable=no` + 清空 `[Icons]`），把 `[Run]` 改成 `--no-window`，其余流程原样跑：
+
+```powershell
+.venv\Scripts\python.exe tools\verify_installer.py          # 装到工作区目录，验完自动清理
+.venv\Scripts\python.exe tools\verify_installer.py --keep   # 保留安装目录便于人工查看
+```
+
+它验证：静默安装退出码 0 → 主程序 / `_internal` / `web/dist` / `resource` / `vendor\webview2` /
+补丁脚本都落盘 → **没有**把 `web_config.json`、`desktop_config.json`、`*.log`、`.webview` 打进包
+→ `[Run]` 让装好的程序自动起来 → 对**安装目录里的 exe**跑一遍冒烟测试。
+
+仍然需要用户自己做的两件事：写卸载注册表项（否则「应用」列表里没有它）与建快捷方式。
+这两步在用户会话里没有任何限制，双击即可。
 
 ## 6. 冒烟测试（每次改完打包链必跑）
 
@@ -122,6 +136,10 @@ Inno 安装必须先写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstal
 退出码 0 = 全过；失败时会打印 `desktop_app.log` 末尾若干行。已经跑着实例时它不会启第二个进程，
 而是直接对现有实例做检查。
 
+`--stop` 现在是**静默**的（结果写 `desktop_app.log`）：它原本会弹系统模态对话框报「已关闭。」，
+而系统模态没人点就把调用方永远卡住 —— 实测让脚本里的 `subprocess.run(timeout=40)` 直接超时。
+要回执弹窗就显式 `chaoxing-fanya.exe --stop --dialog`。
+
 > 手动验证「原生窗口」时不要用本工具的 pwsh 会话 `Start-Process` —— GUI 子进程会继承管道，
 > 让工具一直等下去（实测把整个调用卡成后台任务）。要么用 `smoke_desktop.py`，
 > 要么用 WMI 分离启动：`([wmiclass]'Win32_Process').Create('"<exe>" --no-window')`。
@@ -134,6 +152,8 @@ Inno 安装必须先写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstal
 | `FileLoadException: Assembly with same name is already loaded` | 自己先把 WebView2 程序集 `AddReference` 了 | 别抢注：用 `tools/patch_pywebview.py` 原地覆盖 `webview/lib` |
 | `TypeLoadException: ... ContextMenu` | `webview/lib` 里还是 net462 版程序集 | 跑补丁（`vendor/webview2` 必须存在） |
 | `AttributeError: 'NoneType' object has no attribute 'GetMethod'` | `winforms.py` 的 `OpenFolderDialog` 在 .NET 8 上解析失败 | 跑补丁 |
+| 脚本调 `--stop` 卡住 / `subprocess.run` 超时 | 旧版 `--stop` 会弹系统模态对话框，没人点就一直等 | 已修为默认静默（结果写 `desktop_app.log`）；要弹窗加 `--dialog` |
+| 安装包里出现 `winforms.py.orig` | 补丁脚本留在 site-packages 的回滚备份被 `collect_all` 收走 | spec 已过滤 `*.py.orig`；`.iss` 的 `Excludes` 也加了它 |
 | 启动后出现带地址栏的 Edge/Chrome 窗口 | 走了浏览器兜底分支 | 看 `desktop_app.log` 里 webview 的报错；确认打包版没排除 `webview`/`clr_loader`/`pythonnet` |
 | `RedirectionGuard status ... Enabled in enforcing mode` | Win11 24H2+ 的进程缓解策略，正常 | 无需处理 |
 

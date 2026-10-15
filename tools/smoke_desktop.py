@@ -238,8 +238,11 @@ def main() -> int:
                 text=True,
                 timeout=40,
             )
+        except subprocess.TimeoutExpired:
+            # --stop 自己卡住不该让冒烟测试失败：端口是否真的关掉由下面这一步判定
+            log("[i] --stop 未在 40 秒内返回，继续等端口释放")
         except Exception as exc:  # noqa: BLE001
-            log(f"[!] --stop 调用失败：{exc}")
+            log(f"[i] --stop 调用失败：{exc}（继续等端口释放）")
         deadline = time.time() + 25
         while time.time() < deadline and port_open(port):
             time.sleep(0.7)

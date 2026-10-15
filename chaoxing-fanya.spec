@@ -36,6 +36,10 @@ hiddenimports = ['flask_cors', 'loguru', 'httpx', 'pyaes']
 
 for pkg in ('webview', 'clr_loader', 'pythonnet'):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
+    # 补丁脚本会在 site-packages 里留一份 winforms.py.orig 备份（回滚用），
+    # 那是开发机上的东西，不该进用户包（实测 ISCC 日志里出现过它）。
+    pkg_datas = [item for item in pkg_datas if not item[0].endswith('.py.orig')]
+    pkg_binaries = [item for item in pkg_binaries if not item[0].endswith('.py.orig')]
     datas += pkg_datas
     binaries += pkg_binaries
     hiddenimports += pkg_hidden

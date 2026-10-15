@@ -8,6 +8,13 @@
 * 窗口就是应用本身（内嵌 WebView2，无地址栏、无标签栏），关掉窗口即退出；
 * 浏览器存储持久化（``private_mode=False``），「记住密码」和盘点缓存不会丢。
 
+命令行开关（都可选）：
+
+* ``--no-window``：只起服务、不开窗口（自动化脚本与冒烟测试用）；
+* ``--stop``：停掉已在运行的实例 —— **默认不弹任何对话框**，结果写 ``desktop_app.log``
+  （系统模态弹窗没人点就会把调用方卡死）；``--stop --dialog`` 才会弹回执；
+* ``CHAOXING_NO_WEBVIEW=1``：强制走浏览器兜底方案（排障用）。
+
 实现要点：
 
 * Flask 跑在后台线程（用 ``werkzeug.make_server`` 以便优雅关闭），
@@ -196,9 +203,22 @@ def _write_pid() -> None:
         pass
 
 
-def stop_running() -> int:
+def stop_running(*, interactive: bool = False) -> int:
+    """停掉已在运行的实例。
+
+    ``--stop`` 是**给工具/脚本调**的（冒烟测试、安装脚本、快捷方式），所以默认
+    **不弹任何对话框**：``MessageBoxW`` 是系统模态的，没人去点就会一直阻塞调用方
+    （实测让 ``subprocess.run(timeout=40)`` 直接超时）。结果改为写 ``desktop_app.log``。
+    人在命令行里想要回执时加 ``--dialog``。
+    """
+
+    def _tell(text: str) -> None:
+        log(f"--stop: {text}")
+        if interactive:
+            message_box(WINDOW_TITLE, text)
+
     if not os.path.exists(PID_PATH):
-        message_box(WINDOW_TITLE, "没有找到正在运行的实例。")
+        _tell("没有找到正在运行的实例。")
         return 0
     try:
         pid = int(open(PID_PATH, encoding="utf-8").read().strip())
@@ -209,7 +229,7 @@ def stop_running() -> int:
             os.remove(PID_PATH)
         except OSError:
             pass
-        message_box(WINDOW_TITLE, "记录进程号的文件已损坏，已清理。")
+        _tell("记录进程号的文件已损坏，已清理。")
         return 0
 
     result = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
@@ -220,10 +240,7 @@ def stop_running() -> int:
         os.remove(PID_PATH)
     except OSError:
         pass
-    if alive:
-        message_box(WINDOW_TITLE, "已关闭。")
-        return 0
-    message_box(WINDOW_TITLE, "没有正在运行的实例（已清理残留记录）。")
+    _tell("已关闭。" if alive else "没有正在运行的实例（已清理残留记录）。")
     return 0
 
 
@@ -472,7 +489,8 @@ def _run_with_browser(url: str, server, state: dict) -> int:
 def main() -> int:
     argv = [a.lower() for a in sys.argv[1:]]
     if "--stop" in argv:
-        return stop_running()
+        # 默认静默（工具友好）；想看到回执弹窗就加 --dialog
+        return stop_running(interactive="--dialog" in argv)
     headless = "--no-window" in argv
 
     os.makedirs(BASE_DIR, exist_ok=True)

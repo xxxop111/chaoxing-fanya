@@ -55,7 +55,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式（可选）"; GroupD
 [Files]
 ; 排除运行期产物：它们由程序首次启动时生成，而且 web_config.json / desktop_config.json
 ; 里可能有账号与 AI 密钥，绝不能打进安装包；.webview 是 WebView2 的用户数据目录（几十 MB）。
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: ".webview\*,*.log,desktop_app.log,chaoxing.log,desktop_config.json,web_config.json,config.ini,config.ini.bak,.chaoxing_app.pid,pythonnet.runtimeconfig.json"
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: ".webview\*,*.log,desktop_app.log,chaoxing.log,desktop_config.json,web_config.json,config.ini,config.ini.bak,.chaoxing_app.pid,pythonnet.runtimeconfig.json,*.py.orig"
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
