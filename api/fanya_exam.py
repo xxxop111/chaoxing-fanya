@@ -131,6 +131,33 @@ def looks_like_answering_page(html: str) -> bool:
     return ("saveUrl" in html and "submitTest" in html) or "questionLi" in html
 
 
+# 非作答页的「状态页」特征。按特异性从强到弱排列，命中即用。
+# 实测（2026-10-15，COM0018A 11 个未完成测验）两种成因：
+#   ① 考试窗口已结束（窗口 2026-05-11 ~ 06-30）→ 页面直接写「考试已过期」；
+#   ② 试卷在任务计划建立**之前**就已交卷（planUser.createDate 晚于提交时间）
+#      → 平台不认这次旧交卷，走到的是 look 查看页。
+# 两者都会被旧实现误报成「作答页缺少必需隐藏域 saveUrl」，让用户以为是自己
+# 的页面结构变了。这里把真实原因写清楚。
+_EXAM_STATE_PATTERNS = (
+    ("考试已过期", "考试已过期：考试窗口已结束，平台不允许再进入作答"),
+    ("作答时间耗尽，试卷已提交", "作答时间已耗尽，试卷已被平台自动提交"),
+    ("学生未参加考试", "平台记录为「学生未参加考试」，且考试窗口已结束"),
+    ("查看试卷详情", "该试卷已经交卷；当前页面只是「查看试卷详情」，没有作答入口"),
+    ("交卷成功", "该试卷已经交卷"),
+)
+
+
+def describe_exam_page(html: str) -> str:
+    """识别「不是作答页」时的真实状态；认不出则返回空串。
+
+    调用方用它替换原来含糊的「缺少必需隐藏域」报错。
+    """
+    for key, text in _EXAM_STATE_PATTERNS:
+        if key in html:
+            return text
+    return ""
+
+
 def parse_answering_page(html: str) -> dict:
     """解析作答页：提交地址、时效令牌、当前题号与题型、选项。"""
     fields = parse_hidden_inputs(html)

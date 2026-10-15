@@ -2066,6 +2066,11 @@ def handle_quiz(ctx: CompletionContext) -> tuple[bool, str]:
 
     # 3) 尝试进入作答页（入口可能是 lookPaper「查看详情」或 examnotes「须知」）
     if not ex.looks_like_answering_page(html):
+        # 先识别「状态页」：过期 / 已交卷 / 从未参加。旧实现只会含糊地报
+        # 「缺少必需隐藏域 saveUrl」，会把「考试窗口已结束」误报成页面结构问题。
+        state = ex.describe_exam_page(html)
+        if state:
+            return False, f"{state}，无法补完成（需联系老师处理）"
         next_url = _find_answering_url(html, course, class_id)
         if not next_url:
             return False, ("已定位到考试入口，但当前无法取得作答页"
@@ -2076,6 +2081,9 @@ def handle_quiz(ctx: CompletionContext) -> tuple[bool, str]:
             return False, f"打开作答页失败: {exc}"
         html = resp.content.decode("utf-8", errors="replace")
         if not ex.looks_like_answering_page(html):
+            state = ex.describe_exam_page(html)
+            if state:
+                return False, f"{state}，无法补完成（需联系老师处理）"
             return False, "打开的页面不是预期的作答页，已中止（不提交任何内容）"
 
     # 4) 逐题作答：默认只暂存

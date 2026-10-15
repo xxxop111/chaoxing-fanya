@@ -17,6 +17,9 @@ from api.fanya_ladder import parse_choice_question          # noqa: E402
 from api.fanya_work import _is_refusal  # noqa: E402
 from api.fanya_upload import needs_dialogue, copy_is_banned, min_chars  # noqa: E402
 from api.fanya_task import _format_progress, _window_reason  # noqa: E402
+from api.fanya_exam import (  # noqa: E402
+    describe_exam_page, looks_like_answering_page,
+)
 
 
 # ---------------- 选择题解析 ----------------
@@ -357,6 +360,42 @@ def test_watched_ms_reads_total_time():
     assert watched_ms({"totalTime": None}) == 0
     assert watched_ms(None) == 0
     assert watched_ms("304000") == 0  # score 不是 dict 时不能瞎猜
+
+
+# ----------------------------------------------------------------------
+# 考试「状态页」识别：过期 / 已交卷 / 从未参加
+#
+# 背景：2026-10-15 实测 COM0018A 的 11 个未完成测验，全都被旧实现含糊地
+# 报成「作答页缺少必需隐藏域 saveUrl」。真实成因只有两种：窗口已结束，
+# 或试卷在任务计划建立之前就已交卷（平台不认旧交卷）。这里钉住识别逻辑。
+# ----------------------------------------------------------------------
+def test_describe_exam_page_detects_expired():
+    html = '<h2>考试已过期</h2><p>开始时间：2026-05-11 09:59</p>'
+    assert "已过期" in describe_exam_page(html)
+
+
+def test_describe_exam_page_detects_submitted():
+    assert "已经交卷" in describe_exam_page('<span>交卷成功</span>')
+    assert "查看试卷详情" in describe_exam_page('<a>查看试卷详情</a>')
+
+
+def test_describe_exam_page_detects_never_attended():
+    html = '{"msg":"学生未参加考试","status":false}'
+    assert "未参加考试" in describe_exam_page(html)
+
+
+def test_describe_exam_page_returns_empty_for_answering_page():
+    # 真正的作答页不该被认成状态页，否则会误报「无法补完成」
+    html = '<input id="saveUrl" value="/x"><form id="submitTest"></form><div class="questionLi">'
+    assert describe_exam_page(html) == ""
+    assert describe_exam_page("<html><body>nothing here</body></html>") == ""
+
+
+def test_exam_answering_page_needs_save_url():
+    assert looks_like_answering_page('<input id="saveUrl"><form id="submitTest">')
+    assert looks_like_answering_page('<div class="questionLi">')
+    # 只有 saveUrl 没有 submitTest、也没有 questionLi → 不算作答页
+    assert not looks_like_answering_page('<input id="saveUrl">')
 
 
 # ----------------------------------------------------------------------
