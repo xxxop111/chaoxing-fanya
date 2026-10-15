@@ -176,7 +176,7 @@ courseId=..&classId=..&replyId=-1&uuid=<新 uuid4>&topic_content=<二次编码�
 **重要纠正**：这些任务点**不都是**章节附件，必须逐类看待 —— 早期「统一复用章节流程」的
 假设是错的。
 
-### 6.1 文档（planType 11）——[已验证] 单次上报即可完成
+### 6.1 文档（planType 11）——[已验证] `readEnd` 只解决「读完」，不解决「读够」
 
 ```
 跳转  POST /userStudyPlan/getToStudyUrl  → data.url =
@@ -184,11 +184,44 @@ courseId=..&classId=..&replyId=-1&uuid=<新 uuid4>&topic_content=<二次编码�
 完成  GET  https://task.chaoxing.com/documentStudy/readEnd?encryPlanUserId=<EPU>
 ```
 
-任务引擎有自己的文档学习页（云盘阅读器）。阅读器上报 `isFinished=1` 时页面会调用
-`/documentStudy/readEnd`，这就是服务端认可的「读完了」。
+任务引擎有自己的文档学习页。页面本身只是个**外壳**：它把
+
+```
+https://pan-yz.chaoxing.com/screen/v2/file_<objectId>?…&ext={"rwyq_doc":<EPU>,"pId":<planId>,…}
+```
+
+塞进 iframe，真正的阅读器在那个**独立域名**里跑。阅读器滚到底部时
+`parent.postMessage({isFinished:1})`，外壳收到才调 `/documentStudy/readEnd`
+（外壳页里只有 2 个 `requestGet`：`readEnd` 和 `downloadUrl`，**没有任何时长上报**）。
 
 **实测**：`planId=7453880`「9-4 静电场环路定理与电势自学任务清单」调用前
-`isFinish=False`，调用后 `isFinish=True`。
+`isFinish=False`，调用后 `isFinish=True` —— 那是一个**没设时长门槛**的文档。
+
+#### ⚠️ 但设了 `enableDocumentWatchDuration` 时，`readEnd` 不够
+
+服务端要的是 `score.totalTime >= documentWatchDuration × 60000` 毫秒（单位是**分钟**）。
+`readEnd` 能让 `completeWeightRate` 变成 100（=「读完」），却**一分一秒都不计入**
+`totalTime`。2026-10-15 受控实验：
+
+| 实验 | 结果 |
+| --- | --- |
+| `learnPage` → 真等 40 秒 → `readEnd` | `{"result":true}`，`totalTime` 仍是 `None` |
+| 再连打 3 次 `readEnd`（间隔 12 秒） | `totalTime` 仍是 `None` |
+| `GET /documentStudy/dataLog/1/1/1` | **404** |
+| `GET /documentStudy/readStart` / `readLog` / `lastCurrentTime/1` | **均 404** |
+
+对照数据（全账号 15 个带时长要求的任务点）：`completeWeightRate=100.0` 但
+`isFinish=False` 的有 8 个，全部满足 `totalTime < 要求`。
+
+**结论**：文档时长由云盘阅读器 iframe 走一条**跨域埋点**通道上报：
+
+```
+https://data-xxt.aichaoxing.com/analysis/ac_mark?…
+```
+
+参数在 `addPoint.js`（jsjiami.com.v5 混淆，97 KB）里，纯 HTTP 复现不了。
+因此 `handle_document` 在这种情况下**如实返回失败**并说明原因，而不是让外层
+打一条「提交成功但状态仍为未完成」再算成功。
 
 ### 6.2 作业（planType 4）——课程作业，与章节检测不同
 
@@ -200,7 +233,7 @@ courseId=..&classId=..&replyId=-1&uuid=<新 uuid4>&topic_content=<二次编码�
 带的是 `workId` + `enc`，属于**课程作业**，和章节检测作业（`api/base.py:study_work`
 用的 `/mooc-ans/api/work?...&jobid=work-...`）不是同一套入口，暂未接入。
 
-### 6.3 视频（planType 10）——[已验证] 一次到位上报即可完成
+### 6.3 视频（planType 10）——累计观看时长门槛
 
 任务引擎有**自己的视频学习页**（不走 mooc1 的 video 模块）：
 
@@ -216,7 +249,7 @@ const videoLearnVo = {
   encryId: "BEDCjrlChRDhp@…",     // 上报用的加密 id
   resourceId: "03788546aa…",
   currentTime: 0, farthestTimeValue: 0,
-  enableDrag: true,                // 允许拖拽（关键）
+  enableDrag: true,                // 允许拖拽
   enableTripleSpeed: false,
   videoInfo: { videoSource: "https://s2.cldisk.com/…/sd.mp4?at_=…&ak_=…&ad_=…",
                duration: 808 }     // 时长（秒）
@@ -234,13 +267,39 @@ const videoLearnVo = {
 要点：
 
 * `duration` / `currentTime` 都取整（`Math.floor`）。
-* **关键实测结论**：服务端**接受一次到位的进度上报**，不需要按真实时长等待。
+* **没设 `enableVideoWatchDuration` 时**：服务端接受一次到位的进度上报。
 
   | planId | 时长 | 调用 | isFinish |
   | --- | --- | --- | --- |
   | 6797890（已完成项，对照组） | 808s | `ct=0,status=0` → `result:true`；`ct=808,status=2` → `result:true` | 保持 true |
   | **4097446（未完成项）** | **1362s** | 同上 | **false → true** |
   | **4097447（未完成项）** | **643s** | 走 `handle_video` 处理器 | **false → true** |
+
+  这三个任务点的 `planBreakthroughSet` 里 `enableVideoWatchDuration=0`。
+
+* **设了 `enableVideoWatchDuration` 时，一次到位就失效了**（旧结论的适用边界）。
+  此时判据是 `score.totalTime >= videoWatchDuration × 60000`（毫秒 vs **分钟**）。
+  2026-10-15 三条受控实验：
+
+  | 实验 | 墙上用时 | `totalTime` 增量 | 结论 |
+  | --- | --- | --- | --- |
+  | 一次性 `ct=0,status=0` → `ct=duration,status=2` | ~0s | **0** | 跳播不给分 |
+  | 大跳 `ct=1500`（不等待） | ~6s | **0** | 大跳不给分 |
+  | 真实 6 秒心跳 ×7 | 42.6s | **+74.0s** | 按真实间隔计入 |
+  | 10 倍速节奏（墙上 6s / `ct` +60） | 63.8s | **+18.0s** | 加速被折扣，不能用 |
+
+  单位检验（`_probe_tt.py` 扫全库 15 个带时长要求的任务点）：
+
+  | planId | 要求 | `totalTime` | 换算 | isFinish |
+  | --- | --- | --- | --- | --- |
+  | 6797876（唯一完成） | 5.0 min | 304000 | 304s ≥ 300s | **True** ✅ |
+  | 8359996 | 13.0 min | 22000 | 22s < 780s | False |
+  | 8359997 | 5.0 min | None | 0 < 300s | False |
+
+  后者在 2026-10-15 被按真实时间补到 `totalTime=304000`（304s ≥ 300s）后
+  `isFinish` **真的翻转成 True** —— 因果闭环。
+
+  详见 `docs/观看时长门槛.md`（含 `_exp_proof.py` 级别的完整实验记录）。
 
 * 适配器实现：抓 `videoLearnVo` → 上报「开始播放」(`ct=0,status=0`) →
   上报「播放结束」(`ct=duration,status=2`) → 记录播放位置 → 复查 `isFinish`。

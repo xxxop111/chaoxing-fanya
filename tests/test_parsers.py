@@ -294,6 +294,72 @@ def test_story_evaluate_uses_get_not_post():
 
 
 # ----------------------------------------------------------------------
+# 累计观看时长门槛：判据是 score.totalTime >= watchDuration(分钟) × 60000
+# 这层一旦算错，就会把「上报成功」当成「已完成」（曾经真的这样）
+# ----------------------------------------------------------------------
+def test_watch_duration_ms_converts_minutes():
+    from api.fanya_task import watch_duration_ms
+
+    extra = {"planBreakthroughSet": {"enableVideoWatchDuration": 1,
+                                     "videoWatchDuration": 13.0}}
+    assert watch_duration_ms(extra, "video") == 780000
+
+
+def test_watch_duration_ms_zero_when_not_enabled():
+    from api.fanya_task import watch_duration_ms
+
+    # enable 位关了 / 没这个字段 / 值为 0，都算「没有要求」
+    assert watch_duration_ms(
+        {"planBreakthroughSet": {"enableVideoWatchDuration": 0,
+                                 "videoWatchDuration": 13.0}}, "video") == 0
+    assert watch_duration_ms(
+        {"planBreakthroughSet": {"videoWatchDuration": 13.0}}, "video") == 0
+    assert watch_duration_ms(
+        {"planBreakthroughSet": {"enableVideoWatchDuration": 1,
+                                 "videoWatchDuration": 0}}, "video") == 0
+
+
+def test_watch_duration_ms_tolerates_broken_input():
+    """任务点字段是平台返回的原始 JSON，缺字段/类型不对都不能抛。"""
+    from api.fanya_task import watch_duration_ms
+
+    assert watch_duration_ms(None, "video") == 0
+    assert watch_duration_ms({}, "video") == 0
+    assert watch_duration_ms({"planBreakthroughSet": None}, "video") == 0
+    assert watch_duration_ms(
+        {"planBreakthroughSet": {"enableVideoWatchDuration": 1,
+                                 "videoWatchDuration": "abc"}}, "video") == 0
+    assert watch_duration_ms(
+        {"planBreakthroughSet": {"enableVideoWatchDuration": 1,
+                                 "videoWatchDuration": None}}, "video") == 0
+    assert watch_duration_ms(
+        {"planBreakthroughSet": {"enableVideoWatchDuration": 1,
+                                 "videoWatchDuration": 5}}, "movie") == 0
+
+
+def test_watch_duration_ms_per_kind():
+    from api.fanya_task import watch_duration_ms
+
+    assert watch_duration_ms(
+        {"planBreakthroughSet": {"enableDocumentWatchDuration": 1,
+                                 "documentWatchDuration": 3.0}}, "document") == 180000
+    assert watch_duration_ms(
+        {"planBreakthroughSet": {"enableAudioWatchDuration": 1,
+                                 "audioWatchDuration": 2.5}}, "audio") == 150000
+
+
+def test_watched_ms_reads_total_time():
+    from api.fanya_task import watched_ms
+
+    # 实测：唯一完成的那个任务点 totalTime=304000（304s ≥ 5 分钟）
+    assert watched_ms({"totalTime": 304000}) == 304000
+    assert watched_ms({}) == 0
+    assert watched_ms({"totalTime": None}) == 0
+    assert watched_ms(None) == 0
+    assert watched_ms("304000") == 0  # score 不是 dict 时不能瞎猜
+
+
+# ----------------------------------------------------------------------
 # 内置 runner：没装 pytest 也能跑（本仓库刻意保持零测试依赖）
 # ----------------------------------------------------------------------
 def _run_all() -> int:

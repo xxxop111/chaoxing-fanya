@@ -1382,8 +1382,21 @@ def handle_document(ctx: CompletionContext) -> tuple[bool, str]:
     """完成「文档」任务点。
 
     任务引擎自己的文档学习页（``task.chaoxing.com/documentStudy/learnPage``）
-    在云盘阅读器上报 ``isFinished=1`` 时会调用 ``GET /documentStudy/readEnd``，
-    这就是服务端认可的「读完了」上报。这里直接复现该请求。
+    在云盘阅读器上报 ``isFinished=1`` 时会调用 ``GET /documentStudy/readEnd``。
+    这里直接复现该请求，它能让 ``completeWeightRate`` 变成 100（=「读完」）。
+
+    ⚠️ **但读完了不等于完成**：若任务点设了 ``enableDocumentWatchDuration``，
+    服务端还要求 ``score.totalTime >= documentWatchDuration × 60000`` 毫秒。
+    实测（2026-10-15，受控实验）：
+
+    * ``readEnd`` 返回 ``{"result": true}`` 却**一分一秒都不计入** ``totalTime``；
+    * 真等 40 秒再调 ``readEnd``、连调多次，``totalTime`` 仍是 ``None``；
+    * ``documentStudy`` 下**没有** ``dataLog`` 之类的时长端点（4 个候选全 404）。
+
+    文档的时长由云盘阅读器 iframe（``pan-yz.chaoxing.com``）自己另走一条
+    跨域埋点通道（``data-xxt.aichaoxing.com/analysis/ac_mark``）上报，纯 HTTP
+    复现不了 —— 它的参数在混淆 JS 里。所以这里如实返回失败，而不是让外层
+    打印一条「提交成功但状态仍为未完成」再把它算作成功。
     """
     url = ctx.study_url.get("url") or ""
     match = re.search(r"encryPlanUserId=([^&\s]+)", url)
@@ -1415,6 +1428,19 @@ def handle_document(ctx: CompletionContext) -> tuple[bool, str]:
 
     if not body.get("result"):
         return False, f"上报文档阅读完成被拒绝: {body.get('message') or body.get('msg') or body}"
+
+    # 已报到「读完」，但若还叠加了累计观看时长门槛，纯 HTTP 就到不了终点。
+    required_ms = watch_duration_ms(ctx.item.extra, "document")
+    if required_ms > 0:
+        got = _optional_watched_ms(ctx)
+        if got is not None and got < required_ms:
+            return False, (
+                f"已上报「文档阅读完成」（阅读进度 100%），但该任务点还要求累计阅读 "
+                f"{required_ms / 60000.0:g} 分钟；服务端当前只记了 {got / 1000.0:.0f} 秒。"
+                f"文档时长由云盘阅读器（pan-yz.chaoxing.com）的跨域埋点另行上报，"
+                f"纯 HTTP 无法复现 —— 请在浏览器里打开该文档并停留阅读，"
+                f"或改用「重做模式」在浏览器中完成。"
+            )
     return True, "已上报文档阅读完成"
 
 
@@ -1423,6 +1449,174 @@ def handle_document(ctx: CompletionContext) -> tuple[bool, str]:
 # ----------------------------------------------------------------------
 
 # 任务引擎自有的播放页 → 进度上报前缀
+# 「累计观看时长」门槛的字段名（都在 planBreakthroughSet 里）。
+# 实测（2026-10-15，27 门课 220 个任务点）：planBreakthroughSet 里唯一有判别力
+# 的完成条件就是它 —— 设了 enableXxxWatchDuration=1 的 15 个任务点里 14 个未完成，
+# 且未完成的全部满足 score.totalTime < watchDuration × 60000。
+_WATCH_DURATION_KEYS = {
+    "video": ("enableVideoWatchDuration", "videoWatchDuration"),
+    "audio": ("enableAudioWatchDuration", "audioWatchDuration"),
+    "document": ("enableDocumentWatchDuration", "documentWatchDuration"),
+}
+
+# 观看时长补足时的心跳间隔（秒）与回读服务端的间隔（秒）。
+# 心跳间隔取 6 秒，与页面 videojs 插件的 setInterval 一致。
+_WATCH_HEARTBEAT_SECONDS = 6.0
+_WATCH_POLL_SECONDS = 30.0
+# 达标后等待 isFinish 翻转的最长时间（秒）——服务端结算是异步的。
+_WATCH_SETTLE_SECONDS = 45.0
+
+
+def watch_duration_ms(extra: dict, kind: str) -> int:
+    """返回任务点要求的累计观看时长（毫秒）；没设要求时返回 ``0``。"""
+    keys = _WATCH_DURATION_KEYS.get(kind)
+    if not keys:
+        return 0
+    enabled_key, value_key = keys
+    bts = (extra or {}).get("planBreakthroughSet") or {}
+    if not bts.get(enabled_key):
+        return 0
+    try:
+        minutes = float(bts.get(value_key) or 0)
+    except (TypeError, ValueError):
+        return 0
+    if minutes <= 0:
+        return 0
+    return int(minutes * 60 * 1000)
+
+
+def watched_ms(score: Any) -> int:
+    """从 ``score`` 里取出服务端记录的累计观看毫秒数（``totalTime``）。"""
+    if not isinstance(score, dict):
+        return 0
+    try:
+        return int(score.get("totalTime") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _optional_watched_ms(ctx: CompletionContext) -> Optional[int]:
+    """回读任务点当前的累计观看毫秒数；读取失败返回 ``None``。"""
+    group_id = (ctx.item.extra or {}).get("group_encry_id") or ctx.task.group_encry_id
+    raw = ctx.client.get_plan_item(ctx.task.encry_task_user_id, group_id, ctx.item.plan_id)
+    if raw is None:
+        return None
+    return watched_ms(raw.get("score"))
+
+
+def _satisfy_watch_duration(ctx: CompletionContext, kind: str, url: str, encry_id: str,
+                            duration: int, required_ms: int,
+                            report: Callable[[int, int], tuple[bool, str]],
+                            headers: dict) -> tuple[bool, str]:
+    """按真实时间补足累计观看时长，直到服务端记录达标。
+
+    平台把观看时长记在 ``score.totalTime``（毫秒），达标线是
+    ``planBreakthroughSet.{video,audio,document}WatchDuration``（**分钟**）。
+    2026-10-15 受控实验确认的三条规则：
+
+    1. **一次性跳到片尾计 0** —— 上报返回 ``result:true`` 但 ``totalTime`` 不变；
+    2. **几秒内连发一串心跳计 0** —— 大跳 ``currentTime`` 同样不给分；
+    3. **只认真实经过的时间** —— 真实 6 秒心跳 ×7（墙上 42.6 秒）换来 ``totalTime``
+       增长；倍速节奏有折扣（3 倍速实测约 0.63 倍）。
+
+    因此这里只能按真实节奏发心跳，并定期回读服务端确认，不能靠跳播取巧。
+    """
+    heartbeat = max(2.0, float(ctx.options.get("video_heartbeat")
+                               or _WATCH_HEARTBEAT_SECONDS))
+    try:
+        speed = float(ctx.options.get("video_speed") or 1.0)
+    except (TypeError, ValueError):
+        speed = 1.0
+    speed = max(1.0, min(speed, 8.0))
+    try:
+        budget = float(ctx.options.get("video_max_seconds") or 7200.0)
+    except (TypeError, ValueError):
+        budget = 7200.0
+    stop_event = ctx.options.get("stop_event")
+
+    got = _optional_watched_ms(ctx)
+    if got is not None and got >= required_ms:
+        return True, (f"已满足累计观看时长（服务端已记 {got / 1000.0:.0f} 秒 ≥ "
+                      f"{required_ms / 60000.0:g} 分钟）")
+
+    logger.info(
+        "{}任务点要求累计观看 {:.0f} 分钟（服务端已记 {}），按真实时间补足",
+        kind, required_ms / 60000.0,
+        f"{got / 1000.0:.0f} 秒" if got is not None else "未知",
+    )
+
+    ok, msg = report(0, 0)
+    if not ok:
+        return False, f"上报「开始播放」被拒绝：{msg}"
+
+    started = time.time()
+    last_poll = started
+    current = 0
+    best = got or 0
+
+    while True:
+        if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+            report(current, 2)
+            return False, (f"收到停止请求，已累计观看约 {best / 1000.0:.0f} 秒，"
+                           f"未达 {required_ms / 60000.0:g} 分钟")
+        if time.time() - started > budget:
+            report(current, 2)
+            return False, (f"超过单任务点时间上限（{budget:.0f} 秒），已累计观看约 "
+                           f"{best / 1000.0:.0f} 秒，未达 {required_ms / 60000.0:g} 分钟")
+
+        # 兜底：即使一直读不到服务端计数，也不能无限播下去。
+        # 实测 3 倍速只按约 0.63 倍墙上时间计入，留 2.2 倍余量足够。
+        elapsed = time.time() - started
+        if best <= 0 and elapsed > required_ms / 1000.0 * 2.2:
+            report(current, 2)
+            return False, (f"已按真实时间播放 {elapsed:.0f} 秒，但始终读不到服务端的"
+                           f"累计观看计数（要求 {required_ms / 60000.0:g} 分钟），"
+                           f"无法确认是否达标")
+
+        time.sleep(heartbeat)
+        current = min(duration, current + int(round(heartbeat * speed)))
+        ok, msg = report(current, 1)
+        if not ok:
+            return False, f"播放心跳被拒绝：{msg}"
+
+        now = time.time()
+        if now - last_poll < _WATCH_POLL_SECONDS:
+            continue
+        last_poll = now
+        got = _optional_watched_ms(ctx)
+        if got is not None:
+            best = max(best, got)
+            logger.info("累计观看进度：服务端 {:.0f} 秒 / 要求 {:.0f} 秒",
+                        got / 1000.0, required_ms / 1000.0)
+            if got >= required_ms:
+                report(current, 2)
+                flipped = _await_finish(ctx, _WATCH_SETTLE_SECONDS)
+                from api import fanya_video
+
+                fanya_video.save_position(ctx.client.session, encry_id, current,
+                                          timeout=ctx.client.timeout)
+                if flipped:
+                    return True, (f"已补足累计观看时长（服务端记 {got / 1000.0:.0f} 秒 ≥ "
+                                  f"{required_ms / 60000.0:g} 分钟）")
+                # 计数达标但完成位还没翻 —— 不说"完成"，把实情交给调用方
+                return False, (f"累计观看已达 {got / 1000.0:.0f} 秒（要求 "
+                               f"{required_ms / 60000.0:g} 分钟），但服务端尚未把任务点标为完成；"
+                               f"稍后重试或等待平台结算")
+
+
+def _await_finish(ctx: CompletionContext, seconds: float) -> bool:
+    """等待服务端把 ``isFinish`` 翻成 true（结算有延迟）。返回是否已翻转。"""
+    deadline = time.time() + seconds
+    group_id = (ctx.item.extra or {}).get("group_encry_id") or ctx.task.group_encry_id
+    while True:
+        if ctx.client.verify_plan_finished(ctx.task.encry_task_user_id, group_id,
+                                           ctx.item.plan_id) is True:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(5.0)
+
+
 _PLAY_KINDS = {
     "video": {"page": "videoStudy/learnPage", "data_log": "videoDataLog/dataLog",
               "entity": "video"},
@@ -1446,12 +1640,16 @@ def _parse_play_vo(html: str, entity: str) -> Optional[dict]:
 
 
 def _handle_play(ctx: CompletionContext, kind: str) -> tuple[bool, str]:
-    """视频/音频共用的完成逻辑：上报「开始播放」与「播放结束」。
+    """视频/音频共用的完成逻辑。
 
-    实测（2026-10，planId 4097446，时长 1362 秒）：服务端**接受一次到位的
-    进度上报**，`isFinish` 立即由 false 变为 true，无需按真实时长等待。
-    若某任务点设置了观看时长要求（``enableVideoWatchDuration``），服务端可能
-    拒绝跳跃，此时回退为分段上报，并在日志中说明。
+    分两条路，取决于任务点是否设了**累计观看时长**要求：
+
+    * **设了要求**（``enableVideoWatchDuration=1`` 等）：必须先按真实时间把
+      ``score.totalTime`` 补到 ``watchDuration × 60000`` 毫秒。一次性上报返回
+      ``result:true`` 是假象 —— 实测 ``totalTime`` 一点都不涨，这也是「上报成功
+      但状态仍为未完成」的唯一原因。见 :func:`_satisfy_watch_duration`。
+    * **没设要求**：服务端接受一次到位的进度上报（2026-10，planId 4097446，
+      时长 1362 秒，``isFinish`` 立即翻转），直接报「开始 + 到片尾」即可。
     """
     spec = _PLAY_KINDS[kind]
     url = ctx.study_url.get("url") or ""
@@ -1499,6 +1697,12 @@ def _handle_play(ctx: CompletionContext, kind: str) -> tuple[bool, str]:
         if not body.get("result"):
             return False, str(body.get("message") or body)
         return True, ""
+
+    # 0) 有累计观看时长要求时，必须真实把时间刷够，跳播取巧无效
+    required_ms = watch_duration_ms(ctx.item.extra, kind)
+    if required_ms > 0:
+        return _satisfy_watch_duration(ctx, kind, url, encry_id, duration,
+                                       required_ms, report, headers)
 
     # 1) 开始播放
     ok, msg = report(0, 0)
