@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import re
 import time
@@ -811,10 +812,34 @@ def _describe_ai_practice_items(client: FanyaTaskClient, course: dict, task: Fan
 
 
 def _window_reason(message: str) -> str:
-    """把服务端的窗口报错整理成给用户看的一句话。"""
-    if "不在学习时间内" in message:
-        return "学习窗口未开放（服务端拒绝进入），等窗口开启后再盘点即可读到模式"
-    return f"暂不可进入该任务点：{message[:60]}"
+    """把服务端的窗口报错整理成给用户看的一句话。
+
+    ★ 服务端对「还没开」和「已经关了」用的是**同一句**报错
+    （`任务学习时间：A至B，当前不在学习时间内`），必须自己比较 B 与当前时间，
+    否则会把「窗口已经结束、再也进不去」误说成「等窗口开启再来」——
+    那是在让用户白等。
+
+    实测（2026-10-15）：全账号 19 个被拒任务点的窗口终点全部落在
+    2026-09-07 ~ 2026-10-01，即**全部已过期**。
+    """
+    if "不在学习时间内" not in message:
+        return f"暂不可进入该任务点：{message[:60]}"
+
+    # 抽出窗口终点（「…至YYYY-MM-DD HH:MM」），判断到底是没开还是已关
+    m = re.search(r"至\s*(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})", message)
+    if not m:
+        return "学习窗口未开放（服务端拒绝进入）；窗口已关闭的任务点无法补完成，需联系老师处理"
+
+    try:
+        end = datetime.datetime(*(int(g) for g in m.groups()))
+    except ValueError:
+        return "学习窗口未开放（服务端拒绝进入）；窗口已关闭的任务点无法补完成，需联系老师处理"
+
+    span = m.group(0).lstrip("至 ")
+    if datetime.datetime.now() > end:
+        return (f"学习窗口已结束（{span}），平台不再允许进入 —— "
+                f"这类任务点无法补完成，需联系老师处理")
+    return f"学习窗口尚未开放（{span}），等窗口开启后再盘点即可读到模式"
 
 
 def _format_progress(value: Any) -> str:

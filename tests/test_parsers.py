@@ -399,6 +399,38 @@ def test_exam_answering_page_needs_save_url():
 
 
 # ----------------------------------------------------------------------
+# 学习窗口措辞：服务端对「还没开」和「已经关了」用同一句报错，
+# 必须自己比较终点与当前时间。实测 2026-10-15 全账号 19 个被拒任务点
+# 的窗口终点全部已过 —— 旧文案「等窗口开启后再盘点」是在让用户白等。
+# ----------------------------------------------------------------------
+def test_window_reason_says_expired_for_past_window():
+    msg = ("任务点学习时间：2026-09-13 20:26至2026-09-20 23:59，当前不在学习时间内")
+    out = _window_reason(msg)
+    assert "已结束" in out
+    assert "无法补完成" in out
+    assert "等窗口开启" not in out
+
+
+def test_window_reason_says_not_open_for_future_window():
+    future = "2099-09-01 00:00至2099-09-30 23:59"
+    out = _window_reason(f"任务学习时间：{future}，当前不在学习时间内")
+    assert "尚未开放" in out
+    assert "等窗口开启" in out
+
+
+def test_window_reason_handles_unparseable_window():
+    # 抽不出时间时不能瞎猜成「还没开」；要给出保守且不误导的说明
+    out = _window_reason("任务学习时间未知，当前不在学习时间内")
+    assert "未开放" in out
+    assert "等窗口开启" not in out
+
+
+def test_window_reason_passes_through_other_errors():
+    out = _window_reason("some other server error")
+    assert out.startswith("暂不可进入该任务点：")
+
+
+# ----------------------------------------------------------------------
 # 内置 runner：没装 pytest 也能跑（本仓库刻意保持零测试依赖）
 # ----------------------------------------------------------------------
 def _run_all() -> int:
