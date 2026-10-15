@@ -430,6 +430,68 @@ def test_window_reason_passes_through_other_errors():
     assert out.startswith("暂不可进入该任务点：")
 
 
+# ---------------- 浏览器通道（api/fanya_browser）----------------
+# 这些是纯逻辑/契约测试，**不启动浏览器**。
+
+def test_browser_module_imports_without_playwright():
+    # 模块必须能在没装 playwright 的环境里被导入（playwright 是可选依赖）
+    from api import fanya_browser as fb
+    assert callable(fb.read_document_in_browser)
+    assert issubclass(fb.BrowserUnavailable, RuntimeError)
+
+
+def test_document_learn_url_carries_epu():
+    from api.fanya_browser import document_learn_url
+    url = document_learn_url("BEDCjrlChRDhp@abc123")
+    assert url.startswith("https://task.chaoxing.com/documentStudy/learnPage?")
+    assert url.endswith("encryPlanUserId=BEDCjrlChRDhp@abc123")
+
+
+def test_browser_cookies_get_real_chaoxing_domain():
+    """requests 的 cookie domain 常是空串；必须改写成 .chaoxing.com。
+
+    否则 passport2.chaoxing.com 收不到 cookie，浏览器会被踢回登录页
+    （这是实测踩过的坑，不是理论风险）。
+    """
+    from api.fanya_browser import _cookies_for_playwright
+
+    class _C:
+        def __init__(self, name, value, domain):
+            self.name, self.value, self.domain = name, value, domain
+            self.path, self.secure = "/", False
+
+    class _Jar(list):
+        pass
+
+    class _S:
+        cookies = _Jar([
+            _C("JSESSIONID", "x", ""),                    # 空 domain → 要救回来
+            _C("uf", "y", None),                          # None → 也要救回来
+            _C("UID", "z", ".chaoxing.com"),              # 正常
+            _C("evil", "w", ".example.com"),              # 非 chaoxing → 丢掉
+        ])
+
+    out = _cookies_for_playwright(_S())
+    names = {c["name"] for c in out}
+    assert names == {"JSESSIONID", "uf", "UID"}
+    assert all(c["domain"] == ".chaoxing.com" for c in out)
+
+
+def test_browser_temp_dir_is_writable_and_used():
+    """必须把 TEMP/TMP/TMPDIR 指到工作区内的可写目录。
+
+    ★ 沙箱下 %TEMP% 不可写，Playwright 启动浏览器时 mkdtemp 会直接失败；
+      所以这一步必须在导入 playwright 之前完成。
+    """
+    import os
+    from api.fanya_browser import _prepare_temp
+
+    tmp = _prepare_temp()
+    assert os.path.isdir(tmp)
+    for key in ("TEMP", "TMP", "TMPDIR"):
+        assert os.environ[key] == tmp
+
+
 # ----------------------------------------------------------------------
 # 内置 runner：没装 pytest 也能跑（本仓库刻意保持零测试依赖）
 # ----------------------------------------------------------------------

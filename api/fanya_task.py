@@ -570,12 +570,14 @@ register_adapter(PLAN_TYPE_CHAPTER, "chapter", STATUS_AUTO, "章节",
 register_adapter(PLAN_TYPE_VIDEO, "video", STATUS_AUTO, "视频",
                  "上报 videoDataLog 观看进度（未设时长要求时一次到位即可；"
                  "设了要求则按真实时间补足累计观看时长）")
-# 文档：documentStudy/readEnd 只能把 completeWeightRate 置 100（「读完」），
-# 若该任务点还要求累计阅读时长，readEnd 一分一秒都不计入 totalTime。文档时长由云盘
-# 阅读器 iframe（pan-yz.chaoxing.com）经 data-xxt.aichaoxing.com/analysis/ac_mark 上报，
-# 纯 HTTP 复现不了 → 逐项在 resolve_item() 里降级说明。
+# 文档：documentStudy/readEnd 只能把 completeWeightRate 置 100（「读完」）。
+# 若该任务点还要求累计阅读时长，readEnd 一分一秒都不计入 totalTime，且阅读器的
+# ac_mark 埋点无法用 HTTP 重放（实测原样重发/篡改签名/伪造 h 都是 Δ=0）。
+# ★ 2026-10-15 起走**浏览器通道**（api/fanya_browser.py）：自动开真实浏览器滚到底，
+# 实测把 totalTime 从 0 补到 300000ms 并让 isFinish 翻转为 True（planId=8360000）。
 register_adapter(PLAN_TYPE_DOCUMENT, "document", STATUS_AUTO, "文档",
-                 "上报文档阅读完成（task.chaoxing.com/documentStudy/readEnd）")
+                 "上报文档阅读完成（task.chaoxing.com/documentStudy/readEnd）；"
+                 "若叠加累计阅读时长门槛，则自动改用真实浏览器滚动阅读补足")
 # 作业：mooc2 课程作业（mooc2/work/task?workId=&enc=），knowledgeid=0 且 jobid 为空，
 # 不在章节任务点里，无法复用 study_work → 需单独的课程作业适配器。
 register_adapter(PLAN_TYPE_WORK, "course_work", STATUS_AUTO, "作业",
@@ -681,8 +683,8 @@ def resolve_item(item: FanyaPlanItem) -> tuple[str, str, str]:
 
 
 #: 观看时长门槛逐项的说明与状态修正。
-#: 文档侧无法用 HTTP 补足，所以降到 ``manual``；视频/音频可以真实播放补足，
-#: 但仍要提醒耗时（半小时的视频就得真等半小时），因此降到 ``partial``。
+#: 文档侧 HTTP 补不了，但可以走**浏览器通道**（api/fanya_browser.py）真实滚动，
+#: 所以是 ``partial``；视频/音频同样要真实等待，也是 ``partial``。
 _WATCH_KIND_LABELS = {"video": "视频", "audio": "音频", "document": "文档"}
 
 
@@ -696,13 +698,13 @@ def _watch_duration_note(item: FanyaPlanItem, status: str) -> Optional[tuple[str
             continue
         minutes = required / 60000.0
         if kind == "document":
-            return (STATUS_MANUAL,
+            return (STATUS_PARTIAL,
                     f"文档还要求累计阅读 {minutes:g} 分钟：documentStudy/readEnd 只把"
                     f"「读完」置 100%，一分一秒都不计入 totalTime（实测等 40 秒再调、"
-                    f"连调 3 次都仍是 0）。真实时长由云盘阅读器 iframe 经 "
-                    f"data-xxt.aichaoxing.com/analysis/ac_mark 上报，纯 HTTP 复现不了 —— "
-                    f"请用 Edge 打开该文档并停留阅读；若你已在浏览器读过，"
-                    f"可用「重做模式」自动完成，平台会沿用已累计的时长")
+                    f"连调 3 次都仍是 0）；云盘阅读器的 ac_mark 埋点也无法用 HTTP 重放"
+                    f"（原样重发 / 篡改签名 / 伪造停留时长，三种都是 Δ=0）。"
+                    f"执行时会**自动打开真实浏览器并滚动阅读**来补足，需要真等到"
+                    f"{minutes:g} 分钟；这依赖可选的 playwright（未安装时如实报失败）")
         return (STATUS_PARTIAL,
                 f"{label}要求累计观看 {minutes:g} 分钟，只能按**真实经过时间**累计"
                 f"（跳到片尾 / 快进 / 连发心跳全部计 0，实测倍速约 0.63 倍被采信）。"
@@ -746,12 +748,19 @@ def _ai_practice_status(ai_mode: dict) -> tuple[str, str]:
         #       传章节记录 → 「会话不存在」   传外层记录 → 正常应答
         #   对照实测见 api/fanya_story.py 模块说明与 docs/FANYA_TASK_API.md。
         #
-        #   链路本身已通：add-chat 发言 → answer/submit 交卷 → evaluate/stream 评分。
-        #   仍不标「全自动」的原因：交卷**不可逆**（部分课程 enableReset=false），
-        #   不该由程序替用户按下去。
-        return STATUS_MANUAL, ("AI剧情型：链路已打通（发言 → 交卷 → 评分）；"
-                               "但交卷不可逆（部分课程 enableReset=false），"
-                               "故不代为提交，需你确认后再执行")
+        #   链路本身已通：add-chat 发言 → story-host-agent 驱动应答 →
+        #   answer/submit 交卷 → evaluate/stream 评分。
+        #   2026-10-14 实测：完整自动化在「审计抽样建模校验」拿到 **100 分**
+        #   （平台原文 totalScore=100，「完全符合满分标准」），任务点判定通过。
+        #
+        #   标 PARTIAL 而不是 AUTO 的原因（两条，都是真实缺口）：
+        #   1) 交卷**不可逆**（部分课程 enableReset=false），因此处理器默认
+        #      要 ``options["allow_ai_submit"]`` 才真的动手，审批模式下只出草稿；
+        #   2) 剧情的最后一章往往是**上传作品**节点（subtype=1），尚未自动化。
+        return STATUS_PARTIAL, ("AI剧情型：已真机验证（发言 → 智能体应答 → 交卷 → "
+                                "评分，2026-10-14 实测满分 100）。两条边界：交卷不可逆"
+                                "（需显式开启「允许 AI实践直接提交」才执行）；剧情末尾的"
+                                "「上传作品」节点尚未自动化，遇到会停下并请你手动上传")
     return STATUS_PENDING, f"{ai_mode.get('modeLabel') or '未知模式'}：暂未支持自动完成"
 
 
@@ -1466,10 +1475,15 @@ def handle_document(ctx: CompletionContext) -> tuple[bool, str]:
     * 真等 40 秒再调 ``readEnd``、连调多次，``totalTime`` 仍是 ``None``；
     * ``documentStudy`` 下**没有** ``dataLog`` 之类的时长端点（4 个候选全 404）。
 
-    文档的时长由云盘阅读器 iframe（``pan-yz.chaoxing.com``）自己另走一条
-    跨域埋点通道（``data-xxt.aichaoxing.com/analysis/ac_mark``）上报，纯 HTTP
-    复现不了 —— 它的参数在混淆 JS 里。所以这里如实返回失败，而不是让外层
-    打印一条「提交成功但状态仍为未完成」再把它算作成功。
+    文档的时长由云盘阅读器 iframe（``pan-yz.chaoxing.com``）按停留时间累计：
+    学生真实滚动、阅读器判到底后才 ``postMessage({isFinished:1})``。
+    ★ 该埋点（``data-xxt.aichaoxing.com/analysis/ac_mark``）**纯 HTTP 重放无效** ——
+    抓到的 URL 原样重发（带正确 ``enc`` 签名）、篡改签名、伪造停留毫秒 ``h``，
+    三种都让 ``totalTime`` 保持 Δ=0。
+
+    因此叠加了时长门槛的文档**必须走浏览器通道**：见 ``api/fanya_browser.py``。
+    这里先做 HTTP 的 ``readEnd``（把「读完」置 100%），再用真实浏览器滚动补足时长。
+    浏览器不可用时**如实返回失败**并说明原因，不假装成功。
     """
     url = ctx.study_url.get("url") or ""
     match = re.search(r"encryPlanUserId=([^&\s]+)", url)
@@ -1502,19 +1516,61 @@ def handle_document(ctx: CompletionContext) -> tuple[bool, str]:
     if not body.get("result"):
         return False, f"上报文档阅读完成被拒绝: {body.get('message') or body.get('msg') or body}"
 
-    # 已报到「读完」，但若还叠加了累计观看时长门槛，纯 HTTP 就到不了终点。
+    # 没设时长门槛：readEnd 就够了。
     required_ms = watch_duration_ms(ctx.item.extra, "document")
-    if required_ms > 0:
-        got = _optional_watched_ms(ctx)
-        if got is not None and got < required_ms:
-            return False, (
-                f"已上报「文档阅读完成」（阅读进度 100%），但该任务点还要求累计阅读 "
-                f"{required_ms / 60000.0:g} 分钟；服务端当前只记了 {got / 1000.0:.0f} 秒。"
-                f"文档时长由云盘阅读器（pan-yz.chaoxing.com）的跨域埋点另行上报，"
-                f"纯 HTTP 无法复现 —— 请在浏览器里打开该文档并停留阅读，"
-                f"或改用「重做模式」在浏览器中完成。"
-            )
-    return True, "已上报文档阅读完成"
+    if required_ms <= 0:
+        return True, "已上报文档阅读完成"
+
+    # 叠加了累计阅读时长门槛 —— 纯 HTTP 到不了终点，改用浏览器通道。
+    got = _optional_watched_ms(ctx)
+    if got is not None and got >= required_ms:
+        return True, (f"已上报文档阅读完成；累计阅读已达标（服务端记 "
+                      f"{got / 1000.0:.0f} 秒 ≥ {required_ms / 60000.0:g} 分钟）")
+
+    logger.info(
+        "文档「{}」要求累计阅读 {:.0f} 分钟（服务端已记 {}），改用真实浏览器滚动补足",
+        ctx.item.name, required_ms / 60000.0,
+        f"{got / 1000.0:.0f} 秒" if got is not None else "未知",
+    )
+
+    try:
+        from api import fanya_browser
+    except ImportError as exc:  # pragma: no cover - 理论上不会发生
+        return False, f"浏览器通道模块不可用：{exc}"
+
+    try:
+        budget = float(ctx.options.get("doc_read_max_seconds") or 1800.0)
+    except (TypeError, ValueError):
+        budget = 1800.0
+
+    def _read_state() -> tuple:
+        """回读 (isFinish, totalTime_ms, completeWeightRate)。"""
+        group_id = (ctx.item.extra or {}).get("group_encry_id") or ctx.task.group_encry_id
+        raw = ctx.client.get_plan_item(ctx.task.encry_task_user_id, group_id,
+                                       ctx.item.plan_id) or {}
+        score = raw.get("score") or {}
+        return (bool(raw.get("isFinish")), watched_ms(score),
+                score.get("completeWeightRate"))
+
+    try:
+        ok, detail = fanya_browser.read_document_in_browser(
+            ctx.client.session,
+            fanya_browser.document_learn_url(encry_plan_user_id),
+            required_ms,
+            _read_state,
+            budget_seconds=budget,
+            headless=bool(ctx.options.get("browser_headless", True)),
+            on_log=logger.info,
+        )
+    except fanya_browser.BrowserUnavailable as exc:
+        return False, (
+            f"已上报「文档阅读完成」（阅读进度 100%），但该任务点还要求累计阅读 "
+            f"{required_ms / 60000.0:g} 分钟。文档时长只能由真实浏览器滚动阅读产生"
+            f"（HTTP 的 readEnd 不计时长，埋点也不可重放），而浏览器通道当前不可用："
+            f"{exc}。请安装 playwright 后重试，或用浏览器手动打开该文档停留阅读。"
+        )
+
+    return ok, detail
 
 
 # ----------------------------------------------------------------------

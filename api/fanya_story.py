@@ -429,6 +429,72 @@ def parse_total_score(text: str) -> Optional[float]:
         return None
 
 
+ANSWER_INIT = f"{ld.MOOC_ANS_DOMAIN}/mooc2-ans/ai-evaluate/v2/answer/init"
+
+
+def reopen_chapter(session: requests.Session, base: dict,
+                   chapter_uuid: str) -> Optional[str]:
+    """★ 重开本章作答，返回新的章节记录 UUID（失败返回 ``None``）。
+
+    ``init-chain-answer`` 只在"任务链顺位推进"时可用；一旦本章的**当前**作答是
+    一条失败记录（``condition.hit=false``），它就会拒绝并报
+    「任务链无法跳转到下一章节」—— 此时页面上的「重新作答」走的是**另一个**接口。
+
+    实测（2026-10-15，planId=8519975 第 1 章）::
+
+        POST /mooc2-ans/ai-evaluate/v2/answer/init
+             ?courseid=&clazzid=&cpi=&publishRelationUuid=
+             data: {"type": 7, "chapterUuid": <章>, "recordUuid": <外层记录>}
+        -> {"status": true,
+            "data": {"recordUuid": "7629554e-…",     ← 新的章节记录
+                     "answerUuid": "acc675f9-…",
+                     "picPreviewPrefix": "https://p.ananas.chaoxing.com/star3/origin/"}}
+
+    三个字段缺一不可（都实测过）：
+
+    * 缺 ``recordUuid`` → 「当前作答状态不满足重新作答」(errorCode 9001)
+    * 缺 ``chapterUuid`` → 「已存在未完成的作答记录」(errorCode 4601)
+    * ``type`` 必须是本题的作答类型（AI剧情 = 7）
+
+    重开**不会**消耗作答次数（实测 ``answerCount`` / ``remainAnswerCount`` 不变），
+    也会保留全部历史记录（``answerRecord`` 只增不减）。
+    """
+    params = {
+        "courseid": base.get("courseId") or "",
+        "clazzid": base.get("classId") or "",
+        "cpi": base.get("cpi") or "",
+        "publishRelationUuid": base.get("publishRelationUuid") or "",
+    }
+    payload = {
+        "type": ld.MODE_STORY,
+        "chapterUuid": chapter_uuid,
+        "recordUuid": base.get("recordUuid") or "",
+    }
+    try:
+        r = session.post(ANSWER_INIT, params=params, data=payload, timeout=60.0,
+                         headers=HEADERS)
+    except requests.RequestException as exc:
+        logger.debug("answer/init 请求失败: {}", exc)
+        return None
+    if r.status_code != 200:
+        logger.debug("answer/init 返回 HTTP {}", r.status_code)
+        return None
+    try:
+        body = r.json()
+    except ValueError:
+        logger.debug("answer/init 返回非 JSON: {}", r.text[:160])
+        return None
+    if not body.get("status"):
+        logger.debug("answer/init 被拒: {}", body.get("msg") or body.get("errorMsg"))
+        return None
+    data = body.get("data") or {}
+    record = data.get("recordUuid") if isinstance(data, dict) else None
+    if not record:
+        return None
+    logger.info("已用 answer/init 重开本章作答：{}", str(record)[:8])
+    return str(record)
+
+
 def init_chapter_chain(session: requests.Session, base: dict,
                        chapter_uuid: str, fallback_record: str = "") -> str:
     """为新章节开链，返回该章的 ``chapterRecordUuid``。
@@ -440,9 +506,15 @@ def init_chapter_chain(session: requests.Session, base: dict,
     实测：``{"data": "98224ca7-…", "status": true}``；不带 ``chapterUuid`` 会得到
     「作答信息为空」。
 
-    幂等处理：服务端在已有未交卷记录时会拒绝（「存在作答中的记录，不允许重新开始
-    新的作答」）。此时若调用方给出了 ``fallback_record``（当前进行中的记录），
-    就直接复用它继续作答 —— 否则整条流程会因为一次重跑而彻底卡死。
+    两级兜底（顺序不能颠倒）：
+
+    1. 服务端在已有未交卷记录时会拒绝（「存在作答中的记录，不允许重新开始
+       新的作答」）。此时若调用方给出了 ``fallback_record``（当前进行中的记录），
+       就直接复用它继续作答 —— 否则整条流程会因为一次重跑而彻底卡死。
+    2. ★ 若报的是「任务链无法跳转到下一章节」（= 本章当前作答未达标），
+       说明平台不允许按链推进，只有页面的「重新作答」能开新记录 ——
+       改调 :func:`reopen_chapter`。**这是解卡的关键的一步**：
+       没有它，一条失败记录会把整个剧情永久锁死。
     """
     try:
         data = _get(session, "init-chain-answer", {**base, "chapterUuid": chapter_uuid},
@@ -452,6 +524,9 @@ def init_chapter_chain(session: requests.Session, base: dict,
         if fallback_record and ("作答中" in msg or "不允许重新开始" in msg):
             logger.info("该章已有作答中的记录，复用它继续：{}", fallback_record[:8])
             return str(fallback_record)
+        record = reopen_chapter(session, base, chapter_uuid)
+        if record:
+            return record
         raise
     record = data if isinstance(data, str) else (data or {}).get("recordUuid")
     if not record:
@@ -818,8 +893,20 @@ def complete_story_task(session: requests.Session, course: dict, study_url: dict
         if info.get("title"):
             title = str(info["title"])
             chapter = {**chapter, "title": title}
-        chapter_record = init_chapter_chain(session, base, chapter_uuid,
-                                            fallback_record=str(chapter.get("chapterRecordUuid") or ""))
+
+        # ★ 先看有没有**已经开着但还没交卷**的记录（``status=0``）——
+        #   有就直接续作答，**不要再调 init**：重复开新记录会被服务端拒
+        #   （「已存在未完成的作答记录」），而且会平白多留一条空记录。
+        #   注意 ``_enter_and_load_chapter`` 造出来的新章对象 status 固定是 0、
+        #   chapterRecordUuid 固定是 ""，所以必须两个条件同时成立才算"已开着"。
+        open_record = ""
+        if int(chapter.get("status") or 0) == 0:
+            open_record = str(chapter.get("chapterRecordUuid") or "")
+        if open_record:
+            log(f"「{title}」已有一条未交卷的记录 {open_record[:8]}…，直接续作答")
+            chapter_record = open_record
+        else:
+            chapter_record = init_chapter_chain(session, base, chapter_uuid)
         log(f"「{title}」作答记录 {chapter_record[:8]}…")
 
         # 该章自己的数据（含 requirement —— load-data 带 chapterRecordUuid 才有，
@@ -838,7 +925,12 @@ def complete_story_task(session: requests.Session, course: dict, study_url: dict
         role_uuid = pick_role_uuid(chats, roles)
         if not role_uuid:
             raise StoryAbort("未能确定学生角色 roleUuid，无法发言")
-        requirement = chapter.get("requirement") or ""
+        # ★ 这里曾有一行 ``requirement = chapter.get("requirement") or ""``，
+        #   会把上面刚从 ``load-data`` 取到的 requirement **覆盖成空串**——
+        #   ``go-chapter`` / ``get-progress`` 返回的章节对象里根本没有
+        #   ``requirement`` 字段，只有 ``load-data(带 chapterRecordUuid)`` 才有。
+        #   后果是每轮喂给智能体的提示词都缺了题目背景，评分自然难看。
+        #   现已删除：requirement 一律沿用上面取到的那份。
         # ★ 本题允许的对话轮数取「用户设置」与「平台 maxRound」的较小值。
         #   无视平台上限会把对话灌坏（实测第 2 章 maxRound=1 却发了 3 轮 → 0 分）。
         cap = chapter_max_round(chats, chapter_uuid)

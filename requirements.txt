@@ -13,3 +13,10 @@ ddddocr
 tqdm>=4.67.1
 httpx>=0.28.1
 urllib3>=2.5.0
+
+# 可选：浏览器通道（api/fanya_browser.py）
+# 补齐「累计阅读时长」门槛的文档任务点 —— 这类时长只能由真实浏览器滚动阅读产生
+# （HTTP 的 documentStudy/readEnd 不计入 totalTime，阅读器的 ac_mark 埋点也不可重放）。
+# 不装不影响其它功能：未安装时这些任务点会如实报失败，不会假装完成。
+#   pip install playwright && playwright install msedge
+playwright>=1.40.0
