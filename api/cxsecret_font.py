@@ -38,13 +38,23 @@ def resource_path(relative_path: str) -> str:
     Returns:
         资源文件的绝对路径
     """
+    # 统一交给 api.paths：打包后是解压目录（_MEIPASS），源码运行是项目根目录，
+    # 都基于 __file__ 而不是**当前工作目录**。这里以前用 os.path.abspath(".")，
+    # 于是只有 cwd 正好是项目根时才找得到 font_map_table.json（1.6 MB 的
+    # 超星字体混淆映射表）；换个目录启动就会静默退化成「无映射」，
+    # 题目文字还原不出来，答题内容跟着错。
+    from api.paths import bundle_path
+
+    direct = bundle_path(relative_path)
+    if os.path.exists(direct):
+        return direct
+
+    # 兜底：老行为（cwd 相对 / PyInstaller 的 _MEIPASS）
     try:
-        # PyInstaller创建临时文件夹，定位路径
         base_path = sys._MEIPASS
     except Exception:
-        # 非打包环境，使用当前目录
         base_path = os.path.abspath(".")
-    
+
     return os.path.join(base_path, relative_path)
 
 

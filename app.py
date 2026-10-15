@@ -179,6 +179,45 @@ def web_config():
 
     return jsonify({'status': True, 'msg': '保存成功'})
 
+
+@app.route('/api/ai/test', methods=['POST'])
+def ai_test():
+    """AI 配置页的「测试连接」：真发一条极短请求，把模型侧原话带回来。
+
+    请求可只带 ``{"tiku_config": {...}}``；不带（或为空）时用本地已保存的
+    ``settings.tiku_config``，方便前端「先读配置、再点测试」。
+    """
+    try:
+        body = request.json if isinstance(request.json, dict) else {}
+        tiku_config = body.get('tiku_config')
+        if not isinstance(tiku_config, dict) or not tiku_config:
+            saved = load_web_config() or {}
+            tiku_config = (saved.get('settings') or {}).get('tiku_config') \
+                or saved.get('tiku_config') or {}
+        if not isinstance(tiku_config, dict):
+            tiku_config = {}
+
+        from api.fanya_task import ContentGenerator
+
+        result = ContentGenerator.from_tiku_config(tiku_config).ping()
+        if not result['ok']:
+            # 失败也把 model/latency 带回去：前端能在界面上显示「发到哪个模型、等了多久」
+            return jsonify({
+                'status': False,
+                'msg': result['error'],
+                'data': {'ok': False, 'model': result['model'], 'latency': result['latency']},
+            })
+        return jsonify({
+            'status': True,
+            'data': {
+                'ok': True, 'model': result['model'],
+                'latency': result['latency'], 'sample': result['sample'],
+            },
+        })
+    except Exception as e:
+        logger.error(f"AI 接口测试错误: {e}")
+        return jsonify({'status': False, 'msg': str(e)}), 500
+
 @app.route('/api/start', methods=['POST'])
 def start_study():
     """开始学习任务"""

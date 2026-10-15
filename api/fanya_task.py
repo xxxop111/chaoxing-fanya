@@ -417,6 +417,10 @@ class ContentGenerator:
         self.model = (model or "").strip()
         self.timeout = timeout
         self.max_retries = max_retries
+        #: 最近一次 ``_chat`` 失败的原文（形如 ``HTTP 401: {...}``）。
+        #: 生成类调用只看得到 ``None``，而「测试连接」需要把模型侧原话显示给用户，
+        #: 所以在这里留一份，避免为了报错再发一次请求。
+        self.last_error: str = ""
 
     @classmethod
     def from_tiku_config(cls, tiku_config: Optional[dict]) -> "ContentGenerator":
@@ -432,7 +436,9 @@ class ContentGenerator:
         return bool(self.endpoint and self.key and self.model)
 
     def _chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int = 900) -> Optional[str]:
+        self.last_error = ""
         if not self.available:
+            self.last_error = "未配置 AI 接口（endpoint / key / model 都不能为空）"
             logger.warning("未配置 AI 接口（endpoint/key/model），无法生成作答内容")
             return None
 
@@ -470,11 +476,45 @@ class ContentGenerator:
                 return content
             except Exception as exc:  # noqa: BLE001 - 生成失败需回退到模板
                 last_error = exc
+                self.last_error = str(exc)
                 logger.warning("AI 生成失败（第 {}/{} 次）: {}", attempt, self.max_retries, exc)
                 if attempt < self.max_retries:
                     time.sleep(1.5 * attempt)
         logger.error("AI 生成最终失败: {}", last_error)
+        self.last_error = str(last_error) if last_error else "模型没有返回内容"
         return None
+
+    def ping(self, prompt: str = "请只回复两个字符：OK", *, max_tokens: int = 16) -> dict:
+        """连通性自检，供「AI 接口配置」页的「测试连接」按钮使用。
+
+        真发一条极短请求（温度 0、16 token），因此能验证 endpoint / key / model
+        三项是否真的可用，而不是只看字段填没填。
+
+        返回 ``{"ok": bool, "model": str, "latency": int, "sample": str, "error": str}``：
+        失败时 ``error`` 是模型侧原话（例如 ``HTTP 401: {"error":...}``），
+        ``latency`` 单位毫秒（含重试耗时）。
+        """
+        started = time.perf_counter()
+        if not self.available:
+            return {
+                "ok": False, "model": self.model, "latency": 0, "sample": "",
+                "error": "未配置 AI 接口（endpoint / key / model 都不能为空）",
+            }
+        text = self._chat(
+            [{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=max_tokens,
+        )
+        latency = int((time.perf_counter() - started) * 1000)
+        if not text:
+            return {
+                "ok": False, "model": self.model, "latency": latency, "sample": "",
+                "error": self.last_error or "模型没有返回内容",
+            }
+        return {
+            "ok": True, "model": self.model, "latency": latency,
+            "sample": text.strip()[:200], "error": "",
+        }
 
     def generate_discussion_reply(self, topic: str, course_title: str = "",
                                   min_chars: int = 120) -> Optional[str]:
