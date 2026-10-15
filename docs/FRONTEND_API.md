@@ -88,14 +88,22 @@
 
 ### 2.5 静态托管
 
-* `GET /` → `web/dist/index.html`；`GET /<任意非 api 路径>` → 命中真实文件就返回该文件，
-  否则回退 `index.html`（SPA 客户端路由可用）。
-* `GET /api/...` 永远不会命中静态回退。
-* **但「路径不存在」的 404 有两种形态**，前端要都能吃：
-  * 已知接口内部找不到资源（例如 `task_id` 过期）→ 本规范定义的 **JSON** `{"status": false, "msg": ...}`；
-  * 路径本身没注册（例如拼错）→ **Flask 默认的 HTML 404**
-    （`<!doctype html>…<title>404 Not Found</title>`，实测 `/api/nope` 就是这样）。
-    所以取响应体前先看 `Content-Type`，别无条件 `response.json()`。
+* `GET /` → `web/dist/index.html`。
+* **客户端路由可用**：`GET /<任意非 api 路径>` 先当成真实文件去 `web/dist` 里找（命中就返回，
+  哈希过的资源可以正常缓存），找不到时按下面规则处理 —— 这决定了你的路由该怎么写：
+  * `Accept` 含 `text/html` **且**路径末段没有扩展名（「整页导航」的特征）
+    → 返回 `index.html`（200）。所以 `BrowserRouter` 那种 `/tasks`、`/courses/123/detail`
+    直接刷新也能正常打开；
+  * 其余（`.js` / `.css` / 图片等缺失资源，或 `fetch()` 默认的 `Accept: */*`）
+    → **JSON 404** `{"status": false, "msg": "Not Found"}`，
+    不会回 200 + HTML（那会让浏览器报 MIME 错误，掩盖真正的 404）。
+* `GET /api/...` 永远不会命中静态回退：未注册的 `/api/` 路径**一律 JSON 404**，
+  即使整页导航过去也只给 JSON。
+* 已知接口内部找不到资源（例如 `task_id` 过期）→ 同样是 JSON
+  `{"status": false, "msg": ...}`（HTTP 400 / 401 / 404 / 500）。
+  历史坑：早期版本里「路径没注册」会落到 Flask 默认的 HTML 404
+  （`<!doctype html>…<title>404 Not Found</title>`），现在已统一成 JSON；
+  仍然建议取响应体前看一眼 `Content-Type`，别无条件 `response.json()`。
 * HTML 响应带 `Cache-Control: no-store`；哈希过的静态资源可以正常缓存。
 * **不要假设后端有前端构建**：没有 `web/dist` 时 `/` 返回 404 JSON
   `{"status": false, "msg": "前端未构建…"}`。

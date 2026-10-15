@@ -210,12 +210,45 @@ def main() -> int:
 
         return _run
 
+    def raw(
+        path: str,
+        *,
+        accept: str = "",
+        expect_status: int = 200,
+        contains: str = "",
+        want_json: bool = False,
+    ):
+        """按状态码/内容类型校验的通用探针（前端托管的契约靠它守着）。"""
+
+        def _run():
+            headers = {"Accept": accept} if accept else {}
+            r = s.request("GET", url + path, headers=headers, timeout=20)
+            if r.status_code != expect_status:
+                return False, f"HTTP {r.status_code}（期望 {expect_status}）{r.text[:120]!r}"
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if want_json and "json" not in ctype:
+                return False, f"Content-Type={ctype!r}（应为 JSON）"
+            if contains and contains not in r.text:
+                return False, f"响应里找不到 {contains!r}"
+            return True, f"HTTP {r.status_code}（{ctype or '无 Content-Type'}）"
+
+        return _run
+
     checks = [
         ("GET /api/health", http("GET", "/api/health")),
         ("GET /api/heartbeat（桌面壳）", http("GET", "/api/heartbeat")),
         ("POST /api/heartbeat（桌面壳）", http("POST", "/api/heartbeat")),
         ("GET /api/version", http("GET", "/api/version")),
         ("GET /（前端已收进包）", http("GET", "/", expect_json=False, contains='id="root"')),
+        ("GET /tasks（客户端路由兜底到 index.html）", raw("/tasks", accept="text/html", contains='id="root"')),
+        (
+            "GET /assets/missing.js（缺失资源如实 404）",
+            raw("/assets/missing.js", accept="*/*", expect_status=404, want_json=True),
+        ),
+        (
+            "GET /api/nope（未知接口 JSON 404）",
+            raw("/api/nope", accept="application/json", expect_status=404, want_json=True),
+        ),
     ]
     for label, fn in checks:
         if not check(label, fn):

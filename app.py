@@ -1003,6 +1003,36 @@ def serve_static(path):
     return jsonify({'status': False, 'msg': '前端未构建'}), 404
 
 
+@app.errorhandler(404)
+def spa_fallback(error):
+    """把前端的客户端路由兜底到 index.html。
+
+    为什么需要它：``Flask(__name__, static_folder=STATIC_DIR, static_url_path='')``
+    在应用创建时就自动注册了一条 ``/<path:filename>`` 静态路由，它与下面的
+    ``serve_static`` 形状相同但注册更早，于是 ``/tasks`` 这类前端路由会先命中静态路由、
+    拿静态目录里找不到文件后直接 404（实测打包版返回的是 Flask 的 HTML 404 页），
+    ``serve_static`` 里那段「SPA 兜底」从来没有机会执行。
+
+    这里用 404 处理器补上，判据刻意保守：
+
+    * ``/api/`` 命名空间一律 JSON 404（前端要靠 ``status`` 字段判断，不该拿到 HTML）；
+    * 只有「像是页面导航的 GET」才回 index.html —— 即 ``Accept`` 含 ``text/html``
+      且末段没有扩展名；
+    * 缺失的静态资源（``.js`` / ``.css`` / ``.png`` …）如实 404，
+      免得浏览器拿到 200 + HTML 后报出莫名其妙的 MIME 错误。
+    """
+    path = request.path or ''
+    if path.startswith('/api/'):
+        return jsonify({'status': False, 'msg': 'Not Found'}), 404
+    if not os.path.exists(STATIC_DIR):
+        return jsonify({'status': False, 'msg': '前端未构建'}), 404
+    accept = request.headers.get('Accept') or ''
+    name = os.path.basename(path.rstrip('/'))
+    if request.method == 'GET' and 'text/html' in accept and '.' not in name:
+        return send_from_directory(STATIC_DIR, 'index.html')
+    return jsonify({'status': False, 'msg': 'Not Found'}), 404
+
+
 if __name__ == "__main__":
     # 端口/监听地址/调试模式都可用环境变量覆盖，便于桌面版以更安全的参数启动
     host = os.environ.get("CHAOXING_HOST", "0.0.0.0")

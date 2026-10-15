@@ -131,7 +131,9 @@ Inno 于是整体回滚（日志：
 3. `GET|POST /api/heartbeat`、`POST /api/window-closed` 已注册（桌面壳的关窗协议，缺了会关不掉窗）；
 4. `GET /api/version` 正常；
 5. `GET /` 返回含 `id="root"` 的 HTML（证明 `web/dist` 被收进包，而不是只有一个后端）；
-6. `--stop` 能干净停下。
+6. `GET /tasks`（带 `Accept: text/html`）也返回 `index.html` —— 前端用客户端路由时，直接刷新不能 404；
+7. `GET /assets/missing.js` 与 `GET /api/nope` 都是 **JSON 404**，不是 200 + HTML；
+8. `--stop` 能干净停下。
 
 退出码 0 = 全过；失败时会打印 `desktop_app.log` 末尾若干行。已经跑着实例时它不会启第二个进程，
 而是直接对现有实例做检查。
