@@ -624,3 +624,105 @@ type-2 分支；作答接口在 SPA 的懒加载 chunk 里。与另外两种模�
 > ⚠️ 探测副作用（如实记录）：调用 `go-chapter` 会让服务端初始化一条**空**对话
 > （`storyExtraData.chat` 由 0 条变 1 条）；`answer/init` 在已有未完成记录时被拒，
 > 故未新建作答卷。**`add-chat` 一旦调用就会写入真实对话内容，不可撤销。**
+
+---
+
+## 8. AI剧情（type=7）做到全自动 —— 2026-10-15 实测补遗
+
+以下每一条都是当天在本课程（`planId=8519975`，5 章：4 章情景对话 + 1 章上传）上
+跑出来的，取代本文件前面若干"当时未能确定"的猜测。
+
+### 8.1 推进任务链：`init-chain-answer` 的正解是 `nextChapterUuid`
+
+| 传参 | 结果 |
+| --- | --- |
+| `chapterUuid=<目标章>`（旧实现） | **被忽略**，服务端退回"链上第一个未完成节点"（永远是第 1 章）—— run4 里它给"第 2 章"开的记录其实是**第 1 章的第 15 次作答**，把已到手的 100 分覆盖成 0 分 |
+| **`nextChapterUuid=<目标章>`** ✅ | `{"data":"<章节记录 uuid>","status":true}`，定向开出目标章的记录（实测一次成功） |
+| `nextChapterUuid=…&isAnswerAgain=true` | `{"msg":"当前作答状态不满足重新作答"}` —— `isAnswerAgain` 属于 `answer-again`，推进时**不能**带 |
+
+* 断言归属**只能**看 `load-data(...).storyExtraData.title`：顶层 `title` 是任务名
+  （「离散型随机变量 AI 实践（审计与风控案例）」），章名在 `storyExtraData.title`
+  （「审计抽样建模校验」…）。写内容之前必须先校验，否则会把对话写到错章上。
+* `answer/init`（本项目里的 `reopen_chapter`）会**额外留一行 `status=-1` 的同章记录**；
+  而"链上第一个未完成节点"正是按这行定位的 ⇒ 它会**把自己堵死**。只在确实需要
+  重开时才调，不要每次续跑都调。
+
+### 8.2 推进规则与通过门槛只在 `progress[].payload.condition.rule`
+
+`progress[].payload` 是**字符串形式的 JSON**，其中
+
+```json
+{ "condition": { "dimension": "总分",
+    "rule": [ {"from": 0,  "to": 89,  "nextChapter": "<自己>"},
+              {"from": 90, "to": 100, "nextChapter": "<下一章 uuid>"} ] } }
+```
+
+* `nextChapter != 本章` 的那条就是"前进口"，其 `from` 就是**通过门槛**（实测都是 90）。
+* `progress[].condition[]` **形状不一致**：第 1 章只有 `name:"分数达到90分"`，
+  第 2 章起只有 `from`/`to`/`dimension`。靠「…分」字面量解析的
+  `condition_threshold()` 从第 2 章起恒为 `None` ⇒ "已通过就跳过"永远不成立，
+  满分的章会被**完整重答一遍**（实测）。
+* `dimension: "总分"` 指的是**链级总分**：`POST v2/answer/submit`（只带
+  `courseid/clazzid/cpi/recordUuid`）+ `GET /ai-ans/ai-evaluate/v2/evaluate/stream`
+  **不带 `chapterRecordUuid`** = 链级评估，返回
+  `{"chainTitle":…,"totalScore":26,"completedNodeCount":1,"dimensionScores":[…]}`。
+  它是**只读预览，不写库**（评估前后外层 `answerScore` 都是 0.0）。
+  整链没做完时它必然 < 90，所以 `condition[].hit` 恒 `false` ——
+  但**推进并不依赖 `hit`**，`nextChapterUuid` 照样能跳过去。
+
+### 8.3 得 0 分还是 100 分：评卷器要的是**对话里的正文**
+
+* 学生发言由 `story-host-agent`(SSE) 落库（**不要**再用 `add-chat` 重发一次，
+  实测那样每轮会写两条一模一样的消息）。
+* **智能体的回复正文必须自己补**：`story-host-agent` 只推角色元数据与 `intent`，
+  真正的回复正文走语音 WebSocket；纯文字路径下没人落库。用
+  `POST story/add-chat`（`chapterRecordUuid` + `roleUuid=<智能体 roleUuid>`）写进去。
+  * 第 2 章缺它 → **0 分**，评语原文：「对话历史中仅包含学生发送的提示词，
+    **缺失智能体（统计专家）的回复内容**…故判定为未完成」。
+  * 补上后 → **100 分**：「完整获取了任务要求的所有统计量…无缺失或错误」。
+* 题目里可能有**多段**「AI提示词」，必须**依次逐段**提问：
+  * 第 4 章有两段（77 字 + 83 字），只发第一段 → **40 分**，评语原文：
+    「**遗漏了关于泊松分布的第二组案例建模与解读**…每缺失1个要点扣20-30分」。
+  * 轮流逐段发 → **100 分**。
+  * 解析：`_PROMPT_RE.finditer(requirement)` 取全部段落（`extract_prompts()`），
+    并把轮数下限抬到段数（平台 `maxRound=1` 会把它压到 1）。
+
+### 8.4 上传章（`subtype=1`）
+
+* 上传页 URL —— **`chapterUuid` 与 `chapterRecordUuid` 必须同时带**：
+
+  ```
+  GET /ai-evaluate/v2/answer?courseid=&clazzid=&cpi=&publishRelationUuid=
+      &chapterUuid=<章>&chapterRecordUuid=<章节记录>&__from=taskEngine
+  ```
+
+  少任何一个都会被 302 回任务链 SPA 页（13563 字节，没有 `#uploadEnc`）。
+  带上之后是 207987 字节的作答页，`parse_hidden_inputs` 能取到
+  `currentTime` / `currentUploadEnc` / `currentUserId`。
+* 传网盘：`POST https://mooc1.chaoxing.com/upload-ans/upload/uploadNew
+  ?t=<currentTime>&enc2=<currentUploadEnc>&userId=<currentUserId>`，
+  `files={"file": (name, blob, "image/png")}` → 返回 `url` 即 `fileObjectId`。
+* 挂附件：`POST /mooc2-ans/ai-evaluate/v2/answer/update-file`
+  **`recordUuid=<外层记录>` + `chapterRecordUuid=<章节记录>`**，
+  `data={"type": 7, "files": JSON.stringify([{fileObjectId, fileType, fileName}])}`。
+  * 传**章节记录**给 `recordUuid` → `{"msg":"作答记录不存在","status":false}`
+    （与 `evaluate/stream` 同一套"外层=会话、章节=章节"约定）。
+  * 扁平数组（`fileName`，不是 `name`）实测被接受并如期回显；
+    `file-mode/answer.js` 发的是卡片式 `[{fileCardId, files:[…]}]`，可作兜底。
+* **回读校验**：`load-data(<章节记录>)` 的 `files` / `fileObjectId` 有值才交卷 ——
+  服务端对不认识的载荷是"静默成功"，交上去会是一条**没有附件的空记录**。
+* 交卷、评分、门槛与对话章完全一致（门槛取该章 `rule.from` = 90）。
+
+### 8.5 零碎但致命的坑
+
+* 上传章**没有开场白角色**，`go-chapter` 会答「章节开场白角色为空」并抛错 ⇒
+  `subtype` 判断必须放在 `enter_chapter`（`go-chapter`）**之前**。
+  `go-chapter` 不返回 `subtype`，可靠的 `subtype` 在 `get-progress` 行或
+  `load-data` 里。
+* `api/fanya_story.py` 里的 `ld` 是 `api.fanya_ai`，**没有** `parse_hidden_inputs`
+  （那个助手在 `api.fanya_ladder`）。run16 就死在
+  `AttributeError: module 'api.fanya_ai' has no attribute 'parse_hidden_inputs'`。
+* `go-home` 永远返回**链首**（第 1 章），不能拿它判断"平台当前章"；
+  可靠的当前章是 `get-progress.progress[]` 里第一条 `status != 2` 的行。
+* `visited` 防空转守卫：`get-progress` 有滞后，推进不顺时会原地打转。
+

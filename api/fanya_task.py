@@ -1321,7 +1321,9 @@ class FanyaTaskRunner:
             result["message"] = message or ("完成" if ok else "未成功")
         except Exception as exc:  # noqa: BLE001 - 单个任务点失败不应中断整门课程
             logger.error("任务点 {} 处理异常: {}", label, exc)
-            logger.debug("异常详情", exc_info=True)
+            # ★ loguru 不认 ``exc_info=True``（那会被当成 sink 的格式参数，堆栈根本
+            #   打不出来）。要堆栈必须用 ``opt(exception=True)``。
+            logger.opt(exception=True).debug("异常详情")
             result["message"] = f"异常: {type(exc).__name__}: {exc}"
 
         if result["ok"]:
