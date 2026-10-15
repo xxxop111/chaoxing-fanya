@@ -4,12 +4,13 @@
 `web/dist`，由**同一个** Flask 进程以静态文件方式对外提供；桌面版把它打包成 exe，
 用 pywebview / WebView2 开一个**原生窗口**加载 `http://127.0.0.1:<运行时端口>/`。
 
-换前端（重新设计界面）时，这份文档描述的部分**不需要任何后端改动**即可对接；
-只有第 7 节列出的接口是「本规范定义、后端待补」。
+换前端（重新设计界面）时，这份文档描述的部分**不需要任何后端改动**即可对接。
+19 个业务接口（第 3 节表格 1–19）全部**已实现**；另有 2 个由桌面窗口外壳提供的接口
+（`/api/heartbeat`、`/api/window-closed`，表格 20–21），**前端必须调用**，否则关窗后进程不退出。
 
 ---
 
-## 0. 先看这 6 条（最容易踩）
+## 0. 先看这 7 条（最容易踩）
 
 1. **一律用相对路径** `/api/...`，绝对不要写死 `http://127.0.0.1:5000`。端口在运行时
    从 5000 起挑第一个空闲端口，写死端口会连不上（开发模式单独跑 `python app.py`
@@ -25,6 +26,9 @@
    消费方**，两个界面同时轮询会把日志劈成两半。
 6. 失败响应的 HTTP 状态码是 400 / 401 / 404 / 500，但**不要只看状态码**：有的失败是
    HTTP 200 + `status:false`（例如审批被拒绝）。以 `status` 字段为准。
+7. **桌面模式要打心跳**：每 5 秒 `GET /api/heartbeat`，并在 `pagehide` 时
+   `navigator.sendBeacon("/api/window-closed", "")`（§4.20 / §4.21）。这两个接口
+   只在桌面壳里存在，浏览器/开发模式会 404 —— 要写成「有就调、没有就算了」。
 
 ---
 
@@ -77,6 +81,7 @@
 | 日志 | `GET /api/logs/<task_id>` | 1000 ms | 任务结束后再取一次收尾 |
 | 盘点结果 | `GET /api/fanya/preview/<task_id>` | 1500 ms | `data.task.status` ∈ 同上，且取到 `preview` |
 | 待审批 | `GET /api/fanya/approvals` | 2000 ms（执行中） | 任务结束后停 |
+| 窗口心跳 | `GET /api/heartbeat` | 5000 ms | **永不停止**（关窗前一直打；仅桌面壳提供） |
 
 **任务状态机**：`running → completed | stopped | error`，终态不再变化。
 `stopped` 表示用户点了停止（当前章节收尾后退出），`error` 时 `error` 字段有原因。
@@ -115,6 +120,8 @@
 | 17 | GET | `/api/fanya/approvals` | 待审批列表 | 已实现 |
 | 18 | POST | `/api/fanya/approve` | 批准/拒绝一条 | 已实现 |
 | 19 | POST | `/api/fanya/approvals/clear` | 清空待审批队列 | 已实现 |
+| 20 | GET/POST | `/api/heartbeat` | 窗口存活心跳（**前端必须定时打**） | 桌面壳提供 |
+| 21 | GET/POST | `/api/window-closed` | 关窗通知（**前端卸载时打**） | 桌面壳提供 |
 
 > 「章节任务点」= 原 `/api/start` 的学习流程；「任务」= 课程页左侧「任务」标签背后
 > `task.chaoxing.com` 的任务点（AI实践、主题讨论、作业、文档…）。两条流程互不影响，
@@ -557,6 +564,31 @@
 响应 `data: { "remaining": 0 }`（清空后剩下的条目数）。
 `keep_decided: true` 时保留已决策的记录，只扔掉 `pending`。
 
+### 4.20 `GET|POST /api/heartbeat` — 窗口心跳（桌面壳提供）
+
+**这两个端点不在 `app.py` 里，而是桌面壳 `desktop_app.py` 注册的**，所以只在桌面模式存在，
+纯浏览器 / Vite 开发模式下会 404 —— 前端要容忍（用 `?.` 或 catch 吞掉）。
+
+```json
+{ "status": true }
+```
+
+* 前端**每 5 秒**打一次，`GET`、`POST` 都行，无参数、无请求体。
+* 心跳到达会**撤销**「关窗判定」：刷新页面（`pagehide` → 重新加载 → 心跳恢复）不会误杀进程。
+* 不实现心跳的后果：点关闭后程序仍常驻后台（下次启动命中单实例逻辑，只是把窗口再开出来）。
+
+### 4.21 `GET|POST /api/window-closed` — 关窗通知（桌面壳提供）
+
+```json
+{ "status": true }
+```
+
+* 前端在 `pagehide` / `beforeunload` 里 `navigator.sendBeacon("/api/window-closed", "")` 打一次。
+  `sendBeacon` 固定是 `POST`，所以该端点必须同时接受 `GET` 和 `POST`。
+* 收到后桌面壳等 15 秒：期间没有新心跳（真关窗）就退出；有新心跳（刷新/跳转）就撤销，继续运行。
+* 不打这个端点也不会立刻出问题：壳还有「心跳安静 180 秒」的兜底判定
+  （阈值远大于浏览器后台标签页的定时器限流间隔，避免最小化时被误杀）。
+
 ---
 
 ## 5. 前端需要的 6 个界面（建议信息架构）
@@ -609,11 +641,13 @@
 
 若希望审批不需要轮询，可加 SSE。**当前不实现**，前端按 2 秒轮询写就行。
 
-### 7.3 桌面壳能力（由窗口进程提供，不在 HTTP 里）
+### 7.3 桌面壳能力（窗口进程提供）
 
-外链、打开日志目录、最小化到托盘这类需求，桌面壳会在 `window` 上注入一个
-`window.desktop`（例如 `window.desktop.openExternal(url)`），前端**必须**先判断存在性
-（`window.desktop?.openExternal?.(url)`），这样浏览器/开发模式下同一份前端也能跑。
+1. **窗口上的注入对象**：外链、打开日志目录、最小化到托盘这类需求，桌面壳会在 `window` 上
+   注入 `window.desktop`（例如 `window.desktop.openExternal(url)`）。前端**必须**先判断存在性
+   （`window.desktop?.openExternal?.(url)`），这样浏览器/开发模式下同一份前端也能跑。
+2. **必须实现的两个回执**：`/api/heartbeat`（每 5 秒）与 `/api/window-closed`（`sendBeacon`），
+   契约见 §4.20 / §4.21。桌面壳靠它们做到「关掉窗口就退出」，没有它们进程会常驻。
 
 ---
 
@@ -632,4 +666,6 @@
 审批        GET  /api/fanya/approvals     → 列表
             POST /api/fanya/approve       {id, approve}
 配置        GET/POST /api/config          ← 整份覆盖写
+窗口心跳    GET/POST /api/heartbeat       ← 每 5 s（仅桌面壳提供）
+关窗通知    POST /api/window-closed       ← pagehide 时 sendBeacon（仅桌面壳提供）
 ```

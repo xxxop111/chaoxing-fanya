@@ -12,8 +12,11 @@
 
 * Flask 跑在后台线程（用 ``werkzeug.make_server`` 以便优雅关闭），
   GUI 必须占主线程 —— 这是 pywebview/WebView2 的要求；
-* 万一 pywebview 或 WebView2 不可用，退回「Edge/Chrome --app 窗口」方案，
-  保证功能不丢（但那种方式会另起浏览器进程，观感差一些）。
+* 原生窗口（pywebview + WebView2）是**默认**方式；只有它真的起不来时，才退回
+  「Edge/Chrome --app 窗口」方案保证功能不丢（那种方式会另起浏览器进程，观感差）。
+  想强制走浏览器可设 ``CHAOXING_NO_WEBVIEW=1``。
+* .NET 8（coreclr）上 pywebview 6.2.1 有两处不兼容，启动时由
+  ``tools/patch_pywebview.py`` 修好，见 ``_run_pywebview_patches()`` 的说明。
 """
 
 from __future__ import annotations
@@ -295,13 +298,81 @@ def _ensure_dotnet_runtime() -> None:
                 }, fp, indent=2)
         set_runtime(clr_loader.get_coreclr(runtime_config=cfg_path))
         log("已指定 .NET 桌面运行时（coreclr + WindowsDesktop）")
+
+        # pywebview 的 winforms 后端开头就执行 ``from Microsoft.Win32 import SystemEvents``，
+        # 而 pythonnet 只会把**已经加载过**的程序集解析成真实类型：SystemEvents 住在
+        # Microsoft.Win32.SystemEvents.dll（属于 WindowsDesktop 框架，默认并不会被载入），
+        # 于是这行拿到的是个空命名空间，报
+        # ``ImportError: cannot import name 'SystemEvents' from 'Microsoft.Win32'``，
+        # 随后 pywebview 统一报「pythonnet cannot be loaded」，窗口悄悄退化成浏览器。
+        # 这里显式把三个必需程序集先 AddReference 进来。
+        import clr
+
+        for asm in ("Microsoft.Win32.SystemEvents", "System.Windows.Forms",
+                    "System.Drawing.Common"):
+            try:
+                clr.AddReference(asm)
+            except Exception as exc:  # noqa: BLE001 - 缺哪个由后面报错指出
+                log(f"预加载程序集 {asm} 失败：{exc}")
+        log("已预加载 WinForms / SystemEvents 程序集")
     except Exception as exc:  # noqa: BLE001 - 失败则退回默认，由 webview 报错
         log(f"设置 .NET 桌面运行时失败（将尝试默认）：{exc}")
 
 
+def _run_pywebview_patches() -> None:
+    """修好 pywebview 在 .NET 8（coreclr）上的两处不兼容 —— 详见补丁脚本。
+
+    补丁实体在 ``tools/patch_pywebview.py``（唯一实现，打包前也由它施工）：
+
+    1. ``webview/lib/Microsoft.Web.WebView2.{Core,WinForms}.dll`` 得换成 NuGet 包里
+       ``lib_manual/netcoreapp3.0`` 的版本 —— 自带的 net462 版引用了
+       ``System.Windows.Forms.ContextMenu``，该类型在 .NET 7+ 已删除。
+    2. ``webview/platforms/winforms.py`` 的 ``OpenFolderDialog`` 类体在 import 时会解析
+       同样被删除的 ``FileDialogNative``，必须换成容错解析。
+
+    原地替换比自行 ``clr.AddReference`` 正确：后者会让 pywebview 之后按自己的路径
+    再加载一次同名程序集，.NET 报 ``Assembly with same name is already loaded``。
+    任何失败都只告警（窗口还有浏览器兜底）。
+    """
+    tools_dir = os.path.join(getattr(sys, "_MEIPASS", BASE_DIR), "tools")
+    if not os.path.isdir(tools_dir):
+        tools_dir = os.path.join(BASE_DIR, "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import patch_pywebview as patcher
+    except Exception as exc:  # noqa: BLE001
+        log(f"找不到补丁脚本（原生窗口可能不可用）：{exc}")
+        return
+    try:
+        changed = patcher.replace_webview2_assemblies(verbose=False)
+        if changed:
+            log(f"已替换 WebView2 程序集为 .NET Core 版：{'、'.join(changed)}")
+        result = patcher.patch_winforms(verbose=False)
+        if result == "unsupported":
+            log("winforms 补丁未生效（原生窗口可能不可用）")
+        elif result == "patched":
+            log("已给 pywebview 的 winforms.py 打补丁")
+    except Exception as exc:  # noqa: BLE001
+        log(f"应用 pywebview 补丁失败：{exc}")
+
+
+def _native_window_disabled() -> bool:
+    """是否按环境变量强制走浏览器窗口。
+
+    * ``CHAOXING_NO_WEBVIEW=1`` —— 显式禁用原生窗口；
+    * ``CHAOXING_USE_WEBVIEW=0`` —— 同上（兼容旧写法）；
+    * 其它情况一律**优先原生窗口**：那才是「独立软件」该有的样子。
+    """
+    if os.environ.get("CHAOXING_NO_WEBVIEW") == "1":
+        return True
+    return os.environ.get("CHAOXING_USE_WEBVIEW") == "0"
+
+
 def _run_with_webview(url: str, server) -> int:
-    """原生窗口模式（首选）。"""
+    """原生窗口模式（默认）。"""
     _ensure_dotnet_runtime()
+    _run_pywebview_patches()
     import webview
 
     os.makedirs(WEBVIEW_STORAGE, exist_ok=True)
@@ -363,7 +434,7 @@ def _register_window_routes(flask_app) -> dict:
 
 
 def _run_with_browser(url: str, server, state: dict) -> int:
-    """浏览器窗口模式（本机唯一可行方案，见模块头部说明）。
+    """浏览器窗口模式（**兜底**：原生窗口起不来时才会走到这里）。
 
     * 窗口**并行**启动：不等服务就绪就先拉起浏览器，总耗时取两者较大值；
     * **关掉窗口即退出**（心跳安静 15 秒后），行为与普通桌面程序一致，
@@ -420,9 +491,10 @@ def main() -> int:
         log(f"检测到已在运行的实例（端口 {running}），直接打开窗口")
         if not headless:
             reused = False
-            if os.environ.get("CHAOXING_USE_WEBVIEW") == "1":
+            if not _native_window_disabled():
                 try:
                     _ensure_dotnet_runtime()
+                    _run_pywebview_patches()
                     import webview
                     os.makedirs(WEBVIEW_STORAGE, exist_ok=True)
                     webview.create_window(WINDOW_TITLE, url, width=1200, height=840,
@@ -459,15 +531,17 @@ def main() -> int:
             log("--no-window：仅启动服务")
             while True:
                 time.sleep(3600)
-        # pywebview 原生窗口在本机不可用（pythonnet 的 netfx/CLR 均无法解析
-        # Python.Runtime.Loader.Initialize，且 .NET Core 的 WinForms 已移除
-        # ContextMenu）。默认不再尝试，省掉每次启动 ~2 秒的无效探测；
-        # 换到别的机器想试原生窗口时设 CHAOXING_USE_WEBVIEW=1。
-        if os.environ.get("CHAOXING_USE_WEBVIEW") == "1":
+        # 原生窗口（pywebview + WebView2）是默认方式：那才像「一个独立软件」。
+        # .NET 8 上 pywebview 的两处不兼容已由 tools/patch_pywebview.py 修好；
+        # 若仍失败（例如机器没装 WebView2 运行时），退回 Edge/Chrome --app 窗口，
+        # 保证功能不受影响。想强制走浏览器：CHAOXING_NO_WEBVIEW=1。
+        if not _native_window_disabled():
             try:
                 return _run_with_webview(url, server)
             except Exception as exc:  # noqa: BLE001
                 log(f"原生窗口不可用（{exc}），改用浏览器窗口")
+        else:
+            log("已按环境变量要求改用浏览器窗口")
         return _run_with_browser(url, server, state)
     except KeyboardInterrupt:
         log("收到中断，退出")

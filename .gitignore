@@ -203,4 +203,10 @@ fanya-foreground.png
 
 # 本机 npm 源配置（不该强加给其他用户）
 web/.npmrc
-
+# 例外：桌面版打包配置要进版本库（否则 tools/build_desktop.py 依赖一个不受控文件）
+!chaoxing-fanya.spec
+# 运行期产物
+/pywebview.runtimeconfig.json
+pythonnet.runtimeconfig.json
+/.webview/
+/desktop_config.json
