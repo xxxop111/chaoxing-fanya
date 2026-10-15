@@ -89,6 +89,7 @@ cd D:\03-开发\项目\ds\chaoxing-fanya
 | --- | --- |
 | 原生窗口 | ✅ 窗口标题「超星学习通助手」，`/api/health` 返回 `{"status":true,"msg":"OK"}`，`/` 200，前端资源正常加载 |
 | 打包产物 | ✅ `dist\chaoxing-fanya\chaoxing-fanya.exe` 独立运行（含 WebView2/CLR 加载），窗口与源码模式一致 |
+| 冒烟测试 | ✅ `tools\smoke_desktop.py` 六项检查全过、`--stop` 干净退出，退出码 0（连跑两次，覆盖 dist 产物） |
 | 安装包编译 | ✅ `Successful compile`，`chaoxing-fanya-setup-1.0.0.exe` 生成 |
 | 安装到用户目录 | ⚠️ **本会话内无法完成**，见下 |
 
@@ -101,7 +102,31 @@ Inno 安装必须先写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstal
 这属于会话环境限制，不是安装包缺陷；安装到工作区目录时，文件安装阶段是成功的
 （`Successfully installed the file` ×N），只在写卸载注册表项时被拒并回滚。
 
-## 6. 报错速查
+## 6. 冒烟测试（每次改完打包链必跑）
+
+```powershell
+.venv\Scripts\python.exe tools\smoke_desktop.py              # 自动找 dist\ 或安装目录里的 exe
+.venv\Scripts\python.exe tools\smoke_desktop.py --window     # 用真实原生窗口测（会弹窗）
+.venv\Scripts\python.exe tools\smoke_desktop.py --keep-running
+```
+
+它用 `--no-window` 把 exe 拉起来（不弹窗、不打扰人），逐项确认：
+
+1. 进程能启动、端口能监听（5000 起自动探测）；
+2. `GET /api/health` → `{"status": true, "msg": "OK"}`（证明 Flask 与整个 `api/` 包在冻结环境里导入成功）；
+3. `GET|POST /api/heartbeat`、`POST /api/window-closed` 已注册（桌面壳的关窗协议，缺了会关不掉窗）；
+4. `GET /api/version` 正常；
+5. `GET /` 返回含 `id="root"` 的 HTML（证明 `web/dist` 被收进包，而不是只有一个后端）；
+6. `--stop` 能干净停下。
+
+退出码 0 = 全过；失败时会打印 `desktop_app.log` 末尾若干行。已经跑着实例时它不会启第二个进程，
+而是直接对现有实例做检查。
+
+> 手动验证「原生窗口」时不要用本工具的 pwsh 会话 `Start-Process` —— GUI 子进程会继承管道，
+> 让工具一直等下去（实测把整个调用卡成后台任务）。要么用 `smoke_desktop.py`，
+> 要么用 WMI 分离启动：`([wmiclass]'Win32_Process').Create('"<exe>" --no-window')`。
+
+## 7. 报错速查
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
@@ -112,7 +137,7 @@ Inno 安装必须先写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstal
 | 启动后出现带地址栏的 Edge/Chrome 窗口 | 走了浏览器兜底分支 | 看 `desktop_app.log` 里 webview 的报错；确认打包版没排除 `webview`/`clr_loader`/`pythonnet` |
 | `RedirectionGuard status ... Enabled in enforcing mode` | Win11 24H2+ 的进程缓解策略，正常 | 无需处理 |
 
-## 7. 历史遗留（已不用）
+## 8. 历史遗留（已不用）
 
 `build_desktop_app.bat`、`build_portable.bat`、`clean_and_build_portable.bat`、`quick_build.bat`
 是「内嵌 Python + 便携版」时代的老脚本，已被 `tools\build_desktop.py` + `installer\*.iss` 取代。
