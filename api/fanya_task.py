@@ -561,9 +561,18 @@ def register_adapter(plan_type: int, handler: str, status: str, label: str, note
 register_adapter(PLAN_TYPE_CHAPTER, "chapter", STATUS_AUTO, "章节",
                  "复用章节任务点流程（externalDataId == mooc1 章节 point id）")
 # 视频：任务引擎自有播放页（videoStudy/learnPage），进度由 videoDataLog 上报。
-# 实测服务端接受一次到位的进度上报，isFinish 立即翻转为 true。
+# ★ 2026-10-15 更正：此前这里写「实测服务端接受一次到位的进度上报，isFinish 立即翻转」
+#   —— 该结论**只在任务点没设观看时长要求时成立**。设了要求的任务点判据是
+#   score.totalTime >= watchDuration(分钟) × 60000，而 totalTime 只按**真实经过时间**
+#   累计（跳到片尾 / 几秒内连发心跳 / 快进全部计 0）。现已实现 _satisfy_watch_duration()
+#   按真实节奏补足；因此仍标 AUTO，但逐项说明见 resolve_item()。
 register_adapter(PLAN_TYPE_VIDEO, "video", STATUS_AUTO, "视频",
-                 "上报 videoDataLog 观看进度（实测一次到位即可完成）")
+                 "上报 videoDataLog 观看进度（未设时长要求时一次到位即可；"
+                 "设了要求则按真实时间补足累计观看时长）")
+# 文档：documentStudy/readEnd 只能把 completeWeightRate 置 100（「读完」），
+# 若该任务点还要求累计阅读时长，readEnd 一分一秒都不计入 totalTime。文档时长由云盘
+# 阅读器 iframe（pan-yz.chaoxing.com）经 data-xxt.aichaoxing.com/analysis/ac_mark 上报，
+# 纯 HTTP 复现不了 → 逐项在 resolve_item() 里降级说明。
 register_adapter(PLAN_TYPE_DOCUMENT, "document", STATUS_AUTO, "文档",
                  "上报文档阅读完成（task.chaoxing.com/documentStudy/readEnd）")
 # 作业：mooc2 课程作业（mooc2/work/task?workId=&enc=），knowledgeid=0 且 jobid 为空，
@@ -643,8 +652,13 @@ def _ai_practice_handler(ai_mode: dict) -> str:
 def resolve_item(item: FanyaPlanItem) -> tuple[str, str, str]:
     """给出任务点最终生效的 ``(status, handler, note)``。
 
-    AI实践必须**按子模式**细分：upload 需人工、chat 未实现、code 已实测可自动、
-    ladder 已实现但未验证。注册表里 planType 15 只有一个笼统条目，因此这里单独处理。
+    两类需要**逐项**细分，注册表里的类型级条目太笼统：
+
+    1. **AI实践**：upload / chat / code / ladder / story 各自能力不同；
+    2. **视频/音频/文档**：设了「累计观看时长」要求的任务点，判据是
+       ``score.totalTime >= watchDuration × 60000``，而 totalTime 只认真实经过时间。
+       视频/音频能靠真实播放补足（慢但可行）；文档的时长走云盘阅读器跨域埋点，
+       纯 HTTP 补不了 —— 必须如实降级，否则界面上显示「可自动」就等于骗用户。
     """
     if item.plan_type == PLAN_TYPE_AI_PRACTICE:
         ai_mode = item.extra.get("ai_mode")
@@ -656,9 +670,43 @@ def resolve_item(item: FanyaPlanItem) -> tuple[str, str, str]:
         if status in (STATUS_AUTO, STATUS_PARTIAL) and handler not in HANDLERS:
             return STATUS_PENDING, handler, f"{note}（处理器尚未实现）"
         return status, handler, note
+
     spec = adapter_for(item.plan_type)
     status, note = effective_status(spec)
+    watch_note = _watch_duration_note(item, status)
+    if watch_note:
+        status, note = watch_note
     return status, spec.handler, note
+
+
+#: 观看时长门槛逐项的说明与状态修正。
+#: 文档侧无法用 HTTP 补足，所以降到 ``manual``；视频/音频可以真实播放补足，
+#: 但仍要提醒耗时（半小时的视频就得真等半小时），因此降到 ``partial``。
+_WATCH_KIND_LABELS = {"video": "视频", "audio": "音频", "document": "文档"}
+
+
+def _watch_duration_note(item: FanyaPlanItem, status: str) -> Optional[tuple[str, str]]:
+    """该任务点若设了累计观看时长要求，返回修正后的 ``(status, note)``；否则 ``None``。"""
+    if status not in (STATUS_AUTO, STATUS_PARTIAL):
+        return None
+    for kind, label in _WATCH_KIND_LABELS.items():
+        required = watch_duration_ms(item.extra, kind)
+        if not required:
+            continue
+        minutes = required / 60000.0
+        if kind == "document":
+            return (STATUS_MANUAL,
+                    f"文档还要求累计阅读 {minutes:g} 分钟：documentStudy/readEnd 只把"
+                    f"「读完」置 100%，一分一秒都不计入 totalTime（实测等 40 秒再调、"
+                    f"连调 3 次都仍是 0）。真实时长由云盘阅读器 iframe 经 "
+                    f"data-xxt.aichaoxing.com/analysis/ac_mark 上报，纯 HTTP 复现不了 —— "
+                    f"请用 Edge 打开该文档并停留阅读；若你已在浏览器读过，"
+                    f"可用「重做模式」自动完成，平台会沿用已累计的时长")
+        return (STATUS_PARTIAL,
+                f"{label}要求累计观看 {minutes:g} 分钟，只能按**真实经过时间**累计"
+                f"（跳到片尾 / 快进 / 连发心跳全部计 0，实测倍速约 0.63 倍被采信）。"
+                f"执行时会真实等待，可能很久；中途可停止，已累计的时长会保留")
+    return None
 
 
 def _ai_practice_status(ai_mode: dict) -> tuple[str, str]:
