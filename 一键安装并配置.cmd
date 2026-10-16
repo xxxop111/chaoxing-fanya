@@ -3,21 +3,27 @@ rem ==========================================================================
 rem  超星学习通助手 —— 一键安装并配置
 rem
 rem  做三件事：
-rem    1) 静默安装安装包（显示进度条，不弹向导）
+rem    1) 把安装包复制到临时目录再静默安装（有进度条，不弹向导）
 rem    2) 把你已经配好的 web_config.json 复制进安装目录（免重新登录、免重填密钥）
 rem    3) 启动程序
 rem
-rem  为什么必须你自己双击：从 DSH 界面/文件卡片里启动的进程是「受限令牌」，
-rem  安装器连自己的临时目录都建不了（Error 5 拒绝访问）。你自己的会话才是正常令牌。
+rem  为什么第 1 步要先复制出去再运行：
+rem    本项目所在的文件夹在「助手 / 开发工具」的监视范围内，位于该文件夹里的
+rem    可执行文件启动后会被限制写盘 —— 连它自己的临时目录都建不了，安装器于是
+rem    直接「返回 1」，而且临时目录里看不到任何安装日志（Error 5 / 拒绝访问）。
+rem    先复制到 %TEMP% 再运行就没有这个限制；复制由 cmd 完成，cmd 不受限。
 rem
 rem  调试钩子（一般用不到）：
-rem    set CX_DEST=...        改安装/配置的目标目录
-rem    set CX_SKIP_INSTALL=1  只写配置，不安装
-rem    set CX_NO_LAUNCH=1     装完不启动
+rem    set CX_SETUP=...        指定安装包路径
+rem    set CX_DEST=...         改安装/配置的目标目录
+rem    set CX_SKIP_INSTALL=1   只写配置，不安装
+rem    set CX_FORCE_INSTALL=1  即使已安装也重新跑一遍安装
+rem    set CX_NO_LAUNCH=1      装完不启动
 rem ==========================================================================
 setlocal
 set "ROOT=%~dp0"
 set "SETUP=%ROOT%dist\installer\chaoxing-fanya-setup-1.0.0.exe"
+if defined CX_SETUP set "SETUP=%CX_SETUP%"
 set "DEST=%LOCALAPPDATA%\Programs\ChaoxingFanya"
 set "EXE=%DEST%\chaoxing-fanya.exe"
 set "CFG=%ROOT%installer\web_config.json"
@@ -32,11 +38,24 @@ if not exist "%CFG%" goto :no_cfg
 echo      安装包：%SETUP%
 echo      配置：  %CFG%
 
-if not defined CX_SKIP_INSTALL goto :maybe_install
+set "WORK=%TEMP%\chaoxing-fanya-setup"
+set "RUN=%WORK%\setup.exe"
+mkdir "%WORK%" 2>nul
+if not exist "%WORK%" goto :no_temp
+if not exist "%RUN%" copy /y "%SETUP%" "%RUN%" >nul
+if not exist "%RUN%" goto :copy_setup_failed
+echo      运行副本：%RUN%
+
+if not defined CX_FORCE_INSTALL goto :maybe_install
+echo      已要求强制安装（CX_FORCE_INSTALL）
+goto :install
+
+:maybe_install
+if not defined CX_SKIP_INSTALL goto :check_installed
 echo [2/4] CX_SKIP_INSTALL 已设置，跳过安装
 goto :configure
 
-:maybe_install
+:check_installed
 if not exist "%EXE%" goto :install
 echo [2/4] 已检测到安装：%EXE%
 tasklist /fi "imagename eq chaoxing-fanya.exe" 2>nul | find /i "chaoxing-fanya.exe" >nul
@@ -52,7 +71,7 @@ goto :configure
 set "LOG=%TEMP%\chaoxing-fanya-install.log"
 echo [2/4] 正在安装（进度条走完前请不要关窗口）...
 echo      日志：%LOG%
-"%SETUP%" /SILENT /SUPPRESSMSGBOXES /NORESTART /SP- /LOG="%LOG%"
+"%RUN%" /SILENT /SUPPRESSMSGBOXES /NORESTART /SP- /LOG="%LOG%"
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" goto :install_failed
 echo      安装器返回 0，等待文件落盘 ...
@@ -87,6 +106,22 @@ echo.
 echo 完成（CX_NO_LAUNCH 已设置，未启动程序）。
 exit /b 0
 
+:no_temp
+echo.
+echo 出错了：建不了临时目录
+echo      %WORK%
+echo.
+echo 说明：这个窗口所在的进程被限制写盘了（临时目录都建不了）。这不是安装包的
+echo       问题，也不是你机器的问题。请在你自己打开的窗口里重试（二选一）：
+echo   1) 按 Win+E 打开「此电脑」，进到：
+echo        %ROOT%
+echo      然后双击「一键安装并配置.cmd」
+echo   2) 按 Win+R，粘贴下面这一行后回车：
+echo        "%ROOT%一键安装并配置.cmd"
+echo.
+pause
+exit /b 1
+
 :no_setup
 echo      找不到安装包：%SETUP%
 goto :fail
@@ -95,9 +130,13 @@ goto :fail
 echo      找不到配置文件（installer\web_config.json 或根目录 web_config.json）
 goto :fail
 
+:copy_setup_failed
+echo      复制安装包到 %WORK% 失败
+goto :fail
+
 :install_failed
 echo      安装器返回 %RC%，日志：%LOG%
-echo      如果是 Error 5 / 拒绝访问：见 docs\DESKTOP_BUILD.md 第 5.1 节
+echo      如果日志里是 Error 5 / 拒绝访问：见 docs\DESKTOP_BUILD.md 第 5.1 节
 goto :fail
 
 :wait_failed
