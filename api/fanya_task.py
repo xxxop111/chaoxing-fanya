@@ -121,6 +121,26 @@ class FanyaPlanItem:
     supported: bool = False
     handled_by: str = ""
     skip_reason: str = ""
+    # 学习窗口状态（预览时逐个探测 getToStudyUrl 得到）：
+    #   "" 未探测 / "open" 可进入 / "expired" 已结束 / "not_open" 尚未开放
+    # 窗口已结束且处理器**依赖** study_url 的任务点，在当前账号上无法补完成，
+    # 因此不算进「待处理」——否则界面上会永远挂着一批做不了的作业。
+    window_state: str = ""
+    window_note: str = ""
+
+    @property
+    def window_blocked(self) -> bool:
+        """窗口已结束 / 尚未开放 —— 现在进不去。"""
+        return self.window_state in ("expired", "not_open")
+
+    @property
+    def unreachable(self) -> bool:
+        """进不去、且这类任务点没有别的入口 —— 现存条件下无法完成。
+
+        「章节」是例外：它不经过任务引擎的跳转（``HANDLERS_WITHOUT_STUDY_URL``），
+        窗口关掉也照样能学，所以不算 unreachable。
+        """
+        return self.window_blocked and self.handled_by not in HANDLERS_WITHOUT_STUDY_URL
 
     @property
     def type_label(self) -> str:
@@ -147,7 +167,9 @@ class FanyaTask:
 
     @property
     def completable_items(self) -> list[FanyaPlanItem]:
-        return [i for i in self.items if not i.is_finish and i.supported]
+        # unreachable（窗口已结束/未开放）不算「可完成」：执行器不必为它们
+        # 白跑一趟 getToStudyUrl，界面上也不该把它们显示成能做的事。
+        return [i for i in self.items if not i.is_finish and i.supported and not i.unreachable]
 
 
 class FanyaTaskClient:
@@ -837,6 +859,102 @@ def _describe_quiz_items(client: FanyaTaskClient, task: FanyaTask, redo: bool = 
             logger.info("自测/测验「{}」：{}", item.name[:30], info.get("summary") or "已识别")
 
 
+def _window_state_from_message(message: str) -> tuple[str, str]:
+    """把服务端的窗口报错判成 ``(state, note)``。"""
+    note = _window_reason(message)
+    if "已结束" in note:
+        return "expired", note
+    if "尚未开放" in note:
+        return "not_open", note
+    return "", note
+
+
+def _probe_item_windows(client: FanyaTaskClient, task: FanyaTask,
+                        max_workers: int = 8,
+                        probe_client_factory: Optional[Callable[[], Any]] = None) -> None:
+    """给未完成的任务点逐个探测学习窗口（**只读**）。
+
+    服务端没有「窗口列表」这种接口：唯一能判断某个任务点现在还能不能做的方法，
+    就是对它调一次 ``getToStudyUrl`` —— 成功=可进入，失败=按报错里的窗口终点
+    判「已结束 / 尚未开放」。没有这一步，界面上就会把一批永远做不了的作业
+    一直显示成「待处理」。
+
+    实测（2026-10-16）：窗口已结束的任务点，服务端只回
+    ``{"code":400,"result":false,"message":"任务点学习时间：…当前不在学习时间内"}``，
+    **不给任何 id**（workId / publishRelationUuid / topicId 都没有），
+    所以这类任务点在当前账号上无法通过别的入口补完成。
+
+    探测只影响内存里的标记，不改任何学习记录。
+    """
+    pending = [i for i in task.items if not i.is_finish and not i.window_state]
+    if not pending:
+        return
+
+    workers = max(1, min(int(max_workers or 1), 8, len(pending)))
+
+    def probe(item: FanyaPlanItem) -> None:
+        try:
+            client.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
+        except FanyaTaskError as exc:
+            message = str(exc)
+            if "不在学习时间内" not in message:
+                return
+            state, note = _window_state_from_message(message)
+            item.window_state = state or "expired"
+            item.window_note = note
+        except Exception as exc:  # noqa: BLE001 - 探测失败不该影响盘点
+            logger.debug("窗口探测失败（{}）：{}", item.name[:24], exc)
+        else:
+            item.window_state = "open"
+
+    if workers == 1:
+        for item in pending:
+            probe(item)
+        return
+
+    # 探测是纯 GET，用独立会话并发跑（共享 session 不是线程安全的）。
+    # ``probe_client_factory`` 让测试注入假客户端；生产路径复制全局会话。
+    factory = probe_client_factory
+
+    def probe_with(item: FanyaPlanItem) -> None:
+        probe_client = factory() if factory else None
+        if probe_client is None:
+            probe(item)
+            return
+        try:
+            probe_client.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
+        except FanyaTaskError as exc:
+            message = str(exc)
+            if "不在学习时间内" not in message:
+                return
+            state, note = _window_state_from_message(message)
+            item.window_state = state or "expired"
+            item.window_note = note
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("窗口探测失败（{}）：{}", item.name[:24], exc)
+        else:
+            item.window_state = "open"
+
+    def default_factory() -> Any:
+        try:
+            from api.base import SessionManager
+            return FanyaTaskClient(session=SessionManager.clone_session())
+        except Exception as exc:  # noqa: BLE001 - 复制失败就退回共享客户端
+            logger.debug("窗口探测会话复制失败，改用共享会话：{}", exc)
+            return None
+
+    if factory is None:
+        factory = default_factory
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="window-probe") as pool:
+        futures = [pool.submit(probe_with, item) for item in pending]
+        for fut in futures:
+            try:
+                fut.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("窗口探测任务异常: {}", exc)
+
+
 def _describe_ai_practice_items(client: FanyaTaskClient, course: dict, task: FanyaTask, redo: bool = False) -> None:
     """为未完成的 AI实践任务点补充子模式信息（只读）。"""
     from api import fanya_ai
@@ -939,15 +1057,20 @@ def classify_items(task: FanyaTask) -> None:
 def build_task_preview(chaoxing: Any, courses: list[dict],
                        client: Optional[FanyaTaskClient] = None,
                        on_progress: Optional[Callable[[dict], None]] = None,
-                       redo: bool = False) -> dict:
+                       redo: bool = False, probe_windows: bool = True) -> dict:
     """遍历给定课程，返回「任务」模块的完整清单与可自动化判定。
 
     该函数只做 GET/POST 读取，不会修改任何学习记录，可安全用于前端预览。
+
+    ``probe_windows``：是否为每个未完成任务点探测学习窗口（默认开）。关掉可以
+    省掉每个任务点一次 ``getToStudyUrl``，代价是界面分不清「现在能做」和
+    「窗口已经关了、永远做不了」。
     """
     client = client or FanyaTaskClient()
     result: dict = {"courses": [], "summary": {
         "courseCount": 0, "taskCount": 0, "pendingCount": 0,
         "completableCount": 0, "manualCount": 0, "unsupportedCount": 0,
+        "expiredCount": 0,
     }}
 
     def emit(**payload) -> None:
@@ -1004,6 +1127,9 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
             _describe_ai_practice_items(client, course, task, redo=redo)
             _describe_quiz_items(client, task, redo=redo)
             classify_items(task)
+            # 窗口探测必须在 classify_items 之后：unreachable 依赖 handled_by。
+            if probe_windows:
+                _probe_item_windows(client, task)
             allow, allow_msg = client.check_allow_study(task.encry_task_user_id)
             task.allow_study = allow
             task.allow_study_message = allow_msg
@@ -1015,6 +1141,13 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
                 if not ai_mode and item.extra.get("ai_mode_error"):
                     # 读不到模式时说明真实原因（多为学习窗口未开放）
                     note = item.extra["ai_mode_error"]
+                if item.window_note and (item.unreachable or not note):
+                    # 窗口探测给出的说法比「取不到跳转」更具体
+                    note = item.window_note
+                if item.unreachable:
+                    # 进不去、也没有别的入口：现状下无法补完成。不放进「待处理」，
+                    # 否则界面上会一直挂着一批永远做不了的作业。
+                    status = STATUS_MANUAL
                 quiz_info = item.extra.get("quiz_info")
                 if quiz_info and quiz_info.get("summary"):
                     note = quiz_info["summary"]
@@ -1033,6 +1166,9 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
                     "supported": status in (STATUS_AUTO, STATUS_PARTIAL),
                     "note": note,
                     "skipReason": item.skip_reason,
+                    "windowState": item.window_state,
+                    "windowNote": item.window_note,
+                    "expired": item.unreachable,
                     "aiMode": ai_mode.get("mode") if ai_mode else None,
                     "aiModeLabel": ai_mode.get("modeLabel") if ai_mode else "",
                     "aiRules": ai_mode.get("rules") if ai_mode else [],
@@ -1041,13 +1177,17 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
                     "quizWindow": (quiz_info.get("window") or "") if quiz_info else "",
                 })
                 if not item.is_finish:
-                    result["summary"]["pendingCount"] += 1
-                    if status in (STATUS_AUTO, STATUS_PARTIAL):
-                        result["summary"]["completableCount"] += 1
-                    elif status == STATUS_MANUAL:
-                        result["summary"]["manualCount"] += 1
+                    if item.unreachable:
+                        # 窗口已结束 / 尚未开放：单列，不混进「待处理」
+                        result["summary"]["expiredCount"] += 1
                     else:
-                        result["summary"]["unsupportedCount"] += 1
+                        result["summary"]["pendingCount"] += 1
+                        if status in (STATUS_AUTO, STATUS_PARTIAL):
+                            result["summary"]["completableCount"] += 1
+                        elif status == STATUS_MANUAL:
+                            result["summary"]["manualCount"] += 1
+                        else:
+                            result["summary"]["unsupportedCount"] += 1
 
             result["summary"]["taskCount"] += 1
             course_entry["tasks"].append({
@@ -1057,8 +1197,10 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
                 "allowStudy": task.allow_study,
                 "allowStudyMessage": task.allow_study_message,
                 "encryTaskUserId": task.encry_task_user_id,
-                "pendingCount": len(task.pending_items),
-                "completableCount": len(task.completable_items),
+                "pendingCount": len([i for i in task.pending_items if not i.unreachable]),
+                "completableCount": len([i for i in task.pending_items
+                                         if not i.unreachable and i.supported]),
+                "expiredCount": len([i for i in task.pending_items if i.unreachable]),
                 "groups": task.extra.get("groups") or [],
                 "items": items,
             })
@@ -1400,17 +1542,29 @@ class FanyaTaskRunner:
             self._emit(type="item_done", **result)
             return result
 
+        study_url: dict = {}
         try:
             study_url = worker.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
         except FanyaTaskError as exc:
             # 常见原因：该任务点有自己的有效期，服务端会返回
-            # “任务点学习时间：… 当前不在学习时间内”。这种情况直接记为跳过。
-            result["skipped"] = True
-            result["message"] = f"无法进入任务点：{exc}"
-            logger.warning("跳过任务点 {}：{}", label, result["message"])
-            self.results.append(result)
-            self._emit(type="item_done", **result)
-            return result
+            # “任务点学习时间：… 当前不在学习时间内”。这时服务端**什么都不给**
+            # （实测 code=400，没有 url / workId / publishRelationUuid），
+            # 依赖它的类型就只能记为跳过。
+            #
+            # 但「章节」类不依赖它（见 HANDLERS_WITHOUT_STUDY_URL）：窗口关闭只是
+            # 任务引擎那条腿被掐，章节内容本身仍可学习 —— 实测 2026-10-16 在窗口
+            # 已结束的「5.1 人口增长-马尔萨斯模型视频教学」上仍能正常播放并上报。
+            # 这里如果一并跳过，就是把还能做的事误判成不能做。
+            if handler_name not in HANDLERS_WITHOUT_STUDY_URL:
+                result["skipped"] = True
+                result["message"] = f"无法进入任务点：{exc}"
+                logger.warning("跳过任务点 {}：{}", label, result["message"])
+                self.results.append(result)
+                self._emit(type="item_done", **result)
+                return result
+            result["windowBlocked"] = True
+            logger.warning("任务点 {} 取不到学习跳转（{}），但「{}」不依赖它，继续执行",
+                           label, exc, handler_name)
 
         ctx = CompletionContext(
             chaoxing=self.chaoxing,
@@ -1463,6 +1617,14 @@ class FanyaTaskRunner:
 
 
 # handler 注册表在文件末尾由各适配器模块填充
+#: 这些处理器**不需要** ``getToStudyUrl`` 的结果（只用课程 id + ``plan.externalDataId``）。
+#: 章节类任务点经常「任务点窗口已结束、章节内容本身仍可学习」，因此窗口失败时
+#: 不能像别的类型那样直接跳过 —— 那是把还能做的事误判成不能做。
+#: 实测（2026-10-16）：窗口 2026-09-20~09-30 已结束的 plan 8110517
+#: 「5.1 人口增长-马尔萨斯模型视频教学」仍可 get_course_point → get_job_list →
+#: process_job 正常播放/上报。
+HANDLERS_WITHOUT_STUDY_URL = {"chapter"}
+
 HANDLERS: dict[str, Callable[[CompletionContext], tuple[bool, str]]] = {}
 
 

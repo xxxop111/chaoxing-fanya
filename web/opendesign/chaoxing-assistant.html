@@ -1204,13 +1204,15 @@
     var cells = [
       ["待完成", s.pendingCount, true], ["可自动完成", s.completableCount, false],
       ["需人工", s.manualCount, false], ["暂不支持", s.unsupportedCount, false],
+      ["窗口已过", s.expiredCount, false],
       ["课程", s.courseCount, false], ["任务", s.taskCount, false]
     ];
     el.innerHTML = cells.map(function (c) {
       return '<div class="metric' + (c[2] ? " accent" : "") + '"><div class="metric-num num">' + (c[1] == null ? "—" : c[1]) + '</div><div class="metric-label">' + c[0] + "</div></div>";
     }).join("");
   }
-  function statusPill(st) {
+  function statusPill(st, it) {
+    if (it && it.expired) return '<span class="pill pill-muted">窗口已过</span>';
     if (st === "auto") return '<span class="pill pill-run">可自动</span>';
     if (st === "partial") return '<span class="pill pill-warn">部分自动</span>';
     if (st === "manual") return '<span class="pill pill-muted">需人工</span>';
@@ -1230,11 +1232,12 @@
           if (selectable) anySelectable = true;
           return '<div class="tree-item' + (selectable ? "" : " is-disabled") + '" data-od-id="plan-' + esc(it.planId) + '">' +
             '<input class="check" type="checkbox" data-plan="' + esc(it.planId) + '" data-course="' + esc(co.courseId) + '" data-task="' + esc(t.taskId) + '"' + (selectable ? " checked" : " disabled") + '>' +
-            '<span class="grow"><span class="title">' + esc(it.name) + " " + statusPill(it.status) + '</span><span class="sub">' + esc(it.note || "") + '</span></span>' +
+            '<span class="grow"><span class="title">' + esc(it.name) + " " + statusPill(it.status, it) + '</span><span class="sub">' + esc(it.note || "") + '</span></span>' +
             '<span class="tag">' + esc(it.typeLabel || "任务点") + "</span>" +
             '<button class="btn btn-sm btn-ghost" data-open="' + esc(it.entryUrl || "#") + '">打开</button></div>';
         }).join("");
-        return '<div class="tree-task"><div class="tree-task-head"><span class="title" style="font-weight:600;">' + esc(t.name) + '</span><span class="grow"></span><span class="meta">未完成 ' + (t.pendingCount || 0) + "</span></div>" + items + "</div>";
+        var meta = "未完成 " + (t.pendingCount || 0) + (t.expiredCount ? " · 窗口已过 " + t.expiredCount : "");
+        return '<div class="tree-task"><div class="tree-task-head"><span class="title" style="font-weight:600;">' + esc(t.name) + '</span><span class="grow"></span><span class="meta">' + meta + "</span></div>" + items + "</div>";
       }).join("");
       return '<div class="tree-group">' + head + tasks + "</div>";
     }).join("");

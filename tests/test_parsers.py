@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from api.fanya_ladder import parse_choice_question          # noqa: E402
-from api.fanya_work import _is_refusal  # noqa: E402
+from api.fanya_work import _is_refusal, _resolve_choice_answer, build_submission  # noqa: E402
 from api.fanya_upload import needs_dialogue, copy_is_banned, min_chars  # noqa: E402
 from api.fanya_task import _format_progress, _window_reason  # noqa: E402
 from api.fanya_exam import (  # noqa: E402
@@ -490,6 +490,67 @@ def test_browser_temp_dir_is_writable_and_used():
     assert os.path.isdir(tmp)
     for key in ("TEMP", "TMP", "TMPDIR"):
         assert os.environ[key] == tmp
+
+
+# ---------------- 选择题答案 → 选项字母 ----------------
+_OPTS4 = ["A. 甲的说法", "B. 乙的说法", "C. 丙的说法", "D. 丁的说法"]
+
+
+def test_resolve_choice_answer_accepts_letters():
+    assert _resolve_choice_answer("B", _OPTS4) == "B"
+    assert _resolve_choice_answer("b", _OPTS4) == "B"
+    assert _resolve_choice_answer("答：AB", _OPTS4) == "AB"
+    assert _resolve_choice_answer("A,B", _OPTS4) == "AB"
+    # 字母超出选项范围 → 宁可留空，也不能把 "E" 交上去
+    assert _resolve_choice_answer("E", _OPTS4) is None
+
+
+def test_resolve_choice_answer_maps_option_text():
+    assert _resolve_choice_answer("乙的说法", _OPTS4) == "B"
+    assert _resolve_choice_answer("B. 乙的说法", _OPTS4) == "B"
+    # 模型只回了一小段选项原文（含在选项里）也要能对上
+    assert _resolve_choice_answer("丁的说法", _OPTS4) == "D"
+
+
+def test_resolve_choice_answer_rejects_plain_text():
+    """旧实现会把整段话写进单选字段，服务端判错、页面上「我的答案」变成一段话。"""
+    assert _resolve_choice_answer("Logistic 曲线呈 S 形", _OPTS4) is None
+    assert _resolve_choice_answer("", _OPTS4) is None
+
+
+class _StubTiku:
+    def __init__(self, answer):
+        self.answer = answer
+
+    def query(self, _payload):
+        return self.answer
+
+
+def _one_choice_work():
+    return {
+        "formData": {"answertypeq1": "0", "answerq1": ""},
+        "answerwqbid": "q1",
+        "questions": [{
+            "id": "q1", "type": "single", "typeCode": 0, "title": "下列说法正确的是？",
+            "options": _OPTS4, "answerFields": {"answertypeq1": "0", "answerq1": ""},
+        }],
+    }
+
+
+def test_build_submission_accepts_option_text_answer():
+    payload, found, total, details = build_submission(_one_choice_work(), _StubTiku("乙的说法"))
+    assert (found, total) == (1, 1)
+    assert payload["answerq1"] == "B"
+    assert details[0]["answered"] is True
+
+
+def test_build_submission_leaves_choice_empty_when_unmappable():
+    payload, found, total, details = build_submission(
+        _one_choice_work(), _StubTiku("Logistic 曲线呈 S 形"))
+    assert (found, total) == (0, 1)
+    assert payload["answerq1"] == ""
+    assert details[0]["answered"] is False
+    assert details[0]["reason"] == "答案无法对应选项"
 
 
 # ----------------------------------------------------------------------

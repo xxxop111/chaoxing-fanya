@@ -121,6 +121,58 @@ def _normalise_letters(answer: str) -> str:
     return "".join(sorted({x.upper() for x in letters}))
 
 
+_OPTION_PREFIX = re.compile(r"^[A-Za-z]\s*[.．、,，)）:：]?\s*")
+_NON_WORD = re.compile(r"[\s，。,.、;；:：()（）\[\]【】\"'`<>&=+*/\\|~^%$#@!?！？、-]+")
+
+
+def _option_plain(option: str) -> str:
+    """选项文本 → 去掉字母前缀与全部标点空白的可比对形式。"""
+    text = _OPTION_PREFIX.sub("", str(option or "").strip())
+    return _NON_WORD.sub("", text).lower()
+
+
+def _resolve_choice_answer(answer: str, options: list) -> Optional[str]:
+    """把题库答案对应到「选项字母」，对应不上返回 None。
+
+    单选/多选的提交字段只接受选项字母。历史上这里用
+    ``_normalise_letters(answer) or str(answer).strip()`` 兜底：题库一旦返回选项原文
+    （例如「阻滞增长模型」），整段文本会被塞进单选字段，服务端只能判错，
+    而且前端「我的答案」栏也会显示成一段话。本函数只接受能确定对应关系的答案：
+
+    * 纯字母答案（``"B"``、``"AC"``、``"答：B"``）且字母都在选项范围内 → 直接用；
+    * 选项原文或「B. 原文」→ 反查字母；
+    * 其余 → ``None``（宁可留空，也不写错）。
+    """
+    options = list(options or [])
+    allowed = [chr(ord("A") + i) for i in range(len(options))]
+    raw = str(answer or "").strip()
+    if not raw:
+        return None
+
+    letters = "".join(sorted({c.upper() for c in re.findall(r"[A-Za-z]", raw)}))
+    core = re.sub(r"^[^A-Za-z]+|[^A-Za-z]+$", "", raw)
+    # 纯字母答案：前后可以带「答：」这类引导词，但中间不能夹着一堆文本
+    if letters and all(x in allowed for x in letters) and len(core) <= max(4, 2 * len(letters) + 2):
+        return letters
+
+    # 选项原文（可能带前缀，也可能是「B. 原文」）→ 反查字母
+    plain_answer = _option_plain(raw)
+    if plain_answer:
+        best: Optional[tuple[int, str]] = None
+        for idx, opt in enumerate(options):
+            plain_opt = _option_plain(opt)
+            if not plain_opt:
+                continue
+            if plain_opt == plain_answer:
+                return allowed[idx]
+            if len(plain_opt) >= 2 and (plain_opt in plain_answer or plain_answer in plain_opt):
+                if best is None or len(plain_opt) > best[0]:
+                    best = (len(plain_opt), allowed[idx])
+        if best is not None:
+            return best[1]
+    return None
+
+
 def build_submission(parsed: dict, tiku: Any) -> tuple[dict, int, int, list]:
     """按题目查询题库并拼出提交字段。
 
@@ -177,7 +229,18 @@ def build_submission(parsed: dict, tiku: Any) -> tuple[dict, int, int, list]:
                 value = "true" if str(answer).strip() in (
                     "正确", "对", "T", "t", "true", "TRUE", "√", "是", "1") else "false"
             else:
-                value = _normalise_letters(answer) or str(answer).strip()
+                value = _resolve_choice_answer(str(answer), q["options"])
+                if value is None:
+                    # 答案既不是选项字母，也对不上任何选项原文：这一题宁可留空。
+                    # 旧行为是把整段文本写进单选字段，服务端判错，用户看到的
+                    # 「我的答案」也变成一段话（曾经真的发生过）。
+                    logger.warning("题目 {} 的答案无法对应到选项字母，本題按未命中处理：{}",
+                                   qid, str(answer)[:60])
+                    found -= 1
+                    details.append({"qid": qid, "type": q["type"], "title": q["title"],
+                                    "answer": str(answer).strip(), "answered": False,
+                                    "reason": "答案无法对应选项"})
+                    continue
             for name in q["answerFields"]:
                 if name.startswith("answer") and not name.startswith("answertype"):
                     payload[name] = value

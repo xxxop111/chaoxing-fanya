@@ -52,6 +52,50 @@
 * 任务级：`isAllowStudyTask` → `任务学习时间：… 当前不在学习时间内`。
 * 任务点级：`getToStudyUrl` → `任务点学习时间：… 当前不在学习时间内`。
 
+**[已验证，2026-10-16]** 窗口关掉以后，服务端在 `getToStudyUrl` 的失败响应里
+**什么 id 都不给**（实测 `{"code":400,"result":false,"message":"…"}`，没有 url /
+workId / publishRelationUuid / topicId），所以依赖这次跳转的类型在窗口结束后
+**没有任何入口**：作业拿不到 workId、AI实践拿不到 `publishRelationUuid`、讨论拿不到
+topicId。已排除的旁路（都实测失败或不可达）：
+
+* 作业「修改答案」入口：`/mooc-ans/mooc2/work/dowork?…&answerId=…` 直接返回
+  **403「很抱歉，您没有权限访问这个页面！」**；且判定页里 `redoTimes=0`
+  （`redoWork()` 的文案是「你还可以重做0次」）——平台自己也不允许重做。
+* 作业列表接口：`/mooc-ans/mooc2/work/task` 是按 `workId` 打开的详情页，
+  **不存在**「列出全部作业」的 HTTP 接口（前端从课程页 HTML 里拿 workId）。
+  ⚠️ 但这条不是**硬**限制：mooc1 课程页 HTML 里带着每份作业的 `workId/enc`，
+  所以「窗口关闭的课程作业」在原理上仍可从课程页 HTML 取 workId 后直达
+  `mooc2/work/task` 答题（**尚未实测**，列为后续工作）。
+* 文档/视频/AI实践/讨论：`externalDataId` 不是进入资源所需的那个 id（AI实践上它是
+  评分 `libraryUuid`），借它拼阅读器/播放器 URL 都不成立。
+
+**[已验证]** 唯一的例外是**章节类**（`planType=8`，handler `chapter`）：
+`handle_chapter` 只用课程 id + `plan.externalDataId`（= 小整数，精确等于 mooc1 的
+章节 point id），完全不碰任务引擎的跳转。实测 2026-10-16 在窗口已结束
+（2026-09-20~09-30）的 plan 8110517「5.1 人口增长-马尔萨斯模型视频教学」上：
+入口侧 `get_course_point` → `get_job_list` → `process_job` 正常播放并上报；
+**完成侧也确实生效** —— 该任务点由 `isFinish=False` 变为 `isFinish=True`，
+服务端生成评分记录（`createDate/updateDate = 2026-10-16T11:07:51Z`，
+`jobCompleteRate=100.0`、`moocChapterFinish=1`、`moocChapterId=1222389482`）。
+因此 `run_item` 里 `HANDLERS_WITHOUT_STUDY_URL = {"chapter"}`：窗口失败时只有
+章节继续执行，其余类型如实记为跳过。
+
+> ⚠️ **读回要留出延迟**：同一任务点刚跑完时立刻回读，`verify_plan_finished` 与
+> 任务列表里的 `isFinish` 仍然是 `False`（实测跑完瞬间读到 False，几分钟后才是
+> True）。判定章节类是否完成不能只看紧邻的那一次回读。
+
+> ⚠️ **耗时**：该任务点的 `planBreakthroughSet` 里 `enableTripleSpeed=0`（平台禁倍速），
+> 视频总时长 3398 秒，实测真实播放约 **18 分钟**才完成。窗口关闭的章节类「能做」
+> 但**不便宜**，盘点里要给这个预期。
+
+**[约定]** 盘点（`build_task_preview`）现在会为每个未完成任务点探测一次
+`getToStudyUrl`，把窗口状态写成 `window_state`（`open` / `expired` / `not_open`），
+并把「窗口已结束且处理器依赖跳转」的任务点（`item.unreachable`）从
+「待完成 / 可自动完成」里挪到 `expiredCount`（前端标「窗口已过」，说明文字带上
+窗口终点）。理由：不探测就只能把它们永远显示成能做，用户会一直等一个永远不会开的窗口。
+章节类窗口关闭**不算** `unreachable`（它不依赖这次跳转，实测还能完成），
+只是 `windowState="expired"` + `windowNote` 提示窗口已过。
+
 ## 3. 任务点类型（全库实测分布）
 
 对本人 26 门课程盘点，7 门存在任务引擎任务，共 28 个任务、127 个待完成任务点。
