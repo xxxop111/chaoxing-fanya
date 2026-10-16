@@ -601,6 +601,10 @@
                   <span class="mono-note">并发任务点</span>
                   <input class="input" id="fanya-concurrency" type="number" step="1" min="1" max="8" value="1" style="width:76px;" />
                 </label>
+                <label class="row" style="gap:8px; align-items:center;">
+                  <input type="checkbox" id="preview-show-expired" />
+                  <span class="mono-note">显示窗口已过</span>
+                </label>
               </div>
               <div id="preview-summary" class="grid-3" style="margin-bottom:16px;"></div>
               <div id="preview-tree"></div>
@@ -810,7 +814,7 @@
   var state = {
     view: "account", demo: false, healthOk: null, version: null, lastHeartbeat: null, rawConfig: null,
     username: "", hasCookies: false, courses: [], selected: {},
-    preview: null, previewTask: null, previewPending: false,
+    preview: null, previewTask: null, previewPending: false, showExpired: false,
     run: null, runKind: null, runId: null, console: [], autoScroll: true,
     approvals: [], approvalsPending: 0, showingDecided: false,
     config: null, notopen: "retry"
@@ -1234,7 +1238,10 @@
       var head = '<div class="row-between" style="margin:18px 0 10px;"><h3>' + esc(co.title) + '</h3>' + (co.error ? '<span class="pill pill-err">' + esc(co.error) + '</span>' : (co.hasTaskEngine ? '<span class="tag">任务引擎</span>' : '<span class="pill pill-idle">无任务引擎</span>')) + "</div>";
       if (!co.tasks || !co.tasks.length) return '<div class="tree-group">' + head + '<p class="lede">该课程没有可盘点的任务点。</p></div>';
       var tasks = co.tasks.map(function (t) {
-        var items = (t.items || []).map(function (it) {
+        var all = t.items || [];
+        // 窗口已过 = 平台不再允许进入，留在列表里只会把「能做的事」淹掉；默认收起，工具栏可展开
+        var hidden = all.filter(function (it) { return !!it.expired && !state.showExpired; });
+        var items = all.filter(function (it) { return !(!!it.expired && !state.showExpired); }).map(function (it) {
           var selectable = it.status === "auto" || it.status === "partial";
           if (selectable) anySelectable = true;
           return '<div class="tree-item' + (selectable ? "" : " is-disabled") + '" data-od-id="plan-' + esc(it.planId) + '">' +
@@ -1243,6 +1250,9 @@
             '<span class="tag">' + esc(it.typeLabel || "任务点") + "</span>" +
             '<button class="btn btn-sm btn-ghost" data-open="' + esc(it.entryUrl || "#") + '">打开</button></div>';
         }).join("");
+        if (!items && hidden.length) {
+          items = '<p class="lede" style="margin:2px 0 0 2px;">窗口已过 ' + hidden.length + ' 项已收起（勾上「显示窗口已过」可展开）</p>';
+        }
         var meta = "未完成 " + (t.pendingCount || 0) + (t.expiredCount ? " · 窗口已过 " + t.expiredCount : "") + (t.belowThresholdCount ? " · 未达标 " + t.belowThresholdCount : "");
         return '<div class="tree-task"><div class="tree-task-head"><span class="title" style="font-weight:600;">' + esc(t.name) + '</span><span class="grow"></span><span class="meta">' + meta + "</span></div>" + items + "</div>";
       }).join("");
@@ -1303,6 +1313,10 @@
     });
   }
   function finishPreview(btn, html) { btn.disabled = false; btn.innerHTML = html; $("#courses-progress-card").hidden = true; }
+  $("#preview-show-expired").addEventListener("change", function () {
+    state.showExpired = this.checked;
+    if (state.preview) renderPreviewTree();
+  });
 
   $("#btn-start-learn").addEventListener("click", function () {
     var ids = selectedCourseIds();

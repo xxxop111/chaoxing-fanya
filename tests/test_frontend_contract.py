@@ -154,3 +154,15 @@ def test_preview_surfaces_submit_allowance(html):
     assert "submitRemaining" in html, "前端没有读盘点的 submitRemaining"
     assert "不可重交" in html and "可重交" in html, "作业的提交次数没有做成标签"
 
+
+def test_expired_items_are_collapsed_by_default(html):
+    """窗口已过的条目默认收起。
+
+    窗口一过平台就不让进了（补不了），把它们和能做的任务点混在一起，用户只看到
+    一片「窗口已过」。默认收起、工具栏给开关展开，计数仍在汇总和任务头上。
+    """
+    assert 'id="preview-show-expired"' in html, "找不到「显示窗口已过」开关"
+    assert "showExpired" in html, "前端没有记住开关状态"
+    assert "项已收起" in html, "全部收起后没有给出提示"
+    assert "it.expired" in html, "收起逻辑没有按 expired 判定"
+

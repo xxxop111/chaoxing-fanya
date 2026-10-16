@@ -96,6 +96,14 @@ topicId。已排除的旁路（都实测失败或不可达）：
 章节类窗口关闭**不算** `unreachable`（它不依赖这次跳转，实测还能完成），
 只是 `windowState="expired"` + `windowNote` 提示窗口已过。
 
+**[约定]** 前端默认**收起** `item.expired`（= `unreachable`）的条目，工具栏给一个
+「显示窗口已过」勾选展开（`web/opendesign/chaoxing-assistant.html` 的
+`#preview-show-expired` / `state.showExpired`）。理由：窗口一过平台就不让进，补不了；
+混在能做的任务点里只会把「能做的事」淹掉（实测 2026-10-16 数学建模：线性规划窗口已过 7 项、
+马尔萨斯人口模型窗口已过 10 项，能做的只有 21 项）。汇总与任务头上的 `expiredCount`
+照旧计数，一个数都不改——收起不等于隐藏事实。某个任务点的条目**全部**被收起时，
+原地留一行「窗口已过 N 项已收起」。
+
 **[约定]** 成绩与「未达标」：盘点里每个任务点还带 `score` / `threshold` /
 `belowThreshold`，任务级与汇总各有一个 `belowThresholdCount`。
 
