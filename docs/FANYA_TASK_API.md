@@ -352,6 +352,54 @@ https://data-xxt.aichaoxing.com/analysis/ac_mark?…
 用户改用网络题库时生效。回归保护：
 `tests/test_parsers.py::test_handle_course_work_passes_ai_verifier_down`。
 
+#### 6.2.2 一次性作业保护（2026-10-16 自查）
+
+**背景（用户追问「为什么会出现只有一次机会、而且分数很低」）**：作业交上去之后
+能不能改，取决于平台给的 `redoTimes`。它**只在已判分的作业详情页里**才有
+（页面模板：`var redoTimes = 0 + 0 - 0;`，是个算式，必须用 `_parse_redo_times`
+解析，不能 `int()`）；**未提交**的作答页里没有任何次数信息 —— 也就是说，交卷前
+"还剩几次机会"是**不可知**的。实测：全账号唯一一个「未完成 + 窗口开放」的作业就是
+8379428（planId 8379428 已经交过、`redoTimes=0`、得分 44.5 < 达标线 50），其余作业
+`getToStudyUrl` 全部报「不在学习时间内」（窗口已过）。
+
+**发现的洞**（`_audit_hole.py`，纯本地可复现）：
+
+| 情况 | 加固前 | 加固后 |
+| --- | --- | --- |
+| `cover_rate` 没配（默认 0）+ 一题未命中 | `do_submit=True` —— **把空白卷交上去** | `do_submit=False`，连草稿都不保存 |
+| `cover_rate=0.8` | 只保存草稿（阈值生效） | 不变 |
+| 一次性作业（`redoTimes` 查不到或为 0） | 与前一种完全一样，照样自动交 | `do_submit=False`，只保存草稿 |
+
+**加固规则**（`api/fanya_work.py`）：
+
+* `submission_blockers()` 统一给出「不该自动交卷」的理由：一题未命中 → 绝不自动交；
+  一次性作业 → 只有用户显式放行**且整卷都答上**才交；`cover_rate` 设了阈值时照旧。
+* `build_prepared(..., single_shot=…, allow_single_shot=…)` 把判定写进载荷：
+  `do_submit` / `blocked_reason` / `single_shot` 三个字段，日志里直接写清
+  「本次不自动提交：<原因>（改为只保存草稿，可在课程页面核对后自己提交）」。
+* `handle_course_work` 从 `ctx.item.extra["redo_times"]` 取次数：**查不到一律按
+  「只有一次」处理**（`single_shot = redo_times is None or redo_times <= 0`），
+  两条路径都传下去；审批预览里加一行「⚠️ …批准后会直接交卷、不可逆（交上去就不能
+  改了）」，`extra["singleShot"]=true`，返回文案也会带「该作业不可重做」。
+* 想恢复全自动：在 `settings.tiku_config` 里加 `allow_one_shot_submit: "true"`
+  （`_opt_in` 只认 `1/true/yes/on`）；即便如此，仍有没答上的题时也只保存草稿。
+* 审批路径不变：用户点「批准」仍会真正提交（`submit_prepared(force_submit=True)`）
+  —— 那是用户看过预览后的显式决定。
+
+回归保护：`tests/test_parsers.py` 的
+`test_build_prepared_never_submits_an_empty_sheet`、
+`test_build_prepared_single_shot_stays_draft_even_when_full`、
+`test_build_prepared_single_shot_with_opt_in_needs_full_coverage`、
+`test_opt_in_only_accepts_truthy_strings`、
+`test_submission_blockers_reports_cover_rate`、
+`test_handle_course_work_treats_unknown_redo_times_as_one_shot`、
+`test_handle_course_work_warns_irreversible_in_approval_preview`。
+
+> ⚠️ 同一个 `tests/test_parsers.py` 里还修掉一个测试基建问题：内置 runner
+> （`if __name__ == "__main__"`）原来夹在文件中间，`_run_all()` 用 `globals()`
+> 收集用例，于是**它下面定义的用例永远不会执行**（`pytest tests` 才发现）。
+> runner 现在放在文件末尾。
+
 ### 6.3 视频（planType 10）——累计观看时长门槛
 
 任务引擎有**自己的视频学习页**（不走 mooc1 的 video 模块）：

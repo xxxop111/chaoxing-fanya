@@ -115,6 +115,46 @@ def parse_work_page(html: str) -> dict:
             "answerwqbid": ",".join(q["id"] for q in questions) + ","}
 
 
+# 一次性作业：平台没给重做次数（或次数已经用完）时，交卷不可逆。
+# 这类作业默认**只保存草稿**，必须由用户显式批准（或在题库设置里打开
+# ``allow_one_shot_submit`` 且整卷都答上）才会真正提交。
+# 详见 docs/FANYA_TASK_API.md「一次性作业保护」。
+SINGLE_SHOT_MIN_RATE = 1.0
+_OPT_IN_TRUE = ("1", "true", "yes", "on")
+
+
+def _opt_in(value: Any) -> bool:
+    """把配置里的 "true"/"1"/"yes"/"on" 读成 True（其余一律 False）。"""
+    return str(value or "").strip().lower() in _OPT_IN_TRUE
+
+
+def submission_blockers(*, total: int, found: int, rate: float, cover_rate: float = 0.0,
+                        single_shot: bool = False,
+                        allow_single_shot: bool = False) -> list:
+    """列出「这一次不该自动交卷」的理由；空列表表示可以交。
+
+    2026-10-16 自查结论：``cover_rate`` 默认是 0（配置里根本没有这个键），
+    于是**一道题都没答上也会** ``do_submit=True`` 把空白卷交上去；如果这恰好
+    是「平台不给重做」的作业，这一交就不可逆（用户遇到过 44.5 分、redoTimes=0）。
+    所以这里补三条硬规则：
+
+    * 一题未命中 → 绝不自动交（空白卷必然低分）；
+    * 一次性作业 → 只有用户显式放行、且整卷都答上时才交；
+    * ``cover_rate`` 设了阈值时照旧生效。
+    """
+    reasons: list = []
+    if total and found <= 0:
+        reasons.append("一道题都没答上（空白卷必然低分）")
+    if single_shot:
+        if not allow_single_shot:
+            reasons.append("平台没给这个作业重做次数（或查不到），交卷不可逆")
+        elif found < total:
+            reasons.append(f"一次性作业还有 {total - found} 题没答上，交卷不可逆")
+    if cover_rate and rate < cover_rate:
+        reasons.append(f"覆盖率 {rate:.0%} 低于设定阈值 {cover_rate:.0%}")
+    return reasons
+
+
 def _normalise_letters(answer: str) -> str:
     """把题库答案规整成选项字母串（如 "A"、"AC"）。"""
     letters = re.findall(r"[A-Za-z]", answer or "")
@@ -431,13 +471,17 @@ def parse_hidden_inputs(html: str) -> dict:
 def complete_course_work(session: requests.Session, entry_url: str, tiku: Any, *,
                          save_only: bool = False, cover_rate: float = 0.0,
                          on_log: Optional[Callable] = None, timeout: float = 30.0,
-                         verifier: Any = None
+                         verifier: Any = None, single_shot: bool = False,
+                         allow_single_shot: bool = False
                          ) -> tuple[bool, str]:
     """完成一个课程作业任务点。
 
     ``save_only=True``（对应题库设置 ``submit=1``）只保存草稿不提交；
     ``cover_rate`` 是最低命中率（0~1 的小数），未达到时同样只保存不提交，
     避免把大片空白答案交上去。
+
+    ``single_shot=True``（平台不给重做次数、或查不到）时，本次**只保存草稿**，
+    除非 ``allow_single_shot=True`` 且整卷都答上 —— 交错了没有第二次机会。
     """
     log = on_log or (lambda msg: logger.info(msg))
 
@@ -476,9 +520,16 @@ def complete_course_work(session: requests.Session, entry_url: str, tiku: Any, *
         return False, "未在作业页解析到任何题目"
 
     prepared = build_prepared(parsed, final_url, tiku, cover_rate=cover_rate, log=log,
-                              verifier=verifier)
+                              verifier=verifier, single_shot=single_shot,
+                              allow_single_shot=allow_single_shot)
     if prepared["total"] == 0:
         return False, "作业页没有题目"
+
+    # 一题都没答上时连草稿都不保存：空白卷对用户没有任何价值，而某些课程把
+    # pyFlag=1 也当作一次作答（不想在这种作业上冒任何风险）。
+    if prepared["found"] == 0:
+        return False, (f"{prepared['total']} 题全部未命中（可能是纯图片题），"
+                       "没有可提交的答案，本次不保存也不提交")
 
     if save_only:
         prepared["do_submit"] = False
@@ -487,17 +538,29 @@ def complete_course_work(session: requests.Session, entry_url: str, tiku: Any, *
     ok, msg = submit_prepared(session, prepared, timeout=timeout)
     if not ok:
         return False, msg
+    if prepared.get("blocked_reason"):
+        msg = f"{msg}（未自动交卷：{prepared['blocked_reason']}）"
     return True, msg
 
 
 def build_prepared(parsed: dict, referer: str, tiku: Any, *, cover_rate: float = 0.0,
-                   log: Optional[Callable] = None, verifier: Any = None) -> dict:
-    """把「读到的题目 + 题库答案」整理成一个可提交/可送审的载荷（不做任何写操作）。"""
+                   log: Optional[Callable] = None, verifier: Any = None,
+                   single_shot: bool = False, allow_single_shot: bool = False) -> dict:
+    """把「读到的题目 + 题库答案」整理成一个可提交/可送审的载荷（不做任何写操作）。
+
+    ``single_shot=True`` 表示这是「平台不给重做次数（或查不到）」的作业：
+    除非 ``allow_single_shot`` 显式放行且整卷都答上，否则 ``do_submit`` 一律
+    为 False（只保存草稿）。判断依据见 :func:`submission_blockers`。
+    """
     log = log or (lambda m: logger.info(m))
     payload, found, total, details = build_submission(parsed, tiku, verifier=verifier)
     rate = (found / total) if total else 0.0
-    if cover_rate and rate < cover_rate:
-        log(f"题库覆盖率 {rate:.0%} 低于阈值 {cover_rate:.0%}，将只保存不提交")
+    reasons = submission_blockers(total=total, found=found, rate=rate,
+                                  cover_rate=cover_rate, single_shot=single_shot,
+                                  allow_single_shot=allow_single_shot)
+    if reasons:
+        log("本次不自动提交：" + "；".join(reasons)
+            + "（改为只保存草稿，可在课程页面核对后自己提交）")
     return {
         "action": parsed["action"],
         "referer": referer,
@@ -506,8 +569,11 @@ def build_prepared(parsed: dict, referer: str, tiku: Any, *, cover_rate: float =
         "total": total,
         "rate": rate,
         "details": details,
-        # 覆盖率不足时默认不提交；是否提交最终由调用方（含审批）决定
-        "do_submit": not (cover_rate and rate < cover_rate),
+        # 不满足「可以自动交卷」的条件时默认不提交；
+        # 是否提交最终由调用方（含用户审批）决定。
+        "do_submit": not reasons,
+        "blocked_reason": "；".join(reasons),
+        "single_shot": bool(single_shot),
         "answerwqbid": parsed.get("answerwqbid", ""),
     }
 
@@ -548,11 +614,14 @@ def submit_prepared(session: requests.Session, prepared: dict, *,
 
 def prepare_course_work(session: requests.Session, entry_url: str, tiku: Any, *,
                         cover_rate: float = 0.0, on_log: Optional[Callable] = None,
-                        timeout: float = 30.0, verifier: Any = None
+                        timeout: float = 30.0, verifier: Any = None,
+                        single_shot: bool = False, allow_single_shot: bool = False
                         ) -> tuple[bool, str, dict]:
     """**只准备、不写任何东西**：读题 + 查题库，返回送审载荷。
 
     用于「生成后暂停、逐条审批」流程 —— 在用户批准之前，既不保存草稿也不提交。
+    ``single_shot`` 会随载荷带给审批界面：一次性作业在批准前必须让用户看到
+    「交上去就不能改了」。
     """
     log = on_log or (lambda m: logger.info(m))
     try:
@@ -581,6 +650,7 @@ def prepare_course_work(session: requests.Session, entry_url: str, tiku: Any, *,
         return False, gate_msg, {}
 
     prepared = build_prepared(parsed, final_url, tiku, cover_rate=cover_rate, log=log,
-                              verifier=verifier)
+                              verifier=verifier, single_shot=single_shot,
+                              allow_single_shot=allow_single_shot)
     prepared["entry_url"] = entry_url
     return True, summarize_prepared(prepared), prepared

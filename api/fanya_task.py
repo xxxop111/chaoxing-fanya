@@ -2841,7 +2841,7 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
     ``submit`` / ``cover_rate`` 策略直接提交。
     """
     from api.fanya_work import (
-        complete_course_work, prepare_course_work, submit_prepared,
+        _opt_in, complete_course_work, prepare_course_work, submit_prepared,
     )
 
     entry_url = ctx.study_url.get("url") or ""
@@ -2871,18 +2871,43 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
     # 主题库本身就是 AI 时返回 None（同一来源复核没有意义，只会白花调用）。
     verifier = _build_ai_verifier(tiku)
 
+    # 一次性作业保护（2026-10-16 自查）：作业页只有在**已提交**的判分页里才写
+    # redoTimes；未提交时平台不告诉我们还剩几次机会，所以「查不到」一律按
+    # 「只有一次」处理 —— 交了错答案就没有第二次机会。这类作业默认只保存草稿，
+    # 要真正交卷得让用户在审批栏里核对后批准（或显式打开
+    # tiku_config.allow_one_shot_submit，且整卷都答上）。
+    item = getattr(ctx, "item", None)
+    redo_raw = (getattr(item, "extra", None) or {}).get("redo_times") if item is not None else None
+    try:
+        redo_times = int(redo_raw) if redo_raw is not None else None
+    except (TypeError, ValueError):
+        redo_times = None
+    single_shot = redo_times is None or redo_times <= 0
+    try:
+        allow_single_shot = _opt_in((getattr(tiku, "_conf", None) or {}).get("allow_one_shot_submit"))
+    except Exception as exc:  # noqa: BLE001 - 配置形态不定
+        logger.debug("读取 allow_one_shot_submit 失败，按未放行处理: {}", exc)
+        allow_single_shot = False
+    if single_shot:
+        logger.warning(
+            "[作业] 「{}」的平台重做次数{}，本次不会自动交卷；"
+            "需要交卷时请在待审批里核对答案后批准",
+            getattr(ctx, "label", ""), "为 0" if redo_times == 0 else "查不到")
+
     if not ctx.require_approval:
         return complete_course_work(
             ctx.client.session, entry_url, tiku,
             save_only=save_only, cover_rate=cover_rate, on_log=on_log,
-            verifier=verifier,
+            verifier=verifier, single_shot=single_shot,
+            allow_single_shot=allow_single_shot,
         )
 
     # ---- 审批模式：只准备，不写任何东西 ----
     ok, msg, prepared = prepare_course_work(
         ctx.client.session, entry_url, tiku,
         cover_rate=cover_rate, on_log=on_log,
-        verifier=verifier,
+        verifier=verifier, single_shot=single_shot,
+        allow_single_shot=allow_single_shot,
     )
     if not ok:
         return False, msg
@@ -2900,14 +2925,20 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
         return False, (f"题库对这 {total} 题全部未命中（可能是纯图片题），"
                        "已按未命中处理，未提交任何内容")
 
+    warning = ""
+    if prepared.get("single_shot"):
+        warning = ("\n⚠️ 平台没给这个作业重做次数（或查不到）：批准后会直接交卷、"
+                   "不可逆（交上去就不能改了）—— 请先核对上面的答案。")
     entry_id = ctx.register_approval(
         kind="course_work",
-        preview=f"{ctx.label}\n{msg}",
+        preview=f"{ctx.label}\n{msg}{warning}",
         submit_fn=_submit,
-        extra={"total": total, "found": found, "rate": prepared["rate"]},
+        extra={"total": total, "found": found, "rate": prepared["rate"],
+               "singleShot": bool(prepared.get("single_shot"))},
     )
     return True, (f"已生成 {total} 题答案（命中 {found} 题），"
-                  f"待审批后提交 [id={entry_id}]")
+                  f"待审批后提交 [id={entry_id}]"
+                  + ("（该作业不可重做，批准即不可逆）" if prepared.get("single_shot") else ""))
 
 
 @register_handler("chapter")

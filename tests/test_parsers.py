@@ -665,12 +665,6 @@ def _run_all() -> int:
     return 1 if failed else 0
 
 
-if __name__ == "__main__":
-    import sys as _sys
-
-    _sys.exit(_run_all())
-
-
 def test_handle_course_work_passes_ai_verifier_down():
     """handler 必须把复核器真的传下去。
 
@@ -751,3 +745,181 @@ def test_handle_course_work_passes_ai_verifier_down():
         answer_mod.AI = real_ai
         fw.complete_course_work = real_complete
         fw.prepare_course_work = real_prepare
+
+
+# ----------------------------------------------------------------------
+# 一次性作业保护（2026-10-16 自查）：平台不给重做次数时不能盲交
+# ----------------------------------------------------------------------
+
+
+def _work_parsed(n: int = 2) -> dict:
+    questions = [{"id": f"q{i}", "type": "single", "title": f"题目{i}",
+                  "options": ["A. 甲", "B. 乙"],
+                  "answerFields": {f"answerq{i}": "", f"answertypeq{i}": 0}}
+                 for i in range(1, n + 1)]
+    return {"action": "/save", "formData": {}, "answerwqbid": "q1,",
+            "questions": questions}
+
+
+class _AnswerBookTiku:
+    """按题干返回答案的假题库（多次查询返回不同答案用）。
+
+    注意：不要复用文件上半部分的 ``_StubTiku``（它是「每次查询都返回同一份
+    答案」，签名不同）。
+    """
+
+    def __init__(self, answers=None):
+        self.answers = answers or {}
+
+    def query(self, q):
+        return self.answers.get(q["title"])
+
+
+def test_build_prepared_never_submits_an_empty_sheet():
+    """一道题都没答上时，旧代码会 do_submit=True 把空白卷交上去。"""
+    from api import fanya_work as fw
+
+    prepared = fw.build_prepared(_work_parsed(2), "http://x", None, cover_rate=0.0)
+    assert prepared["do_submit"] is False, prepared
+    assert "一道题都没答上" in prepared["blocked_reason"]
+
+
+def test_build_prepared_single_shot_stays_draft_even_when_full():
+    from api import fanya_work as fw
+
+    tiku = _AnswerBookTiku({"题目1": "A", "题目2": "B"})
+    prepared = fw.build_prepared(_work_parsed(2), "http://x", tiku, single_shot=True)
+    assert prepared["rate"] == 1.0
+    assert prepared["do_submit"] is False, prepared
+    assert "不可逆" in prepared["blocked_reason"]
+    assert prepared["single_shot"] is True
+
+
+def test_build_prepared_single_shot_with_opt_in_needs_full_coverage():
+    from api import fanya_work as fw
+
+    partial = fw.build_prepared(_work_parsed(2), "http://x", _AnswerBookTiku({"题目1": "A"}),
+                                single_shot=True, allow_single_shot=True)
+    assert partial["do_submit"] is False
+    assert "还有 1 题没答上" in partial["blocked_reason"]
+
+    full = fw.build_prepared(_work_parsed(2), "http://x",
+                             _AnswerBookTiku({"题目1": "A", "题目2": "B"}),
+                             single_shot=True, allow_single_shot=True)
+    assert full["do_submit"] is True
+    assert full["blocked_reason"] == ""
+
+
+def test_opt_in_only_accepts_truthy_strings():
+    from api.fanya_work import _opt_in
+
+    for value in ("true", "True", "1", "yes", "on", " ON "):
+        assert _opt_in(value) is True, value
+    for value in ("", None, "0", "false", "no", "随便"):
+        assert _opt_in(value) is False, value
+
+
+def test_submission_blockers_reports_cover_rate():
+    from api.fanya_work import submission_blockers
+
+    reasons = submission_blockers(total=4, found=2, rate=0.5, cover_rate=0.8)
+    assert reasons and "低于设定阈值" in reasons[0]
+    assert submission_blockers(total=4, found=4, rate=1.0, cover_rate=0.8) == []
+
+
+def test_handle_course_work_treats_unknown_redo_times_as_one_shot():
+    """平台查不到重做次数时，handler 必须按「只有一次机会」处理。"""
+    from types import SimpleNamespace
+
+    import api.fanya_work as fw
+    from api import fanya_task as ft
+
+    class _Tiku:
+        _conf = {"provider": "AI", "endpoint": "e", "key": "k", "model": "m"}
+        COVER_RATE = 0.0
+
+        def get_submit_params(self):
+            return "0"
+
+    captured = {}
+
+    def _fake_complete(session, entry_url, tiku, **kwargs):
+        captured.update(kwargs)
+        return True, "ok"
+
+    real_complete = fw.complete_course_work
+    ctx = SimpleNamespace(
+        study_url={"url": "http://x"}, chaoxing=SimpleNamespace(tiku=_Tiku()),
+        client=SimpleNamespace(session=object()), require_approval=False,
+        label="作业", item=None, register_approval=lambda **kwargs: "a1",
+    )
+    try:
+        fw.complete_course_work = _fake_complete
+
+        # 1) 什么都没探测到 → 按一次性处理
+        assert ft.handle_course_work(ctx)[0] is True
+        assert captured["single_shot"] is True
+        assert captured["allow_single_shot"] is False
+
+        # 2) 平台还剩 2 次重做 → 不是一次性，正常交卷
+        ctx.item = SimpleNamespace(extra={"redo_times": 2})
+        captured.clear()
+        assert ft.handle_course_work(ctx)[0] is True
+        assert captured["single_shot"] is False
+
+        # 3) 次数为 0 + 配置显式放行 → 两个标记都要传下去
+        ctx.item = SimpleNamespace(extra={"redo_times": 0})
+        ctx.chaoxing.tiku._conf = dict(_Tiku._conf, allow_one_shot_submit="true")
+        captured.clear()
+        assert ft.handle_course_work(ctx)[0] is True
+        assert captured["single_shot"] is True
+        assert captured["allow_single_shot"] is True
+    finally:
+        fw.complete_course_work = real_complete
+
+
+def test_handle_course_work_warns_irreversible_in_approval_preview():
+    from types import SimpleNamespace
+
+    import api.fanya_work as fw
+    from api import fanya_task as ft
+
+    class _Tiku:
+        _conf = {"provider": "AI", "endpoint": "e", "key": "k", "model": "m"}
+        COVER_RATE = 0.0
+
+        def get_submit_params(self):
+            return "0"
+
+    def _fake_prepare(session, entry_url, tiku, **kwargs):
+        assert kwargs["single_shot"] is True
+        return True, "预览文本", {"total": 2, "found": 2, "rate": 1.0,
+                                  "payload": {}, "single_shot": True}
+
+    approvals = {}
+    real_prepare = fw.prepare_course_work
+    ctx = SimpleNamespace(
+        study_url={"url": "http://x"}, chaoxing=SimpleNamespace(tiku=_Tiku()),
+        client=SimpleNamespace(session=object()), require_approval=True,
+        label="作业", item=None,
+        register_approval=lambda **kwargs: approvals.update(kwargs) or "a1",
+    )
+    try:
+        fw.prepare_course_work = _fake_prepare
+        ok, message = ft.handle_course_work(ctx)
+        assert ok is True
+        assert "不可逆" in approvals["preview"]
+        assert approvals["extra"]["singleShot"] is True
+        assert "不可逆" in message
+    finally:
+        fw.prepare_course_work = real_prepare
+
+
+# ----------------------------------------------------------------------
+# 内置 runner 必须放在**文件末尾**：_run_all() 用 globals() 收集 test_*，
+# 放在中间会漏掉它下面定义的所有用例（2026-10-16 才发现）。
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    import sys as _sys
+
+    _sys.exit(_run_all())
