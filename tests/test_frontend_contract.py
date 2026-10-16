@@ -76,8 +76,12 @@ def test_no_hardcoded_host_or_port(html):
 
 
 def test_single_file_has_no_external_assets(html):
-    """单文件自包含：不能有 src=/href= 指向外部资源，否则离线打开就白屏。"""
-    refs = [m for m in re.findall(r"""(?:src|href)\s*=\s*["']([^"']+)["']""", html) if m]
+    """单文件自包含：不能有 src=/href= 指向外部资源，否则离线打开就白屏。
+
+    ``data:`` 内联 URI 不算外部资源（站点图标就是内联的，不额外带文件）。
+    """
+    refs = [m for m in re.findall(r"""(?:src|href)\s*=\s*["']([^"']+)["']""", html)
+            if m and not m.startswith("data:")]
     assert refs == [], f"界面引用了外部资源：{refs}"
 
 
@@ -180,5 +184,30 @@ def test_finished_items_are_collapsed_until_redo_is_on(html):
     assert 'id="preview-redo"' in html and '$("#preview-redo").addEventListener' in html, \
         "开关变了不重渲染，收起状态不会跟着变"
     assert "已完成 " in html and "项已收起" in html, "全部收起后没有给出提示"
+
+
+def test_brand_mark_matches_the_windows_icon(html):
+    """侧栏 logo 与 Windows 图标（chaoxing.ico）用同一套造型：蓝渐变圆角块 + 白「学」。
+
+    2026-10-16 起统一：此前侧栏是线条书页 SVG、任务管理器里是蓝底白三角，两套视觉。
+    """
+    assert '<span class="brand-mark" aria-hidden="true">学</span>' in html, \
+        "侧栏 logo 还是旧造型"
+    assert "linear-gradient(180deg, #2563EB" in html, "侧栏 logo 不是图标那套蓝渐变"
+    assert 'rel="icon"' in html and "%E5%AD%A6" in html, "浏览器标签页没有同款站点图标"
+
+
+def test_app_icon_carries_every_windows_size():
+    """``chaoxing.ico`` 是 exe / 任务管理器 / 任务栏 / 托盘 / 快捷方式 / 安装包共用的那一个。
+
+    少了 16/32 这些小尺寸，Windows 会把大图硬缩，任务栏和任务管理器里就糊了。
+    """
+    Image = pytest.importorskip("PIL.Image")
+    ico = os.path.join(ROOT, "chaoxing.ico")
+    assert os.path.exists(ico), "根目录的 chaoxing.ico 丢了（spec/iss/desktop_app 都指着它）"
+    with Image.open(ico) as im:
+        sizes = set(im.info.get("sizes", []))
+    missing = {(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)} - sizes
+    assert not missing, f"chaoxing.ico 缺尺寸：{sorted(missing)}"
 
 

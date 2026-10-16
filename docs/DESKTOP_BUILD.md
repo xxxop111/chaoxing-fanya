@@ -107,6 +107,30 @@ cd D:\03-开发\项目\ds\chaoxing-fanya
 * 卸载：Windows「应用」列表，或安装目录里的 `unins000.exe`；卸载会清掉运行时文件（`[UninstallDelete]`）。
 * 支持 `/DIR="..."` 指定安装目录、`/VERYSILENT /LOG="..."` 静默安装（用于自动化验证）。
 
+### 4.1 图标：一个 `chaoxing.ico` 管到底（2026-10-16 起）
+
+造型：**蓝渐变圆角方块 + 白色「学」字**（渐变 `#2563EB → #3B82F6`，圆角约边长 22.5%）。
+
+| 出现的地方 | 从哪里来 |
+| --- | --- |
+| exe 的文件图标（→ **任务管理器**、任务栏、资源管理器） | `chaoxing.ico`，由 `chaoxing-fanya.spec` 的 `icon=` 嵌入，并 `('chaoxing.ico', '.')` 随包带出 |
+| 窗口标题栏 / 托盘图标 | `desktop_app._icon_path()` 读 exe 旁边的 `chaoxing.ico`（找不到退 `resource/chaoxing.ico`，再退系统默认图标） |
+| 安装包自身与快捷方式 | `installer/chaoxing-fanya.iss`：`SetupIconFile=..\chaoxing.ico`、`UninstallDisplayIcon`、`[Icons]` |
+| 界面侧栏 logo | `web/opendesign/chaoxing-assistant.html` 的 `.brand-mark`（CSS 画同一个渐变块 + 「学」，不再用线条 SVG） |
+| 浏览器标签页图标 | 同文件的 `<link rel="icon" href="data:image/svg+xml,...">`（内联，不额外带文件，也不违反「单文件自包含」） |
+
+重新生成（每个尺寸都在 4× 画布上重画再降采样，避免 16×16 把「学」糊成一团）：
+
+```powershell
+.venv\Scripts\python.exe tools\make_icon.py                    # 覆盖根目录 chaoxing.ico
+.venv\Scripts\python.exe tools\make_icon.py --out _tmp.ico \   # 换字/换色看效果
+    --glyph 学 --top 2563EB --bottom 3B82F6
+```
+
+* 契约测试钉住两件事：`tests/test_frontend_contract.py::test_app_icon_carries_every_windows_size`
+  （六种尺寸一个都不能少）、`::test_brand_mark_matches_the_windows_icon`（侧栏与图标同一套视觉）。
+* **换完必须重打包 + 重装**才在任务管理器里看得到；Windows 会缓存图标，必要时重启一次资源管理器。
+
 ## 5. 实测结论（2026-10-16）
 
 | 项 | 结果 |

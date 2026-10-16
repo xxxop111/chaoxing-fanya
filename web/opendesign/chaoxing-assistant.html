@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>超星学习通助手 · 桌面版</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563EB'/%3E%3Ctext x='32' y='35' font-size='40' font-family='Microsoft YaHei,Segoe UI,sans-serif' font-weight='700' fill='%23ffffff' text-anchor='middle' dominant-baseline='central'%3E%E5%AD%A6%3C/text%3E%3C/svg%3E" />
 <!--
   本文件是「超星学习通助手」桌面版**实际打包出货**的界面（单文件自包含：
   样式与脚本全部内联，不引用任何外部资源，因此离线也能开）。
@@ -138,12 +139,13 @@
   .brand-mark {
     width: 32px; height: 32px; flex: none;
     display: grid; place-items: center;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--bg);
-    color: var(--accent);
+    border-radius: 8px;
+    /* 与 Windows 图标 chaoxing.ico 同一套视觉：蓝渐变圆角块 + 白「学」 */
+    background: linear-gradient(180deg, #2563EB 0%, #3B82F6 100%);
+    color: #fff;
+    font-size: 17px; font-weight: 600; line-height: 1;
+    user-select: none;
   }
-  .brand-mark svg { width: 18px; height: 18px; }
   .brand-name { font-family: var(--font-display); font-size: var(--text-base); font-weight: 600; }
   .brand-sub { font-size: var(--text-xs); color: var(--muted); }
   .brand-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
@@ -436,9 +438,7 @@
 <div class="app">
   <aside class="sidebar" id="sidebar" data-od-id="sidebar">
     <div class="brand">
-      <span class="brand-mark" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 5h7a3 3 0 0 1 3 3v11a2 2 0 0 0-2-2H4V5Z"/><path d="M20 5h-4a3 3 0 0 0-3 3v11a2 2 0 0 1 2-2h5V5Z"/></svg>
-      </span>
+      <span class="brand-mark" aria-hidden="true">学</span>
       <span class="brand-text">
         <span class="brand-name">学习通助手</span>
         <span class="brand-sub">桌面版 · 自动学习</span>
