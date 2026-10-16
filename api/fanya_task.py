@@ -2836,6 +2836,71 @@ def _build_ai_verifier(tiku: Any) -> Any:
         return None
 
 
+def _is_submitted(message: str) -> bool:
+    """``submit_prepared`` 的返回文案里怎么区分「交卷」和「只存草稿」。"""
+    return "已提交" in (message or "")
+
+
+def _post_submit_score_check(ctx: CompletionContext) -> str:
+    """交卷后回读这次作业的成绩，低于达标线就提醒（**只读**，任何失败都返回空串）。
+
+    2026-10-16 自查补的一环：加固只能防「盲交」，防不住「交了但分数低」。
+    客观题判分通常是即时的，所以交卷后立刻回读一次任务引擎里的 ``score``：
+    低于 ``planBreakthroughSet`` 的达标线就写 WARNING + 发通知，让用户当场知道，
+    而不是等下次盘点才发现。读不到分数时如实说「暂未读到」，绝不猜。
+    """
+    try:
+        item = getattr(ctx, "item", None)
+        client = getattr(ctx, "client", None)
+        task = getattr(ctx, "task", None)
+        course = getattr(ctx, "course", None) or {}
+        if item is None or client is None or task is None:
+            return ""
+        course_id = course.get("courseId")
+        clazz_id = course.get("clazzId") or course.get("classId")
+        if not (course_id and clazz_id):
+            return ""
+        tasks = client.get_course_tasks(course_id, clazz_id)
+        fresh_task = next((t for t in tasks if t.task_id == task.task_id), None)
+        if fresh_task is None:
+            return ""
+        client.load_task_items(fresh_task)
+        fresh = next((i for i in fresh_task.items if i.plan_id == item.plan_id), None)
+        if fresh is None:
+            return ""
+        score = item_score(fresh)
+        threshold = item_threshold(fresh)
+    except Exception as exc:  # noqa: BLE001 - 交卷已经成功，回读失败不能反过来报错
+        logger.debug("[作业] 交卷后回读成绩失败（不影响交卷结果）: {}", exc)
+        return ""
+
+    label = getattr(ctx, "label", "")
+    if score is None:
+        logger.info("[作业] 「{}」交卷后暂未读到分数（平台判分可能有延迟）", label)
+        return "交卷后暂未读到分数（平台判分可能有延迟），下次盘点会显示该作业得分"
+    if threshold is not None and score < threshold:
+        logger.warning("[作业] 「{}」交卷后得分 {:g}，低于达标线 {:g} —— "
+                       "请核对答案质量；本工具不会自动重做", label, score, threshold)
+        try:
+            from api import notification as _notification
+
+            _notification.Notification.send(
+                f"chaoxing : 「{label}」交卷后得分 {score:g}，低于达标线 {threshold:g}，请核对")
+        except Exception as exc:  # noqa: BLE001 - 通知失败不影响结果
+            logger.debug("交卷后发送通知失败: {}", exc)
+        return (f"⚠️ 交卷后回读：得分 {score:g}，低于达标线 {threshold:g}；"
+                "本工具不会自动重做，请到课程页面确认（必要时请老师开启重做）")
+    if threshold is not None:
+        logger.info("[作业] 「{}」交卷后得分 {:g}（达标线 {:g}）", label, score, threshold)
+        return f"交卷后回读：得分 {score:g}（达标线 {threshold:g}，已达标）"
+    return f"交卷后回读：得分 {score:g}"
+
+
+def _append_score_check(ctx: CompletionContext, message: str) -> str:
+    tail = _post_submit_score_check(ctx)
+    return f"{message}\n{tail}" if tail else message
+
+
 def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
     """完成「作业」任务点（mooc2 课程作业）。
 
@@ -2901,12 +2966,15 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
             getattr(ctx, "label", ""), "为 0" if redo_times == 0 else "查不到")
 
     if not ctx.require_approval:
-        return complete_course_work(
+        ok, msg = complete_course_work(
             ctx.client.session, entry_url, tiku,
             save_only=save_only, cover_rate=cover_rate, on_log=on_log,
             verifier=verifier, single_shot=single_shot,
             allow_single_shot=allow_single_shot,
         )
+        if ok and _is_submitted(msg):
+            msg = _append_score_check(ctx, msg)
+        return ok, msg
 
     # ---- 审批模式：只准备，不写任何东西 ----
     ok, msg, prepared = prepare_course_work(
@@ -2925,7 +2993,10 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
     def _submit() -> tuple[bool, str]:
         # 用户已批准 → 正式提交（pyFlag 置空）
         logger.info("[作业] 审批通过，提交 {} 题答案", total)
-        return submit_prepared(session, prepared, force_submit=True)
+        ok, msg = submit_prepared(session, prepared, force_submit=True)
+        if ok and _is_submitted(msg):
+            msg = _append_score_check(ctx, msg)
+        return ok, msg
 
     if found == 0:
         return False, (f"题库对这 {total} 题全部未命中（可能是纯图片题），"

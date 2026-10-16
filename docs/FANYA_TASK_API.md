@@ -395,6 +395,22 @@ https://data-xxt.aichaoxing.com/analysis/ac_mark?…
 `test_handle_course_work_treats_unknown_redo_times_as_one_shot`、
 `test_handle_course_work_warns_irreversible_in_approval_preview`。
 
+**交卷后自检**（`_post_submit_score_check`，`api/fanya_task.py`）：真正交卷之后
+（返回文案里含「已提交」才算，只保存草稿不算）立刻回读一次任务引擎里这个
+`planId` 的 `score` 与达标线：
+
+| 回读结果 | 行为 |
+| --- | --- |
+| 得分 < 达标线 | `WARNING` + 通知（`api/notification.py` 的 `Notification.send`）+ 返回文案里带「⚠️ 交卷后回读：得分 X，低于达标线 Y」 |
+| 得分 ≥ 达标线 | 返回「交卷后回读：得分 X（达标线 Y，已达标）」 |
+| 读不到分数（判分延迟） | 返回「暂未读到分数」，**绝不猜** |
+
+回读本身只读两次（任务列表 + 任务点列表），任何异常都被吞掉并返回空串 ——
+交卷已经成功，回读失败不能反过来把成功报成失败。
+回归保护：`test_post_submit_score_check_warns_when_below_threshold`、
+`test_post_submit_score_check_never_raises`、
+`test_handle_course_work_only_checks_score_after_a_real_submit`。
+
 > ⚠️ 同一个 `tests/test_parsers.py` 里还修掉一个测试基建问题：内置 runner
 > （`if __name__ == "__main__"`）原来夹在文件中间，`_run_all()` 用 `globals()`
 > 收集用例，于是**它下面定义的用例永远不会执行**（`pytest tests` 才发现）。

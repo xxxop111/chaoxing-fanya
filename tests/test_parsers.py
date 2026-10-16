@@ -915,6 +915,128 @@ def test_handle_course_work_warns_irreversible_in_approval_preview():
         fw.prepare_course_work = real_prepare
 
 
+def test_post_submit_score_check_warns_when_below_threshold():
+    """交卷后回读：低于达标线要提醒 + 发通知（这是「只有一次且低分」的收尾一环）。"""
+    from types import SimpleNamespace
+
+    import api.notification as notif
+    from api import fanya_task as ft
+
+    sent = []
+    real_send = notif.Notification.send
+    try:
+        notif.Notification.send = lambda message: sent.append(message) or True
+
+        def _client_with(score):
+            fresh = ft.FanyaPlanItem(
+                plan_id=51, encrypt_plan_id="e", name="Logistic模型作业", plan_type=4,
+                score=score,
+                extra={"planBreakthroughSet": {"enableWorkScore": 1, "workScore": 50}},
+            )
+            task = ft.FanyaTask(task_id=7, name="任务", encry_task_user_id="tu",
+                                items=[fresh])
+
+            class _Client:
+                def get_course_tasks(self, course_id, clazz_id):
+                    return [task]
+
+                def load_task_items(self, t):
+                    t.items = list(t.items)
+
+            return _Client()
+
+        ctx = SimpleNamespace(
+            item=ft.FanyaPlanItem(plan_id=51, encrypt_plan_id="e", name="作业",
+                                  plan_type=4),
+            task=ft.FanyaTask(task_id=7, name="任务", encry_task_user_id="tu"),
+            course={"courseId": "1", "clazzId": "2"}, label="数学建模 / 任务 / 作业",
+            client=_client_with({"totalScore": 44.5}),
+        )
+        out = ft._post_submit_score_check(ctx)
+        assert "低于达标线" in out and "44.5" in out
+        assert sent and "44.5" in sent[0], "低分必须发通知"
+
+        # 达标 → 只报结果，不发通知
+        sent.clear()
+        ctx.client = _client_with({"totalScore": 92.0})
+        out = ft._post_submit_score_check(ctx)
+        assert "已达标" in out and "92" in out
+        assert sent == []
+
+        # 判分未出 → 如实说「暂未读到」，也不发通知
+        sent.clear()
+        ctx.client = _client_with(None)
+        out = ft._post_submit_score_check(ctx)
+        assert "暂未读到分数" in out
+        assert sent == []
+    finally:
+        notif.Notification.send = real_send
+
+
+def test_post_submit_score_check_never_raises():
+    from types import SimpleNamespace
+
+    from api import fanya_task as ft
+
+    class _Boom:
+        def get_course_tasks(self, course_id, clazz_id):
+            raise RuntimeError("网络断了")
+
+    ctx = SimpleNamespace(
+        item=ft.FanyaPlanItem(plan_id=51, encrypt_plan_id="e", name="作业", plan_type=4),
+        task=ft.FanyaTask(task_id=7, name="任务", encry_task_user_id="tu"),
+        course={"courseId": "1", "clazzId": "2"}, label="x", client=_Boom(),
+    )
+    assert ft._post_submit_score_check(ctx) == ""
+    # 缺上下文也不能炸
+    assert ft._post_submit_score_check(SimpleNamespace()) == ""
+
+
+def test_handle_course_work_only_checks_score_after_a_real_submit():
+    """只保存草稿不能触发「交卷后回读」，否则草稿会被报成得分。"""
+    from types import SimpleNamespace
+
+    import api.fanya_work as fw
+    from api import fanya_task as ft
+
+    class _Tiku:
+        _conf = {"provider": "AI", "endpoint": "e", "key": "k", "model": "m"}
+        COVER_RATE = 0.0
+
+        def get_submit_params(self):
+            return "0"
+
+    checked = []
+    real_complete = fw.complete_course_work
+    real_check = ft._post_submit_score_check
+    ctx = SimpleNamespace(
+        study_url={"url": "http://x"}, chaoxing=SimpleNamespace(tiku=_Tiku()),
+        client=SimpleNamespace(session=object()), require_approval=False,
+        label="作业", item=None, register_approval=lambda **kwargs: "a1",
+    )
+    try:
+        ft._post_submit_score_check = lambda c: checked.append(c) or "回读结果"
+
+        fw.complete_course_work = lambda *a, **k: (True, "作业已提交（2 题，命中 2 题）")
+        ok, msg = ft.handle_course_work(ctx)
+        assert ok is True and "回读结果" in msg
+        assert len(checked) == 1
+
+        checked.clear()
+        fw.complete_course_work = lambda *a, **k: (True, "作业已保存为草稿（2 题，命中 2 题）")
+        ok, msg = ft.handle_course_work(ctx)
+        assert ok is True and "回读结果" not in msg
+        assert checked == [], "草稿不该触发交卷后回读"
+
+        checked.clear()
+        fw.complete_course_work = lambda *a, **k: (False, "作业已提交但被拒")
+        ft.handle_course_work(ctx)
+        assert checked == [], "失败也不能触发回读"
+    finally:
+        fw.complete_course_work = real_complete
+        ft._post_submit_score_check = real_check
+
+
 # ----------------------------------------------------------------------
 # 内置 runner 必须放在**文件末尾**：_run_all() 用 globals() 收集 test_*，
 # 放在中间会漏掉它下面定义的所有用例（2026-10-16 才发现）。
