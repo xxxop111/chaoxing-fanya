@@ -90,6 +90,31 @@ def is_stop_requested(task_id: str) -> bool:
     ev = task_stop_events.get(task_id)
     return bool(ev is not None and ev.is_set())
 
+
+def running_task() -> Dict:
+    """找一个还在跑的任务；没有就返回空 dict。
+
+    前端在页面重载后靠它把任务认回来：服务跑在进程里，刷新页面不会停任务，
+    但任务 id 只在页面内存里，不查一下就会出现「任务在跑、界面却说没有」，
+    连停止按钮都找不到。多个候选时取最近启动的那个。
+    """
+    candidates = [
+        (st.get('start_time') or 0, tid, st)
+        for tid, st in task_status.items()
+        if isinstance(st, dict) and st.get('status') == 'running'
+    ]
+    if not candidates:
+        return {}
+    _, tid, st = max(candidates, key=lambda item: item[0])
+    kind = str(st.get('kind') or 'learn')
+    return {
+        'task_id': tid,
+        'kind': 'fanya' if kind.startswith('fanya') else 'learn',
+        'status': 'running',
+        'current_course': st.get('current_course', ''),
+        'current_task': st.get('current_chapter') or st.get('current_task') or '',
+    }
+
 class LogCapture:
     """捕获日志输出"""
     def __init__(self, task_id: str):
@@ -551,6 +576,20 @@ def start_study():
     except Exception as e:
         logger.error(f"启动任务错误: {e}")
         return jsonify({'status': False, 'msg': str(e)}), 500
+
+@app.route('/api/task/current', methods=['GET'])
+def get_current_task():
+    """返回当前仍在运行的任务（没有则 task_id 为空串）。
+
+    前端每次启动都问一次，用于把刷新页面/重开窗口前就启动的任务认回来。
+    """
+    current = running_task()
+    return jsonify({
+        'status': True,
+        'msg': '有任务正在运行' if current else '当前没有运行中的任务',
+        'data': current,
+    })
+
 
 @app.route('/api/task/<task_id>', methods=['GET'])
 def get_task_status(task_id):

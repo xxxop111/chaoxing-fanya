@@ -10,7 +10,7 @@
 
 ---
 
-## 0. 先看这 8 条（最容易踩）
+## 0. 先看这 9 条（最容易踩）
 
 1. **一律用相对路径** `/api/...`，绝对不要写死 `http://127.0.0.1:5000`。端口在运行时
    从 5000 起挑第一个空闲端口，写死端口会连不上（开发模式单独跑 `python app.py`
@@ -32,6 +32,9 @@
 8. **`/api/config` 读写的是整份 `web_config.json`**：`data.settings` 才是设置项，
    且 `POST` 是整份覆盖写 —— 只回传 `settings` 会把 `rememberedLogin`（记住的密码）
    和 `selectedCourses` 清空。详见 §4.5 / §4.6。
+9. **启动时先问 `GET /api/task/current`**：任务跑在后端进程里，刷新页面/重开窗口
+   不会停任务，而任务 id 只在页面内存里。不认领就会出现「任务在跑、界面却说没有
+   运行中的任务」，用户连停止按钮都找不到。详见 §4.22。
 
 ---
 
@@ -125,19 +128,20 @@
 | 6 | POST | `/api/config` | 覆盖写本地配置 | 已实现 |
 | 7 | POST | `/api/ai/test` | 测试 AI 接口连通性 | 已实现 |
 | 8 | POST | `/api/start` | 开始「章节任务点」自动学习 | 已实现 |
-| 9 | GET | `/api/task/<task_id>` | 学习任务状态 | 已实现 |
-| 10 | GET | `/api/task/<task_id>/details` | 学习任务明细（课程/章节） | 已实现 |
-| 11 | POST | `/api/task/<task_id>/stop` | 优雅停止（学习、任务引擎通用） | 已实现 |
-| 12 | GET | `/api/logs/<task_id>` | 取日志（队列消费） | 已实现 |
-| 13 | POST | `/api/fanya/preview` | 阶段一：只读盘点课程「任务」 | 已实现 |
-| 14 | GET | `/api/fanya/preview/<task_id>` | 盘点进度 + 结果 | 已实现 |
-| 15 | POST | `/api/fanya/execute` | 阶段二：确认后执行 | 已实现 |
-| 16 | GET | `/api/fanya/result/<task_id>` | 执行进度 + 明细 | 已实现 |
-| 17 | GET | `/api/fanya/approvals` | 待审批列表 | 已实现 |
-| 18 | POST | `/api/fanya/approve` | 批准/拒绝一条 | 已实现 |
-| 19 | POST | `/api/fanya/approvals/clear` | 清空待审批队列 | 已实现 |
-| 20 | GET/POST | `/api/heartbeat` | 窗口存活心跳（**前端必须定时打**） | 桌面壳提供 |
-| 21 | GET/POST | `/api/window-closed` | 关窗通知（**前端卸载时打**） | 桌面壳提供 |
+| 9 | GET | `/api/task/current` | 当前仍在运行的任务（**刷新后据此认领**） | 已实现 |
+| 10 | GET | `/api/task/<task_id>` | 学习任务状态 | 已实现 |
+| 11 | GET | `/api/task/<task_id>/details` | 学习任务明细（课程/章节） | 已实现 |
+| 12 | POST | `/api/task/<task_id>/stop` | 优雅停止（学习、任务引擎通用） | 已实现 |
+| 13 | GET | `/api/logs/<task_id>` | 取日志（队列消费） | 已实现 |
+| 14 | POST | `/api/fanya/preview` | 阶段一：只读盘点课程「任务」 | 已实现 |
+| 15 | GET | `/api/fanya/preview/<task_id>` | 盘点进度 + 结果 | 已实现 |
+| 16 | POST | `/api/fanya/execute` | 阶段二：确认后执行 | 已实现 |
+| 17 | GET | `/api/fanya/result/<task_id>` | 执行进度 + 明细 | 已实现 |
+| 18 | GET | `/api/fanya/approvals` | 待审批列表 | 已实现 |
+| 19 | POST | `/api/fanya/approve` | 批准/拒绝一条 | 已实现 |
+| 20 | POST | `/api/fanya/approvals/clear` | 清空待审批队列 | 已实现 |
+| 21 | GET/POST | `/api/heartbeat` | 窗口存活心跳（**前端必须定时打**） | 桌面壳提供 |
+| 22 | GET/POST | `/api/window-closed` | 关窗通知（**前端卸载时打**） | 桌面壳提供 |
 
 > 「章节任务点」= 原 `/api/start` 的学习流程；「任务」= 课程页左侧「任务」标签背后
 > `task.chaoxing.com` 的任务点（AI实践、主题讨论、作业、文档…）。两条流程互不影响，
@@ -628,6 +632,25 @@
 
 ---
 
+### 4.22 `GET /api/task/current` — 当前仍在运行的任务
+
+```json
+{ "status": true, "msg": "有任务正在运行",
+  "data": { "task_id": "13800138000_1792127301", "kind": "learn", "status": "running",
+            "current_course": "数学建模", "current_task": "3.4 铅球掷远" } }
+```
+
+* 没有在跑的任务时 `data` 是空对象 `{}`（不是 `null`），`msg` 为「当前没有运行中的任务」。
+* `kind` 只有两个值：`learn`（`/api/start` 那条线，用 `GET /api/task/<id>` 轮询）和
+  `fanya`（任务引擎那条线，含盘点，用 `GET /api/fanya/result/<id>` 轮询）。
+* **前端每次启动都要问一次**：任务跑在后端进程里，刷新页面/重开窗口不会停任务，
+  但任务 id 只在页面内存里。不认领就会出现「任务在跑、界面却说没有运行中的任务」，
+  用户连停止按钮都找不到（实测踩过）。
+* 认领后照常按 §2.4 的节奏轮询该任务，`POST /api/task/<id>/stop` 依旧按 id 停止。
+* 多个任务同时跑时返回**最近启动**的那个，其他任务仍可用各自 id 查询。
+
+---
+
 ## 5. 前端需要的 6 个界面（建议信息架构）
 
 接口已经支撑下面这套，重做界面时可以自由拆分，但**建议保留语义**：
@@ -709,6 +732,7 @@
 任务        POST /api/start               → task_id（章节任务点）
             POST /api/fanya/preview       → task_id（只读盘点）
             POST /api/fanya/execute       → task_id（写入执行）
+认领        GET  /api/task/current        ← 启动时问一次，把在跑的任务接回来
 轮询        GET  /api/task/<id> | /api/fanya/result/<id>   1 s
             GET  /api/logs/<id>（队列消费）                1 s
 停止        POST /api/task/<id>/stop

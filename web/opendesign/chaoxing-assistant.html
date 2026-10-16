@@ -1134,7 +1134,8 @@
   }
   function setLoginBusy(busy, which) {
     $$("#login-form button").forEach(function (b) { b.disabled = busy; });
-    if (busy) { var b = $(which); b.dataset.html = b.innerHTML; b.innerHTML = '<span class="spinner"></span> 处理中…'; }
+    // which 既可能是选择器，也可能已经是元素（登录按钮两处传的是元素）。
+    if (busy) { var b = which && which.nodeType === 1 ? which : $(which); if (b) { b.dataset.html = b.innerHTML; b.innerHTML = '<span class="spinner"></span> 处理中…'; } }
     else { $$("#login-form button").forEach(function (x) { if (x.dataset.html) { x.innerHTML = x.dataset.html; delete x.dataset.html; } }); }
   }
   function afterLogin(res) {
@@ -1315,9 +1316,11 @@
 
   // ── 运行与日志 ──────────────────────────────────────────────────
   var runTimer = null, apprTimer = null;
-  function beginRun(kind, id, label) {
+  function beginRun(kind, id, label, quiet) {
     state.runKind = kind; state.runId = id; state.console = []; state.run = { label: label, status: "running", progress: 0, total: 0, stats: {}, current_course: "", current_task: "", activeJobs: {}, results: null };
-    setView("run");
+    // 记到本地：页面重载（含 WebView2 崩溃自动重载、第二个窗口）后好把任务认回来。
+    try { localStorage.setItem("od-cx-run", JSON.stringify({ kind: kind, id: id, label: label })); } catch (e) {}
+    if (!quiet) setView("run");
     renderConsole();
     if (runTimer) clearInterval(runTimer);
     pollRun();
@@ -1327,6 +1330,21 @@
   function stopRunPolling() {
     if (runTimer) { clearInterval(runTimer); runTimer = null; }
     if (apprTimer) { clearInterval(apprTimer); apprTimer = null; }
+    try { localStorage.removeItem("od-cx-run"); } catch (e) {}
+  }
+  // 服务在进程内跑，页面重载不会停任务。启动时问后端有没有在跑的任务，
+  // 有就重新接管（否则会出现「任务在跑，界面却说没有运行中的任务」、
+  // 连停止按钮都找不到）。本地那份记录只用来还原当初显示的名字。
+  function reattachRun() {
+    var saved = null;
+    try { saved = JSON.parse(localStorage.getItem("od-cx-run") || "null"); } catch (e) { saved = null; }
+    call("/api/task/current").then(function (r) {
+      var cur = r.status && r.data ? r.data : null;
+      if (!cur || !cur.task_id) { try { localStorage.removeItem("od-cx-run"); } catch (e) {} return; }
+      var label = (saved && saved.id === cur.task_id && saved.label) ? saved.label : "任务";
+      beginRun(cur.kind, cur.task_id, label, true);
+      if (state.view === "run") renderRun();
+    });
   }
   function pollRun() {
     if (!state.runId) return;
@@ -1368,16 +1386,24 @@
       return;
     }
     var running = r.status === "running";
-    actions.innerHTML = running
-      ? '<button class="btn btn-danger" id="btn-stop-run">停止（当前章节收尾后退出）</button>'
-      : '<span class="pill ' + terminalPill(r.status) + '">' + terminalText(r.status) + "</span>";
-    if (running) $("#btn-stop-run").addEventListener("click", function () {
-      var b = this; b.disabled = true; var h = b.innerHTML; b.innerHTML = '<span class="spinner"></span> 正在停止…';
-      call("/api/task/" + encodeURIComponent(state.runId) + "/stop", { method: "POST" }).then(function (res) {
-        if (!res.status) { toast(res.msg, "err"); b.disabled = false; b.innerHTML = h; return; }
-        toast("停止请求已发送，当前章节收尾后退出", "warn");
-      });
-    });
+    // 轮询每秒重渲染一次。只在按钮形态变化时重写 head-actions：
+    // 每次都重写会把「正在停止…」的禁用状态和焦点一起冲掉，
+    // 元素每秒被替换一次也让点击很难命中。
+    if (running) {
+      if (!$("#btn-stop-run")) {
+        actions.innerHTML = '<button class="btn btn-danger" id="btn-stop-run">停止（当前章节收尾后退出）</button>';
+        $("#btn-stop-run").addEventListener("click", function () {
+          var b = this; b.disabled = true; var h = b.innerHTML; b.innerHTML = '<span class="spinner"></span> 正在停止…';
+          call("/api/task/" + encodeURIComponent(state.runId) + "/stop", { method: "POST" }).then(function (res) {
+            if (!res.status) { toast(res.msg, "err"); b.disabled = false; b.innerHTML = h; return; }
+            toast("停止请求已发送，当前章节收尾后退出", "warn");
+          });
+        });
+      }
+    } else {
+      var pill = '<span class="pill ' + terminalPill(r.status) + '">' + terminalText(r.status) + "</span>";
+      if (actions.innerHTML !== pill) actions.innerHTML = pill;
+    }
 
     var statCells = r.stats ? Object.keys(r.stats).map(function (k) { return [STAT_LABEL[k] || k, r.stats[k]]; }) : [];
     $("#run-summary").innerHTML =
@@ -1600,7 +1626,7 @@
   setView(NAMES[saved] ? saved : "account", { keepScroll: true });
   // 启动就读一次本地配置：一是把 rememberedLogin 预填到账号页，二是让「运行与日志」
   // 直接开跑时 state.config 已经就位（否则 /api/start 不会带上 AI 密钥）。
-  probe().then(function () { loadConfig(); loadApprovals(true); });
+  probe().then(function () { loadConfig(); loadApprovals(true); reattachRun(); });
 })();
 </script>
 </body>
