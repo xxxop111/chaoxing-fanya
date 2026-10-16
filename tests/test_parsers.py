@@ -669,3 +669,85 @@ if __name__ == "__main__":
     import sys as _sys
 
     _sys.exit(_run_all())
+
+
+def test_handle_course_work_passes_ai_verifier_down():
+    """handler 必须把复核器真的传下去。
+
+    ``_build_ai_verifier`` 单独存在没有任何意义：只有 ``handle_course_work`` 把它
+    递给 complete_course_work / prepare_course_work，非大模型主题库的答案才会被
+    复核。少了这一步，用户装上后行为与修复前完全一样。
+    """
+    from types import SimpleNamespace
+
+    import api.answer as answer_mod
+    import api.fanya_work as fw
+    from api import fanya_task as ft
+
+    class _FakeAI:
+        DISABLE = False
+
+        def __init__(self):
+            self.conf = None
+
+        def config_set(self, conf):
+            self.conf = conf
+
+        def init_tiku(self):
+            return True
+
+    class _Tiku:
+        _conf = {"provider": "LIKE", "endpoint": "https://example.invalid/chat",
+                 "key": "k", "model": "m"}
+        COVER_RATE = 0.0
+
+        def get_submit_params(self):
+            return "1"  # 保存但不提交
+
+    captured = {}
+
+    def _fake_complete(session, entry_url, tiku, **kwargs):
+        captured.update(kwargs)
+        captured["entry_url"] = entry_url
+        return True, "ok"
+
+    def _fake_prepare(session, entry_url, tiku, **kwargs):
+        captured.update(kwargs)
+        captured["entry_url"] = entry_url
+        return True, "prepared", {"total": 1, "found": 1, "rate": 1.0,
+                                  "payload": {"answerq1": "B"}}
+
+    real_ai = answer_mod.AI
+    real_complete = fw.complete_course_work
+    real_prepare = fw.prepare_course_work
+    ctx = SimpleNamespace(
+        study_url={"url": "https://mooc2-ans.chaoxing.com/work?workId=1"},
+        chaoxing=SimpleNamespace(tiku=_Tiku()),
+        client=SimpleNamespace(session=object()),
+        require_approval=False,
+        label="作业",
+        register_approval=lambda **kwargs: "approval-1",
+    )
+
+    try:
+        answer_mod.AI = _FakeAI
+        fw.complete_course_work = _fake_complete
+        fw.prepare_course_work = _fake_prepare
+
+        # 1) 免审批：直接提交，复核器必须传进 complete_course_work
+        captured.clear()
+        ctx.require_approval = False
+        assert ft.handle_course_work(ctx)[0] is True
+        assert isinstance(captured.get("verifier"), _FakeAI), captured
+        assert captured["verifier"].conf["model"] == "m"
+
+        # 2) 审批模式：答案在 prepare 阶段就定下来（提交发生在审批之后），
+        #    所以复核器同样必须传进 prepare_course_work
+        captured.clear()
+        ctx.require_approval = True
+        assert ft.handle_course_work(ctx)[0] is True
+        assert isinstance(captured.get("verifier"), _FakeAI), captured
+    finally:
+        answer_mod.AI = real_ai
+        fw.complete_course_work = real_complete
+        fw.prepare_course_work = real_prepare

@@ -344,6 +344,14 @@ https://data-xxt.aichaoxing.com/analysis/ac_mark?…
 端到端复现：`.venv\Scripts\python.exe _probe_work_verify.py`（假网络题库复刻 4/9 →
 加复核应回到 9/9）。
 
+接线（`handle_course_work`，`api/fanya_task.py`）：复核器在 handler 里构造一次，
+**两条路径都传**——免审批走 `complete_course_work(..., verifier=...)`；审批模式走
+`prepare_course_work(..., verifier=...)`（答案在 prepare 阶段就定稿，提交只是把
+准备好的载荷发出去，所以必须在这一步复核，`submit_prepared` 不需要）。本机配置的
+`provider` 就是 `AI`，因此复核默认**关闭**（同一来源自问自答没有意义），这一步只在
+用户改用网络题库时生效。回归保护：
+`tests/test_parsers.py::test_handle_course_work_passes_ai_verifier_down`。
+
 ### 6.3 视频（planType 10）——累计观看时长门槛
 
 任务引擎有**自己的视频学习页**（不走 mooc1 的 video 模块）：

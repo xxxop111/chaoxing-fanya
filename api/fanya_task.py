@@ -2867,16 +2867,23 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
     def on_log(message: str) -> None:
         logger.info("[作业] {}", message)
 
+    # 大模型复核：主题库不是大模型（言溪/LIKE/TikuAdapter 之类）时，答案会与 AI
+    # 交叉验证 —— 网络题库串题是「分数偏低」的主要成因（见 docs §6.2.1）。
+    # 主题库本身就是 AI 时返回 None（同一来源复核没有意义，只会白花调用）。
+    verifier = _build_ai_verifier(tiku)
+
     if not ctx.require_approval:
         return complete_course_work(
             ctx.client.session, entry_url, tiku,
             save_only=save_only, cover_rate=cover_rate, on_log=on_log,
+            verifier=verifier,
         )
 
     # ---- 审批模式：只准备，不写任何东西 ----
     ok, msg, prepared = prepare_course_work(
         ctx.client.session, entry_url, tiku,
         cover_rate=cover_rate, on_log=on_log,
+        verifier=verifier,
     )
     if not ok:
         return False, msg
