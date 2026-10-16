@@ -411,6 +411,15 @@ https://data-xxt.aichaoxing.com/analysis/ac_mark?…
 `test_post_submit_score_check_never_raises`、
 `test_handle_course_work_only_checks_score_after_a_real_submit`。
 
+**全部「写入平台」入口的审计结论**（2026-10-16，防「只有一次机会却被烧掉」）：
+
+| 入口 | 平台是否可重来 | 交卷前的保护 |
+| --- | --- | --- |
+| 课程作业（`course_work`，mooc2） | **可能只有一次**（`redoTimes` 事前查不到） | 空卷绝不交；一次性作业默认只存草稿；审批预览写「不可逆」；交卷后回读分数 |
+| 自测 / 测验（`quiz`） | 通常只有一次 | **默认只逐题暂存，不交卷**；需显式 `options["exam_submit"]`；任何一题题库没答案就中止（「按约定绝不提交白卷」）；题型无法识别/异常一律中止 |
+| AI实践（`ai_upload` / `ai_ladder` / `ai_chat` / `ai_story` / `ai_code`） | **可重来**：`remainScoreCount`（实测 97）+ `answerScore` 取历次最高分 | 无需拦；低分可重传（实测 35 → 100） |
+| 章节 / 文档 / 视频 / 讨论 | 可重复学 | 无一次性风险 |
+
 > ⚠️ 同一个 `tests/test_parsers.py` 里还修掉一个测试基建问题：内置 runner
 > （`if __name__ == "__main__"`）原来夹在文件中间，`_run_all()` 用 `globals()`
 > 收集用例，于是**它下面定义的用例永远不会执行**（`pytest tests` 才发现）。
