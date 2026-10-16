@@ -856,6 +856,14 @@ def fanya_execute():
         # [planId, ...]，为空表示处理所有可自动化任务点
         plan_ids = data.get('plan_ids') or None
         tiku_config = data.get('tiku_config') or {}
+        if not tiku_config:
+            # 「任务」模块的请求可以不带 tiku_config（老前端就是这样），此时
+            # 用设置页里已保存的那份 —— 否则 AI实践 / 主题讨论会静默降级成
+            # 模板文本甚至直接失败，而用户明明已经配好了 AI 接口。
+            settings = (load_web_config().get('settings') or {})
+            saved_tiku = settings.get('tiku_config') or {}
+            if isinstance(saved_tiku, dict) and saved_tiku:
+                tiku_config = saved_tiku
         options = data.get('options') or {}
 
         if not use_cookies and (not username or not password):

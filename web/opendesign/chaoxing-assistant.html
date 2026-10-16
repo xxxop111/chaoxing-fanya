@@ -597,6 +597,10 @@
               <div class="row wrap" style="gap:12px; margin-bottom:16px;">
                 <button class="btn btn-primary" id="btn-preview">盘点任务点</button>
                 <button class="btn btn-secondary" id="btn-start-learn">开始章节任务点学习</button>
+                <label class="row" style="gap:8px; align-items:center;">
+                  <span class="mono-note">并发任务点</span>
+                  <input class="input" id="fanya-concurrency" type="number" step="1" min="1" max="8" value="1" style="width:76px;" />
+                </label>
               </div>
               <div id="preview-summary" class="grid-3" style="margin-bottom:16px;"></div>
               <div id="preview-tree"></div>
@@ -1307,7 +1311,7 @@
     var byCourse = {};
     $$("#preview-tree input[data-plan]:checked").forEach(function (cb) { (byCourse[cb.dataset.course] = byCourse[cb.dataset.course] || []).push(cb.dataset.task); });
     var p = loginPayload();
-    call("/api/fanya/execute", { method: "POST", body: { use_cookies: p.use_cookies, username: p.username, password: p.password, course_list: Object.keys(byCourse), plan_ids: plans, tasks_by_course: byCourse, options: { redo: $("#preview-redo").checked, require_approval: true, allow_ai_submit: false, exam_submit: false, group_submit: false, browser_headless: true } } }).then(function (r) {
+    call("/api/fanya/execute", { method: "POST", body: { use_cookies: p.use_cookies, username: p.username, password: p.password, course_list: Object.keys(byCourse), plan_ids: plans, tasks_by_course: byCourse, tiku_config: state.config ? state.config.tiku_config : undefined, options: { redo: $("#preview-redo").checked, concurrency: numVal("fanya-concurrency", 1), require_approval: true, allow_ai_submit: false, exam_submit: false, group_submit: false, browser_headless: true } } }).then(function (r) {
       if (!r.status) { toast(r.msg || "执行失败", "err"); return; }
       beginRun("fanya", r.data.task_id, plans.length + " 个任务点 · 任务引擎");
       toast("已开始执行，写入动作将登记到待审批", "ok");

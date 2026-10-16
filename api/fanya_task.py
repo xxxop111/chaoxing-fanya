@@ -27,8 +27,10 @@ from __future__ import annotations
 import datetime
 import json
 import re
+import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -1098,6 +1100,9 @@ class CompletionContext:
     # 把「预览 + 提交回调」登记到 approvals，绝不真实提交。
     require_approval: bool = True
     approvals: Any = None
+    # 返回 True 表示已收到停止请求（由 runner 注入）。长耗时的处理器
+    # （尤其是文档的真实浏览器阅读）要靠它及时收手。
+    stop_requested: Any = None
 
     def log(self, message: str) -> None:
         logger.info(message)
@@ -1131,6 +1136,17 @@ class FanyaTaskRunner:
         self.on_event = on_event
         self.results: list[dict] = []
         self.stop_event = self.options.get("stop_event")
+        # 「并发任务点数」：每个任务点的累计时长门槛是**各算各的**，所以并行 N 个
+        # 任务点 = N 倍吞吐（这是把几十分钟的等待压缩掉的主要手段）。
+        # 默认 1（串行），前端可调到 2~8；并发会成倍占用连接与浏览器实例，
+        # 所以上限压在 8。
+        try:
+            self.concurrency = max(1, min(int(self.options.get("concurrency") or 1), 8))
+        except (TypeError, ValueError):
+            self.concurrency = 1
+        # 并行时事件回调会在多个线程里被调用；加锁让前端状态更新永远串行，
+        # 否则 app.py 里的 stats 计数会出现读改写竞争。
+        self._emit_lock = threading.Lock()
         # 「重做模式」：允许选中**已完成**的任务点再答一次
         # （平台按 remainScoreCount 允许重练；作业/测验的重做是平台自己的 UI 流程，
         #   未探明请求格式，因此这些类型在重做模式下会明确拒绝而不是硬写）
@@ -1150,7 +1166,8 @@ class FanyaTaskRunner:
     def _emit(self, **payload) -> None:
         if callable(self.on_event):
             try:
-                self.on_event(payload)
+                with self._emit_lock:
+                    self.on_event(payload)
             except Exception as exc:  # noqa: BLE001 - 回调失败不影响主流程
                 logger.debug("上报任务完成事件失败: {}", exc)
 
@@ -1259,11 +1276,14 @@ class FanyaTaskRunner:
         self._emit(type="task_start", courseId=str(course.get("courseId")),
                    taskId=task.task_id, name=task.name, pending=len(candidates))
 
-        for item in candidates:
-            if self._stop_requested():
-                logger.warning("已请求停止，剩余任务点跳过")
-                break
-            self.run_item(course, task, item)
+        if self.concurrency > 1 and len(candidates) > 1:
+            self._run_items_parallel(course, task, candidates)
+        else:
+            for item in candidates:
+                if self._stop_requested():
+                    logger.warning("已请求停止，剩余任务点跳过")
+                    break
+                self.run_item(course, task, item)
 
         progress = self.client.refresh_task(task.encry_task_user_id)
         self._emit(type="task_done", courseId=str(course.get("courseId")),
@@ -1272,8 +1292,58 @@ class FanyaTaskRunner:
             logger.info("任务「{}」进度已更新为 {}", task.name, _format_progress(progress))
         return self.results
 
-    def run_item(self, course: dict, task: FanyaTask, item: FanyaPlanItem) -> dict:
-        """执行一个任务点，返回结果字典。"""
+    def _worker_client(self) -> FanyaTaskClient:
+        """并行 worker 的私有客户端（独立 session）。
+
+        ``requests.Session`` 的 cookie jar 与连接池都不支持并发写，多个 worker
+        共用一个 session 会出现串号/丢 cookie；这里给每个 worker 复制一份。
+        复制失败就退回共享 session（功能仍然可用，只是并发安全性下降）。
+        """
+        try:
+            return FanyaTaskClient(session=SessionManager.clone_session())
+        except Exception as exc:  # noqa: BLE001 - 复制失败不应中断运行
+            logger.warning("并行会话复制失败，退回共享会话：{}", exc)
+            return self.client
+
+    def _run_items_parallel(self, course: dict, task: FanyaTask,
+                            candidates: list[FanyaPlanItem]) -> None:
+        """并发执行同一任务下的多个任务点。
+
+        每个任务点的「累计观看/阅读时长」是**各任务点各算各的**，所以并发跑的
+        总等待时间 ≈ 最慢的那个任务点，而不是所有任务点之和 —— 这是把「一轮跑
+        几十分钟」压缩掉的主要手段。并发数上限 8（每个视频任务点都会起一个真实
+        浏览器，太多会拖慢整机）。
+        """
+        logger.info("并发执行任务「{}」的 {} 个任务点（并发数 {}）",
+                    task.name, len(candidates), self.concurrency)
+        self._emit(type="task_parallel", taskId=task.task_id, name=task.name,
+                   concurrency=self.concurrency, pending=len(candidates))
+
+        with ThreadPoolExecutor(max_workers=self.concurrency,
+                                thread_name_prefix="fanya-item") as pool:
+            futures = {}
+            for item in candidates:
+                if self._stop_requested():
+                    logger.warning("已请求停止，剩余任务点不再提交")
+                    break
+                client = self._worker_client()
+                futures[pool.submit(self.run_item, course, task, item, client)] = item
+            for fut in as_completed(futures):
+                item = futures[fut]
+                try:
+                    fut.result()
+                except Exception as exc:  # noqa: BLE001 - 单点失败不影响其他任务点
+                    logger.opt(exception=True).error(
+                        "任务点「{}」并发执行异常: {}", item.name, exc)
+
+    def run_item(self, course: dict, task: FanyaTask, item: FanyaPlanItem,
+                 client: Optional[FanyaTaskClient] = None) -> dict:
+        """执行一个任务点，返回结果字典。
+
+        ``client`` 由并发调度器注入（每个 worker 一份独立 session）；串行调用
+        时省略即可，默认用 runner 自己的 client。
+        """
+        worker = client or self.client
         _, handler_name, _ = resolve_item(item)
         # 重做闸门：只有 AI实践 有安全的自动重做路径（平台按 remainScoreCount
         # 允许重练）。作业/测验的「重做」是平台自己的 UI 流程，请求格式未探明，
@@ -1331,7 +1401,7 @@ class FanyaTaskRunner:
             return result
 
         try:
-            study_url = self.client.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
+            study_url = worker.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
         except FanyaTaskError as exc:
             # 常见原因：该任务点有自己的有效期，服务端会返回
             # “任务点学习时间：… 当前不在学习时间内”。这种情况直接记为跳过。
@@ -1344,7 +1414,7 @@ class FanyaTaskRunner:
 
         ctx = CompletionContext(
             chaoxing=self.chaoxing,
-            client=self.client,
+            client=worker,
             course=course,
             task=task,
             item=item,
@@ -1353,6 +1423,7 @@ class FanyaTaskRunner:
             options=self.options,
             require_approval=self.require_approval,
             approvals=self.approvals,
+            stop_requested=self._stop_requested,
         )
 
         try:
@@ -1370,7 +1441,7 @@ class FanyaTaskRunner:
             logger.info("任务点完成: {} — {}", label, result["message"])
             # scoreRefresh 在本账号上是空操作，因此改为重新拉取分组下的任务点来校验
             group_id = item.extra.get("group_encry_id") or task.group_encry_id
-            verified = self.client.verify_plan_finished(
+            verified = worker.verify_plan_finished(
                 task.encry_task_user_id, group_id, item.plan_id)
             result["verified"] = verified
             if verified is True:
@@ -1602,6 +1673,9 @@ def handle_document(ctx: CompletionContext) -> tuple[bool, str]:
             _read_state,
             budget_seconds=budget,
             headless=bool(ctx.options.get("browser_headless", True)),
+            # 「停止」要能打断文档阅读：否则一个 30 分钟的文档会把停止请求
+            # 一起卡到预算耗尽（用户看到的「正在停止…」迟迟不动）。
+            should_stop=ctx.stop_requested,
             on_log=logger.info,
         )
     except fanya_browser.BrowserUnavailable as exc:

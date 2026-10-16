@@ -502,6 +502,7 @@
   "tiku_config": { … },
   "options": {
     "redo": false,
+    "concurrency": 1,
     "require_approval": true,
     "allow_ai_submit": false,
     "exam_submit": false,
@@ -522,6 +523,13 @@
 * `tasks_by_course` 一般不用（留空即可）。
 * `require_approval` 默认 **true**：所有会写入账号的内容都**先生成、不提交**，
   登记到待审批队列，等用户在界面上逐条批准。想全自动就显式传 `false`。
+* `concurrency` 默认 **1**（串行），范围 1–8：同一个任务下的多个任务点**并行**执行。
+  之所以值得开：每个任务点自己的「累计观看/阅读 N 分钟」门槛是各算各的，串行跑
+  就是 N 份等待相加，并行后总等待≈最慢的那个任务点。每个 worker 用一份**独立
+  会话**（`SessionManager.clone_session()`），事件回调仍然串行（不会撕裂前端计数）。
+  注意：**同一个文档的 10 分钟只能耗掉 10 分钟真实时间**，并行不会让单个任务点变快，
+  它只是让其他任务点不用排队（多开会话也不能让文档时长翻倍，实测见
+  `docs/浏览器通道-文档阅读时长.md`）。
 * `allow_ai_submit: true` 时，AI实践类的作答**不再逐条等待审批**（其余类型仍按
   `require_approval`）。
 * `exam_submit` / `group_submit` 分别控制**考试/测验**与**分组任务**是否真的交卷，

@@ -72,6 +72,12 @@ class SessionManager:
         return cls._instance
 
     def __init__(self):
+        # 单例只初始化一次：``__new__`` 复用实例，但 Python 每次 ``SessionManager()``
+        # 都会再调一次 ``__init__`` —— 不挡住的话每调一次 ``get_session()`` 就把
+        # 会话（连同登录后写入的 cookie、连接池）整份换新，``clone_session()``
+        # 复制到的也不再是"当前正在用的那个会话"。
+        if getattr(self, "_session", None) is not None:
+            return
         self._session = requests.Session()
         self._session.mount("https://", HTTPAdapter(max_retries=10))
         self._session.mount("http://", HTTPAdapter(max_retries=10))
@@ -94,6 +100,23 @@ class SessionManager:
     @classmethod
     def update_cookies(cls):
         cls.get_instance()._session.cookies.update(use_cookies())
+
+    @classmethod
+    def clone_session(cls) -> requests.Session:
+        """复制一份独立会话给并行 worker 用。
+
+        ``requests.Session`` 不是线程安全的（连接池、cookie jar 都会被并发写），
+        所以并行执行任务点时每个 worker 必须拿自己的 session：cookie 与请求头
+        从全局会话复制，连接池独立。
+        """
+        base = cls.get_session()
+        clone = requests.Session()
+        for prefix in base.adapters:
+            clone.mount(prefix, HTTPAdapter(max_retries=10))
+        clone.headers.clear()
+        clone.headers.update(base.headers)
+        clone.cookies.update(base.cookies)
+        return clone
 
 
 class Account:

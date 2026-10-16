@@ -111,3 +111,23 @@ def test_dist_is_single_file():
     """同步后 dist 里只剩一个 index.html（旧 React 产物应被清掉）。"""
     dist = os.path.dirname(DIST_INDEX)
     assert sorted(os.listdir(dist)) == ["index.html"]
+
+
+def test_execute_sends_concurrency_option(html):
+    """界面上的「并发任务点」必须真的发到后端，否则输入框只是个摆设。"""
+    assert 'id="fanya-concurrency"' in html, "找不到并发任务点输入框"
+    block = re.search(r'/api/fanya/execute"[^;]*?options:\s*\{([^}]*)\}', html, re.S)
+    assert block, "解析不到 /api/fanya/execute 的 options"
+    assert "concurrency" in block.group(1), "执行时没有把 concurrency 传给后端"
+
+
+def test_execute_sends_tiku_config(html):
+    """执行任务点也必须带上 AI 接口配置。
+
+    只带 options 不带 tiku_config 时，AI实践（上传作品）和主题讨论会静默
+    降级成模板文本甚至直接失败 —— 用户明明在设置页配好了 AI 接口。
+    """
+    block = re.search(r'/api/fanya/execute"[^;]*?body:\s*\{(.*?)\}\s*\}\)',
+                      html, re.S)
+    assert block, "解析不到 /api/fanya/execute 的 body"
+    assert "tiku_config" in block.group(1), "执行时没有把 tiku_config 传给后端"

@@ -144,8 +144,14 @@ def read_document_in_browser(
     read_state: Callable[[], tuple],
     *,
     budget_seconds: float = 1800.0,
-    poll_seconds: float = 10.0,
+    poll_seconds: float = 0.0,
+    scroll_steps: int = 12,
+    scroll_step_ms: int = 900,
+    scroll_px: int = 900,
     headless: bool = True,
+    should_stop: Optional[Callable[[], bool]] = None,
+    stall_rounds_limit: int = 2,
+    max_reopens: int = 12,
     on_log: Optional[Callable[[str], None]] = None,
 ) -> tuple[bool, str]:
     """在真实浏览器里滚动阅读文档，直到累计阅读时长达标或超出预算。
@@ -163,8 +169,26 @@ def read_document_in_browser(
         由调用方回读服务端，避免本模块依赖 ``FanyaTaskClient``。
     budget_seconds
         真实等待预算，超出即如实返回失败。
+    should_stop
+        可选中断回调（返回 True 立即收手）。界面上的「停止」要能在文档
+        阅读中途生效，否则一个 30 分钟的文档会把停止请求一起卡住。
+    scroll_steps / scroll_step_ms / scroll_px
+        每一轮把「向下滚动」铺开成 ``scroll_steps`` 次、每次间隔
+        ``scroll_step_ms`` 毫秒、每次 ``scroll_px`` 像素。铺开是必要的：
+        实测滚动到新内容才计入时长，一次跳到底再干等则一分不记。
+    poll_seconds
+        每轮回读服务端前的额外等待（默认 0：滚动本身就占满了一轮）。
+    stall_rounds_limit
+        连续多少轮回读「时长没有增加」就认为阅读器已经滚到底（默认 2 轮）。
+    max_reopens
+        最多重开阅读页多少次（默认 12 次）。
     on_log
         日志回调（默认 ``logger.info``）。
+
+    为什么需要「重开阅读页」：服务端只按真实阅读行为累计时长，而阅读器
+    滚到底之后就不再计入 —— 此时原地空转再久也不会涨（实测 160 秒 Δ0）。
+    重新打开阅读页会开始一个新的阅读会话、触发下一段结算（实测一次重开
+    约 +15 秒），这是不伪造上报的前提下唯一还能推进的做法。
 
     返回
     ----
@@ -232,7 +256,9 @@ def read_document_in_browser(
 
         page = ctx.new_page()
         t0 = time.time()
-        try:
+
+        def _open_reader() -> tuple:
+            """打开学习页并取出阅读器 iframe；返回 ``(reader, 错误信息)``。"""
             page.goto(learn_page_url, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(6000)
 
@@ -242,35 +268,45 @@ def read_document_in_browser(
             except Exception:  # noqa: BLE001
                 pass
             if "登录" in title:
-                browser.close()
-                return False, ("浏览器里未带上登录态（被重定向到登录页）—— "
-                               "请确认本机 cookie 仍然有效")
+                return None, ("浏览器里未带上登录态（被重定向到登录页）—— "
+                              "请确认本机 cookie 仍然有效")
 
-            reader = None
             for f in page.frames:
                 if _READER_HOST in (f.url or ""):
-                    reader = f
-                    break
-            if reader is None:
-                browser.close()
-                return False, ("文档阅读器 iframe（pan-yz.chaoxing.com）未加载，"
-                               "可能该文档已变更或需要验证码")
+                    return f, None
+            return None, ("文档阅读器 iframe（pan-yz.chaoxing.com）未加载，"
+                          "可能该文档已变更或需要验证码")
 
+        try:
+            reader, err = _open_reader()
+            if err:
+                browser.close()
+                return False, err
+
+            best = int(before[1] or 0)
+            stall_rounds = 0
+            reopens = 0
             while time.time() - t0 < budget_seconds:
-                # 阅读器判定 scrollBottom<=40 时会 postMessage({isFinished:1})
-                for _ in range(8):
+                if should_stop is not None and should_stop():
+                    browser.close()
+                    return False, (f"已按停止请求中止文档阅读（服务端已记 "
+                                   f"{best/1000:.0f} 秒，任务点未完成）")
+
+                # 阅读器按「滚动到新内容」累计时长（实测：原地滚动 0×、
+                # 向下滚 ≈1×、密集滚偶发 1.4×）—— 所以把滚动铺满整轮，而不是
+                # 一次跳到底再干等：一次到底之后，剩下的等待时间一分都不记。
+                for _ in range(max(1, scroll_steps)):
                     try:
-                        reader.evaluate(
-                            "() => window.scrollTo(0, document.body.scrollHeight)"
-                        )
+                        reader.evaluate(f"() => window.scrollBy(0, {scroll_px})")
                     except Exception:  # noqa: BLE001
                         pass
-                    page.wait_for_timeout(250)
+                    page.wait_for_timeout(scroll_step_ms)
                 try:
                     page.mouse.wheel(0, 2000)
                 except Exception:  # noqa: BLE001
                     pass
-                page.wait_for_timeout(int(max(1.0, poll_seconds) * 1000))
+                if poll_seconds > 0:
+                    page.wait_for_timeout(int(poll_seconds * 1000))
 
                 st = _state()
                 elapsed = time.time() - t0
@@ -281,14 +317,42 @@ def read_document_in_browser(
                     return True, (f"已在浏览器中阅读完成（服务端记 "
                                   f"{st[1]/1000:.0f} 秒 ≥ {required_ms/1000:.0f} 秒）")
 
+                if int(st[1] or 0) > best:
+                    best = int(st[1] or 0)
+                    stall_rounds = 0
+                    continue
+
+                stall_rounds += 1
+                if stall_rounds < stall_rounds_limit:
+                    continue
+                if reopens >= max_reopens:
+                    log(f"已重开阅读页 {reopens} 次仍无新增（停在 "
+                        f"{best/1000:.0f} 秒），不再空转")
+                    break
+                reopens += 1
+                log(f"已连续 {stall_rounds} 轮回读没有新增（{best/1000:.0f} 秒）"
+                    f"—— 阅读器已滚到底，重开阅读页触发下一段结算"
+                    f"（第 {reopens}/{max_reopens} 次）")
+                reader, err = _open_reader()
+                if err:
+                    browser.close()
+                    return False, err
+                # 新一轮从顶部重新读一遍，别停在底部空转
+                try:
+                    reader.evaluate("() => window.scrollTo(0, 0)")
+                except Exception:  # noqa: BLE001
+                    pass
+                stall_rounds = 0
+
             after = _state()
             browser.close()
             if required_ms > 0 and after[1] >= required_ms and not after[0]:
                 return False, (f"累计阅读已记 {after[1]/1000:.0f} 秒（≥ "
                                f"{required_ms/1000:.0f} 秒）但服务端尚未把任务点"
                                f"标为完成；稍后重试或等待平台结算")
-            return False, (f"超出单任务点时间上限（{budget_seconds:.0f} 秒），"
-                           f"已记 {after[1]/1000:.0f} 秒，未达 "
+            reopened = f"，重开阅读页 {reopens} 次" if reopens else ""
+            return False, (f"超出单任务点时间上限（{budget_seconds:.0f} 秒"
+                           f"{reopened}），已记 {after[1]/1000:.0f} 秒，未达 "
                            f"{required_ms/1000:.0f} 秒")
         finally:
             try:
