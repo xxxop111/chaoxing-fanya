@@ -173,10 +173,56 @@ def _resolve_choice_answer(answer: str, options: list) -> Optional[str]:
     return None
 
 
-def build_submission(parsed: dict, tiku: Any) -> tuple[dict, int, int, list]:
+#: 会被「大模型复核」的选择题类型（判断题的答案也要复核，因为错就是 0 分）。
+_CHOICE_TYPES = ("single", "multiple", "judgement")
+
+#: 判断题里被当作「正确」的各种写法；其余一律 false。
+_JUDGEMENT_TRUE = ("正确", "对", "T", "t", "true", "TRUE", "√", "是", "1")
+
+
+def _choice_value(q: dict, answer: str) -> Optional[str]:
+    """把「题库/模型的答案」规范成能直接写进表单的取值；无法规范时返回 None。
+
+    * 判断题 → ``"true"`` / ``"false"``（页面 JS：``itemAnswer == "true" ? true : false``）。
+      ⚠️ 课程作业的判断题取值是字符串 ``"true"/"false"``，写「对/错」会让服务端
+      直接拒绝整份提交（实测：提交请求 ~50ms 内失败，且该作业恰好全是判断题）。
+    * 单选/多选 → 选项字母（``_resolve_choice_answer``）。
+    """
+    if q["type"] == "judgement":
+        return "true" if str(answer).strip() in _JUDGEMENT_TRUE else "false"
+    return _resolve_choice_answer(str(answer), q["options"])
+
+
+def _ask_verifier(verifier: Any, q: dict) -> Optional[str]:
+    """向大模型复核一道题。失败、拒答、空答案都返回 None（视为「没有意见」）。"""
+    if verifier is None:
+        return None
+    try:
+        answer = verifier.query({
+            "title": q["title"],
+            "type": q["type"],
+            "options": "\n".join(q["options"]),
+        })
+    except Exception as exc:  # noqa: BLE001 - 复核失败不影响主答案
+        logger.debug("大模型复核失败（{}）: {}", q["id"], exc)
+        return None
+    if not answer or _is_refusal(str(answer)):
+        return None
+    return str(answer).strip()
+
+
+def build_submission(parsed: dict, tiku: Any,
+                     verifier: Any = None) -> tuple[dict, int, int, list]:
     """按题目查询题库并拼出提交字段。
 
     返回 ``(提交字段, 命中题数, 总题数, 逐题明细)``。未命中的题目保持空答案。
+
+    ``verifier`` 是一份**独立的大模型题库**（通常是 AI），只在主题库不是大模型时
+    传入：选择题会被复核一次，两边规范成选项字母后不一致时**采用模型的答案**。
+    这么做的理由（实测 2026-10-16）：网络题库按题干模糊匹配，串题时会给出「语义
+    完全不相干」的答案（例如问 Logistic 曲线形状却答「周期正弦曲线」），而这些
+    字母答案能通过 check_answer 的宽松校验，于是整份作业被交成 4/9。大模型在
+    同一份卷子上稳定 9/9，所以两个来源冲突时以大模型为准。
     """
     payload = dict(parsed["formData"])
     # 必填：题目 id 列表（缺失会被服务端判为「无效的参数」）
@@ -185,6 +231,7 @@ def build_submission(parsed: dict, tiku: Any) -> tuple[dict, int, int, list]:
     questions = parsed["questions"]
     found = 0
     details: list[dict] = []
+    overridden = 0
 
     for q in questions:
         qid = q["id"]
@@ -208,6 +255,17 @@ def build_submission(parsed: dict, tiku: Any) -> tuple[dict, int, int, list]:
                             "answer": None, "answered": False, "reason": "题库拒答"})
             answer = None
 
+        # 大模型复核：只在答案是选择题、且主题库不是大模型时进行。
+        if answer and verifier is not None and q["type"] in _CHOICE_TYPES:
+            primary = _choice_value(q, str(answer))
+            checked = _ask_verifier(verifier, q)
+            checked_value = _choice_value(q, checked) if checked else None
+            if primary and checked_value and primary != checked_value:
+                logger.warning("题目 {} 题库答案与大模型复核不一致（题库 {} / 模型 {}），"
+                               "采用模型答案", qid, primary, checked_value)
+                answer = checked
+                overridden += 1
+
         if answer:
             found += 1
         # 无论是否命中都要带上字段，否则表单校验可能不通过；
@@ -221,26 +279,18 @@ def build_submission(parsed: dict, tiku: Any) -> tuple[dict, int, int, list]:
             continue
 
         if q["type"] in ("single", "judgement", "multiple"):
-            if q["type"] == "judgement":
-                # ⚠️ 课程作业的判断题取值是字符串 "true"/"false"（页面 JS：
-                # itemAnswer == "true" ? true : false）。这里曾经写成「对/错」，
-                # 服务端表单校验会直接拒绝整份提交 —— 实测表现为提交请求 ~50ms
-                # 内失败，且该作业恰好全是判断题。
-                value = "true" if str(answer).strip() in (
-                    "正确", "对", "T", "t", "true", "TRUE", "√", "是", "1") else "false"
-            else:
-                value = _resolve_choice_answer(str(answer), q["options"])
-                if value is None:
-                    # 答案既不是选项字母，也对不上任何选项原文：这一题宁可留空。
-                    # 旧行为是把整段文本写进单选字段，服务端判错，用户看到的
-                    # 「我的答案」也变成一段话（曾经真的发生过）。
-                    logger.warning("题目 {} 的答案无法对应到选项字母，本題按未命中处理：{}",
-                                   qid, str(answer)[:60])
-                    found -= 1
-                    details.append({"qid": qid, "type": q["type"], "title": q["title"],
-                                    "answer": str(answer).strip(), "answered": False,
-                                    "reason": "答案无法对应选项"})
-                    continue
+            value = _choice_value(q, str(answer))
+            if value is None:
+                # 答案既不是选项字母，也对不上任何选项原文：这一题宁可留空。
+                # 旧行为是把整段文本写进单选字段，服务端判错，用户看到的
+                # 「我的答案」也变成一段话（曾经真的发生过）。
+                logger.warning("题目 {} 的答案无法对应到选项字母，本題按未命中处理：{}",
+                               qid, str(answer)[:60])
+                found -= 1
+                details.append({"qid": qid, "type": q["type"], "title": q["title"],
+                                "answer": str(answer).strip(), "answered": False,
+                                "reason": "答案无法对应选项"})
+                continue
             for name in q["answerFields"]:
                 if name.startswith("answer") and not name.startswith("answertype"):
                     payload[name] = value
@@ -262,6 +312,8 @@ def build_submission(parsed: dict, tiku: Any) -> tuple[dict, int, int, list]:
     rate = (found / len(questions)) if questions else 0.0
     logger.info("课程作业共 {} 题，题库命中 {} 题（覆盖率 {:.0%}）",
                 len(questions), found, rate)
+    if overridden:
+        logger.info("其中 {} 题按大模型复核结果改写过（两个来源答案不一致）", overridden)
     return payload, found, len(questions), details
 
 
@@ -378,7 +430,8 @@ def parse_hidden_inputs(html: str) -> dict:
 
 def complete_course_work(session: requests.Session, entry_url: str, tiku: Any, *,
                          save_only: bool = False, cover_rate: float = 0.0,
-                         on_log: Optional[Callable] = None, timeout: float = 30.0
+                         on_log: Optional[Callable] = None, timeout: float = 30.0,
+                         verifier: Any = None
                          ) -> tuple[bool, str]:
     """完成一个课程作业任务点。
 
@@ -422,7 +475,8 @@ def complete_course_work(session: requests.Session, entry_url: str, tiku: Any, *
     if not questions:
         return False, "未在作业页解析到任何题目"
 
-    prepared = build_prepared(parsed, final_url, tiku, cover_rate=cover_rate, log=log)
+    prepared = build_prepared(parsed, final_url, tiku, cover_rate=cover_rate, log=log,
+                              verifier=verifier)
     if prepared["total"] == 0:
         return False, "作业页没有题目"
 
@@ -437,10 +491,10 @@ def complete_course_work(session: requests.Session, entry_url: str, tiku: Any, *
 
 
 def build_prepared(parsed: dict, referer: str, tiku: Any, *, cover_rate: float = 0.0,
-                   log: Optional[Callable] = None) -> dict:
+                   log: Optional[Callable] = None, verifier: Any = None) -> dict:
     """把「读到的题目 + 题库答案」整理成一个可提交/可送审的载荷（不做任何写操作）。"""
     log = log or (lambda m: logger.info(m))
-    payload, found, total, details = build_submission(parsed, tiku)
+    payload, found, total, details = build_submission(parsed, tiku, verifier=verifier)
     rate = (found / total) if total else 0.0
     if cover_rate and rate < cover_rate:
         log(f"题库覆盖率 {rate:.0%} 低于阈值 {cover_rate:.0%}，将只保存不提交")
@@ -494,7 +548,8 @@ def submit_prepared(session: requests.Session, prepared: dict, *,
 
 def prepare_course_work(session: requests.Session, entry_url: str, tiku: Any, *,
                         cover_rate: float = 0.0, on_log: Optional[Callable] = None,
-                        timeout: float = 30.0) -> tuple[bool, str, dict]:
+                        timeout: float = 30.0, verifier: Any = None
+                        ) -> tuple[bool, str, dict]:
     """**只准备、不写任何东西**：读题 + 查题库，返回送审载荷。
 
     用于「生成后暂停、逐条审批」流程 —— 在用户批准之前，既不保存草稿也不提交。
@@ -525,6 +580,7 @@ def prepare_course_work(session: requests.Session, entry_url: str, tiku: Any, *,
     if not gate_ok:
         return False, gate_msg, {}
 
-    prepared = build_prepared(parsed, final_url, tiku, cover_rate=cover_rate, log=log)
+    prepared = build_prepared(parsed, final_url, tiku, cover_rate=cover_rate, log=log,
+                              verifier=verifier)
     prepared["entry_url"] = entry_url
     return True, summarize_prepared(prepared), prepared

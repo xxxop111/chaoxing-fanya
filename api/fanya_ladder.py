@@ -298,15 +298,22 @@ def consume_sse(resp: requests.Response, on_event: Optional[Callable] = None,
             raise LadderError(f"评估流返回错误: {payload[:200]}")
         if event == "status":
             try:
-                status = json.loads(payload).get("content")
+                parsed = json.loads(payload)
             except ValueError:
                 status = payload
+            else:
+                status = parsed.get("content") if isinstance(parsed, dict) else payload
             continue
         try:
             obj = json.loads(payload)
-            content = obj.get("content") or ""
         except ValueError:
             content = payload
+        else:
+            # 流里除了正文对象，还会出现保活用的裸数字（如 ``data: 0``）或数组，
+            # 早期版本直接 ``obj.get(...)`` 会抛 AttributeError 打断整条评估流。
+            content = obj.get("content") if isinstance(obj, dict) else ""
+            if content is None:
+                content = ""
         if content:
             chunks.append(str(content))
         if callable(on_event):

@@ -131,3 +131,15 @@ def test_execute_sends_tiku_config(html):
                       html, re.S)
     assert block, "解析不到 /api/fanya/execute 的 body"
     assert "tiku_config" in block.group(1), "执行时没有把 tiku_config 传给后端"
+
+def test_preview_surfaces_below_threshold(html):
+    """低分（未达标）必须在盘点里看得见。
+
+    任务点「未完成」和「已交但没达标」是两件不同的事：后者（AI实践 < aicoachScore、
+    作业 < workScore）平台不会算完成，需要重做。前端要给出汇总格、状态标签与
+    任务级计数，否则用户只能看到「未完成」，不知道低分还要处理。
+    """
+    assert "belowThresholdCount" in html, "汇总里没有未达标计数"
+    assert "belowThreshold" in html, "状态标签没有用未达标标记"
+    assert "未达标" in html, "界面上看不到「未达标」字样"
+    assert "expiredCount" in html, "窗口已过的计数被改掉了"

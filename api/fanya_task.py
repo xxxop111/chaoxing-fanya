@@ -955,6 +955,59 @@ def _probe_item_windows(client: FanyaTaskClient, task: FanyaTask,
                 logger.debug("窗口探测任务异常: {}", exc)
 
 
+_REDO_TIMES_RE = re.compile(r"redoTimes\s*=\s*([0-9+\-\s]+);")
+
+
+def _parse_redo_times(html: str) -> Optional[int]:
+    """从作业判定页里解出 ``redoTimes``。
+
+    页面里它是一个 JS 算式（实测 ``var redoTimes = 0 + 0 - 0;``），所以不能直接
+    ``int()``；这里只接受「数字 + 加减号」的表达式，避免把变量名当表达式求值。
+    """
+    match = _REDO_TIMES_RE.search(html or "")
+    if not match:
+        return None
+    expression = match.group(1)
+    if not re.fullmatch(r"[0-9+\-\s]+", expression):
+        return None
+    total = 0
+    for part in re.finditer(r"([+-]?)\s*(\d+)", expression):
+        total += (-1 if part.group(1) == "-" else 1) * int(part.group(2))
+    return max(total, 0)
+
+
+def _probe_work_redo_times(client: FanyaTaskClient, task: FanyaTask) -> None:
+    """为「已出分但低于达标线」的作业查一次还能重做几次（**只读**）。
+
+    作业的重做次数只出现在判定页的 JS 里，而判定页要先 ``getToStudyUrl`` 拿跳转
+    （已提交的作业这时拿到的是「查看」页而不是答题页），所以每个低分作业要花两次
+    请求。只对低分作业做 —— 正常任务点一次都不会多发。
+
+    结果写进 ``item.extra["redo_times"]``：``0`` = 平台根本不给重做次数（实测
+    2026-10-16 的「Logistic模型作业」就是这种，页面里没有任何修改入口），
+    ``None`` = 没读到（页面打不开 / 结构变了，不要猜）。
+    """
+    for item in task.items:
+        if item.plan_type != PLAN_TYPE_WORK or not is_below_threshold(item):
+            continue
+        if item.extra.get("redo_times") is not None:
+            continue
+        try:
+            study_url = client.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
+            url = str(study_url.get("url") or "")
+            if not url:
+                continue
+            resp = client.session.get(url, timeout=30)
+            resp.encoding = "utf-8"
+            html = resp.text
+        except Exception as exc:  # noqa: BLE001 - 读不到就不下结论
+            logger.debug("作业重做次数读取失败（{}）：{}", item.name[:24], exc)
+            continue
+        times = _parse_redo_times(html)
+        if times is not None:
+            item.extra["redo_times"] = times
+
+
 def _describe_ai_practice_items(client: FanyaTaskClient, course: dict, task: FanyaTask, redo: bool = False) -> None:
     """为未完成的 AI实践任务点补充子模式信息（只读）。"""
     from api import fanya_ai
@@ -1049,6 +1102,55 @@ def classify_items(task: FanyaTask) -> None:
             item.skip_reason = note
 
 
+def item_score(item: FanyaPlanItem) -> Optional[float]:
+    """任务点的平台得分。
+
+    作业类任务点的 ``score`` 是一整条评分记录（dict，分数在 ``totalScore`` 里），
+    其它类型直接是数值或 None；两者都归一化成 float / None。
+    """
+    raw = item.score
+    if isinstance(raw, dict):
+        for key in ("totalScore", "studentEvaluationScore", "score"):
+            value = raw.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    return None
+
+
+def item_threshold(item: FanyaPlanItem) -> Optional[float]:
+    """任务点的达标线：AI实践 看 ``aicoachScore``，作业看 ``workScore``。
+
+    其余类型（视频/文档/章节/讨论…）平台不给达标线，返回 None。
+    """
+    breakthrough = (item.extra or {}).get("planBreakthroughSet") or {}
+    if breakthrough.get("enableAicoach"):
+        value = breakthrough.get("aicoachScore")
+    elif breakthrough.get("enableWorkScore"):
+        value = breakthrough.get("workScore")
+    else:
+        return None
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_below_threshold(item: FanyaPlanItem) -> bool:
+    """已出分但低于平台达标线（AI实践 60 / 作业 workScore）。
+
+    这类任务点即使交过卷也会一直挂着（AI实践 低于 ``aicoachScore`` 时
+    ``isFinish`` 不会翻成 True），需要重做或改进答案，值得在界面上单独提示。
+    """
+    score = item_score(item)
+    threshold = item_threshold(item)
+    return score is not None and threshold is not None and score < threshold
+
+
 # ======================================================================
 # 预览：列出所有课程 / 任务 / 任务点及其可自动化判定
 # ======================================================================
@@ -1070,7 +1172,7 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
     result: dict = {"courses": [], "summary": {
         "courseCount": 0, "taskCount": 0, "pendingCount": 0,
         "completableCount": 0, "manualCount": 0, "unsupportedCount": 0,
-        "expiredCount": 0,
+        "expiredCount": 0, "belowThresholdCount": 0,
     }}
 
     def emit(**payload) -> None:
@@ -1130,6 +1232,8 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
             # 窗口探测必须在 classify_items 之后：unreachable 依赖 handled_by。
             if probe_windows:
                 _probe_item_windows(client, task)
+                # 低分作业：再查一次「还能重做几次」（只对低分作业，见该函数注释）
+                _probe_work_redo_times(client, task)
             allow, allow_msg = client.check_allow_study(task.encry_task_user_id)
             task.allow_study = allow
             task.allow_study_message = allow_msg
@@ -1153,6 +1257,22 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
                     note = quiz_info["summary"]
                     if quiz_info.get("expired"):
                         status = STATUS_MANUAL
+                score = item_score(item)
+                threshold = item_threshold(item)
+                below_threshold = is_below_threshold(item)
+                redo_times = item.extra.get("redo_times")
+                if below_threshold and item.plan_type == PLAN_TYPE_WORK:
+                    # 低分作业：平台的重做是纯 UI 流程（本工具不支持），一跑就只会
+                    # 得到「已经提交过了，无需重复作答」。所以要如实说「得了几分、
+                    # 达标线多少、还能不能重做」，而不是让它继续显示成「可自动完成」。
+                    status = STATUS_MANUAL
+                    if redo_times is None:
+                        tail = "本工具不支持作业重做，请到课程页面手动操作"
+                    elif redo_times > 0:
+                        tail = f"平台还剩 {redo_times} 次重做机会，请到课程页面手动重做"
+                    else:
+                        tail = "平台不给重做次数（redoTimes=0），只能请老师开启重做"
+                    note = f"已提交但得分 {score:g}，低于达标线 {threshold:g}；{tail}"
                 items.append({
                     "planId": item.plan_id,
                     "name": item.name,
@@ -1175,7 +1295,15 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
                     "entryUrl": ai_mode.get("entryUrl") if ai_mode else "",
                     "quizExpired": bool(quiz_info.get("expired")) if quiz_info else False,
                     "quizWindow": (quiz_info.get("window") or "") if quiz_info else "",
+                    # 成绩：作业/测验/AI实践 才有分数；未达标（分数 < 平台达标线）
+                    # 的任务点即使 isFinish 也可能仍挂着，界面据此提示「需重做」。
+                    "score": score,
+                    "threshold": threshold,
+                    "belowThreshold": below_threshold,
+                    "redoTimes": redo_times if isinstance(redo_times, int) else None,
                 })
+                if below_threshold:
+                    result["summary"]["belowThresholdCount"] += 1
                 if not item.is_finish:
                     if item.unreachable:
                         # 窗口已结束 / 尚未开放：单列，不混进「待处理」
@@ -1201,6 +1329,8 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
                 "completableCount": len([i for i in task.pending_items
                                          if not i.unreachable and i.supported]),
                 "expiredCount": len([i for i in task.pending_items if i.unreachable]),
+                "belowThresholdCount": len([i for i in task.items
+                                            if is_below_threshold(i)]),
                 "groups": task.extra.get("groups") or [],
                 "items": items,
             })
@@ -2660,6 +2790,47 @@ def handle_group_task(ctx: CompletionContext) -> tuple[bool, str]:
 
 
 @register_handler("course_work")
+def _build_ai_verifier(tiku: Any) -> Any:
+    """当主题库**不是**大模型时，额外造一个 AI 实例用于复核选择题答案。
+
+    背景（实测 2026-10-16）：网络题库按题干模糊匹配，串题时会返回语义完全不相干
+    的字母答案，而这类答案能通过 ``check_answer`` 的宽松校验，于是整份作业被交成
+    4/9。大模型在同一份卷子上稳定 9/9。所以非大模型主题库 + 已配置 AI 时，选择题
+    会复核一次，冲突以模型为准。
+
+    返回 ``None`` 表示无法复核（主题库已经是大模型 / 没配 endpoint+key+model），
+    此时行为与以前完全一致 —— 复核是**可选增强**，绝不能因为它坏掉而影响答题。
+    """
+    conf = getattr(tiku, "_conf", None)
+    if not conf:
+        return None
+    try:
+        provider = str(conf.get("provider") or "").strip()
+    except Exception:  # noqa: BLE001 - 配置对象形态不定
+        return None
+    if provider in ("AI", "SiliconFlow"):
+        return None  # 主答案已经来自大模型，没必要再问一次
+    for key in ("endpoint", "key", "model"):
+        try:
+            if not conf.get(key):
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        from api.answer import AI
+
+        verifier = AI()
+        verifier.config_set(conf)
+        verifier.init_tiku()
+        if verifier.DISABLE:
+            return None
+        logger.info("已启用大模型复核：主题库「{}」的答案会与 AI 交叉验证", provider)
+        return verifier
+    except Exception as exc:  # noqa: BLE001 - 复核失败不影响主流程
+        logger.warning("启用大模型复核失败，本次不做复核: {}", exc)
+        return None
+
+
 def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
     """完成「作业」任务点（mooc2 课程作业）。
 

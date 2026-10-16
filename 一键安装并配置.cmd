@@ -42,7 +42,7 @@ set "WORK=%TEMP%\chaoxing-fanya-setup"
 set "RUN=%WORK%\setup.exe"
 mkdir "%WORK%" 2>nul
 if not exist "%WORK%" goto :no_temp
-if not exist "%RUN%" copy /y "%SETUP%" "%RUN%" >nul
+copy /y "%SETUP%" "%RUN%" >nul
 if not exist "%RUN%" goto :copy_setup_failed
 echo      运行副本：%RUN%
 

@@ -554,6 +554,96 @@ def test_build_submission_leaves_choice_empty_when_unmappable():
 
 
 # ----------------------------------------------------------------------
+# 大模型复核（verifier）：非大模型主题库串题时的兜底
+# 实测背景：题库把「Logistic 曲线形状」答成「周期正弦曲线」，整卷交成 4/9，
+# 而同一个模型对同一份卷子 9/9。两个来源冲突时以大模型为准。
+# ----------------------------------------------------------------------
+def test_build_submission_without_verifier_keeps_tiku_answer():
+    payload, found, _total, _details = build_submission(_one_choice_work(), _StubTiku("A"))
+    assert payload["answerq1"] == "A"
+    assert found == 1
+
+
+def test_verifier_overrides_disagreeing_tiku_answer():
+    payload, found, total, details = build_submission(
+        _one_choice_work(), _StubTiku("A"), verifier=_StubTiku("B"))
+    assert payload["answerq1"] == "B"
+    assert (found, total) == (1, 1)
+    assert details[0]["answered"] is True
+
+
+def test_verifier_agreement_keeps_primary_answer():
+    payload, _found, _total, _details = build_submission(
+        _one_choice_work(), _StubTiku("乙的说法"), verifier=_StubTiku("B"))
+    assert payload["answerq1"] == "B"
+
+
+def test_verifier_useless_answer_keeps_primary():
+    """复核回了一段对不上选项的话 → 视为「没有意见」，不能因此把答案弄丢。"""
+    for bad in ("我不确定", "", None, "E"):
+        payload, found, _total, _details = build_submission(
+            _one_choice_work(), _StubTiku("A"), verifier=_StubTiku(bad))
+        assert payload["answerq1"] == "A", bad
+        assert found == 1, bad
+
+
+def test_verifier_failure_is_swallowed():
+    class _Boom:
+        def query(self, _payload):
+            raise RuntimeError("endpoint down")
+
+    payload, found, _total, _details = build_submission(
+        _one_choice_work(), _StubTiku("A"), verifier=_Boom())
+    assert payload["answerq1"] == "A"
+    assert found == 1
+
+
+def test_verifier_skipped_when_primary_unanswered():
+    """题库没命中时不去问模型（避免把本该留空的题变成「有答案」）。"""
+    calls = []
+
+    class _Counting:
+        def query(self, payload):
+            calls.append(payload)
+            return "B"
+
+    payload, found, _total, _details = build_submission(
+        _one_choice_work(), _StubTiku(None), verifier=_Counting())
+    assert payload["answerq1"] == ""
+    assert found == 0
+    assert calls == []
+
+
+def test_judgement_answer_normalised_to_true_false():
+    """判断题取值必须是字符串 "true"/"false"：写「对/错」会被服务端整份拒绝。"""
+    work = _one_choice_work()
+    work["questions"][0]["type"] = "judgement"
+    work["questions"][0]["options"] = []
+    for raw, expect in (("正确", "true"), ("对", "true"), ("√", "true"),
+                        ("错误", "false"), ("错", "false"), ("×", "false")):
+        payload, found, _total, _details = build_submission(work, _StubTiku(raw))
+        assert payload["answerq1"] == expect, raw
+        assert found == 1, raw
+
+
+def test_ai_verifier_returns_none_for_ai_provider_and_for_incomplete_config():
+    """复核是纯增强：主题库已经是大模型、或没配齐 endpoint/key/model 时都返回 None。"""
+    from api.fanya_task import _build_ai_verifier
+
+    class _T:
+        def __init__(self, conf):
+            self._conf = conf
+
+    assert _build_ai_verifier(_T({"provider": "AI"})) is None
+    assert _build_ai_verifier(_T(None)) is None
+    assert _build_ai_verifier(_T({})) is None
+    # 非大模型主题库但缺 key → 放弃复核，而不是抛异常
+    assert _build_ai_verifier(_T({"provider": "LIKE",
+                                  "endpoint": "https://x/y",
+                                  "model": "m"})) is None
+
+
+# ----------------------------------------------------------------------
 # 内置 runner：没装 pytest 也能跑（本仓库刻意保持零测试依赖）
 # ----------------------------------------------------------------------
 def _run_all() -> int:

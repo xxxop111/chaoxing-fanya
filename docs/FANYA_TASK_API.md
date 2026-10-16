@@ -96,6 +96,38 @@ topicId。已排除的旁路（都实测失败或不可达）：
 章节类窗口关闭**不算** `unreachable`（它不依赖这次跳转，实测还能完成），
 只是 `windowState="expired"` + `windowNote` 提示窗口已过。
 
+**[约定]** 成绩与「未达标」：盘点里每个任务点还带 `score` / `threshold` /
+`belowThreshold`，任务级与汇总各有一个 `belowThresholdCount`。
+
+* `threshold` 取平台自己的达标线：**AI实践** 看 `planBreakthroughSet.aicoachScore`
+  （`enableAicoach=1` 时），**作业** 看 `workScore`（`enableWorkScore=1` 时）；
+  视频/文档/章节这类平台不给达标线，返回 `None`。
+* 作业的 `score` 是**一整条评分记录**（dict，分数在 `totalScore` 里），其它类型
+  直接是数值或 `None`；`item_score()` 负责归一化，`is_below_threshold()` 判低分。
+* **低于达标线的 AI实践 不会翻成已完成**：实测 2026-10-16「线性与非线性回归
+  AI实践作业」（`aicoachScore=60`）第一次作答 35 分 → `isFinish=False`，
+  平台一直把它算作未完成（再跑一遍就是重答）；重做后 100 分 → `isFinish=True`。
+  所以这类任务点界面要明说「未达标、需要重做」，不能只显示「未完成」。
+* **低分作业会被标成「需人工」而不是「可自动完成」**：作业的重做不在本工具的
+  自动重做范围内（见下），若继续显示成「可自动」，用户一跑只会得到一句
+  「该作业已经提交过了，无需重复作答」。所以盘点会为**低分作业**多发两次只读
+  请求（`getToStudyUrl` → 判定页），用 ``_parse_redo_times`` 从页面 JS 里解出
+  ``redoTimes``（实测是算式 ``var redoTimes = 0 + 0 - 0;``），item 上给出
+  `redoTimes`，并把 note 写成「已提交但得分 44.5，低于达标线 50；平台不给重做
+  次数（redoTimes=0），只能请老师开启重做」。读不到次数时不猜（`redoTimes=None`，
+  note 改为「请到课程页面手动操作」）。只对低分作业做，正常任务点一次都不多发。
+
+**[已验证，2026-10-16] 重做的可行边界**：
+
+* **AI实践 可以重做**（平台按 `remainScoreCount` 允许重练，本账号余量很大）：
+  进入任务点作答页 → 重新上传作品（`fileModeType=0` 的挂附件载荷，实测可提交）
+  → 交卷 → 平台 AI 评卷出分。实测同一天把上面那份 AI实践 从 35 分重做到 **100 分**，
+  任务点随即 `isFinish=True`。
+* **作业不可自动重做**：判定页里 `redoTimes=0`（`redoWork()` 文案「你还可以重做0次」），
+  页面里也没有任何「修改 / 重新提交」入口，`modifyAnswer()` 指向的 `dowork` 页 403。
+  低分作业只能请老师在作业设置里开启重做/允许修改。
+* **文档 / 视频 / AI实践 之外的类型**：窗口结束即无法进入（见上），不存在重做问题。
+
 ## 3. 任务点类型（全库实测分布）
 
 对本人 26 门课程盘点，7 门存在任务引擎任务，共 28 个任务、127 个待完成任务点。
@@ -276,6 +308,41 @@ https://data-xxt.aichaoxing.com/analysis/ac_mark?…
 
 带的是 `workId` + `enc`，属于**课程作业**，和章节检测作业（`api/base.py:study_work`
 用的 `/mooc-ans/api/work?...&jobid=work-...`）不是同一套入口，暂未接入。
+
+#### 6.2.1 答案来源与「大模型复核」（2026-10-16 实测）
+
+链路：`handle_course_work` → `parse_work_page`（题干 + 带 `A. ` 前缀的选项）→
+`build_submission(parsed, tiku, verifier=…)` → `submit_prepared`。其中 `tiku` 就是
+`settings.tiku_config` 里配的**那一个**题库类（`Tiku.get_tiku_from_config` 按
+`provider` 只选一个，不存在「多题库并联」）。
+
+写进表单的取值：
+
+| 题型 | 取值 | 备注 |
+| --- | --- | --- |
+| 单选 / 多选 | 选项字母 `"B"` / `"AB"` | 答案给的是选项原文时按 `_option_plain` 反查字母 |
+| 判断题 | 字符串 `"true"` / `"false"` | 页面 JS `itemAnswer == "true" ? true : false`；写「对/错」服务端**拒绝整份提交**（实测提交请求 ~50ms 内失败） |
+
+答案既不是字母、也对不上任何选项原文时：**该题留空**，明细里记
+`reason="答案无法对应选项"`，命中数减一 —— 旧行为是把整段文本塞进单选字段，
+服务端判错，用户看到的「我的答案」还会变成一段话。
+
+⚠️ **为什么要复核**：网络题库（言溪 / LIKE / TikuAdapter）按题干模糊匹配，串题时会
+回**语义完全不相干**的字母答案 —— 实测数学建模作业 8379428（9 道单选）：
+问「Logistic 曲线形状」答「周期正弦曲线」、问「最小化哪个量」答「承载量 xₘ」，
+而这类字母答案能通过 `check_answer` 的宽松校验，于是整份作业交成 **4/9**；同一个
+模型对同一份卷子**三种提示词都是 9/9**（`_probe_work_quality.py`、`_probe_work_quality2.py`）。
+
+所以当**主题库不是大模型、且 `tiku_config` 已配齐 endpoint/key/model** 时，选择题
+（含判断题）会额外问一次 AI 复核：两边都规范成选项字母后不一致 → **采用 AI 的答案**，
+并打 `WARNING`（「题库答案与大模型复核不一致…采用模型答案」）。判定入口
+`_build_ai_verifier`（`api/fanya_task.py`）：provider 已是 `AI`/`SiliconFlow`、
+配置不全、或实例化失败 → 返回 `None`，行为与之前**完全一致**（复核是纯增强）。
+
+复核失败 / 模型回了一段对不上选项的话 / 主题库没命中 —— 三种情况都不改写答案、
+也不抛异常。成本：每题一次额外 AI 调用（AI 内部有 3s 最小间隔），9 题约 +27 秒。
+端到端复现：`.venv\Scripts\python.exe _probe_work_verify.py`（假网络题库复刻 4/9 →
+加复核应回到 9/9）。
 
 ### 6.3 视频（planType 10）——累计观看时长门槛
 

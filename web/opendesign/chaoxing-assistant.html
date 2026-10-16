@@ -1205,6 +1205,7 @@
       ["待完成", s.pendingCount, true], ["可自动完成", s.completableCount, false],
       ["需人工", s.manualCount, false], ["暂不支持", s.unsupportedCount, false],
       ["窗口已过", s.expiredCount, false],
+      ["未达标", s.belowThresholdCount, false],
       ["课程", s.courseCount, false], ["任务", s.taskCount, false]
     ];
     el.innerHTML = cells.map(function (c) {
@@ -1213,6 +1214,8 @@
   }
   function statusPill(st, it) {
     if (it && it.expired) return '<span class="pill pill-muted">窗口已过</span>';
+    // 已出分但低于平台达标线（AI实践 60 / 作业 workScore）：要重做，别显示成「可自动」
+    if (it && it.belowThreshold) return '<span class="pill pill-warn">未达标</span>';
     if (st === "auto") return '<span class="pill pill-run">可自动</span>';
     if (st === "partial") return '<span class="pill pill-warn">部分自动</span>';
     if (st === "manual") return '<span class="pill pill-muted">需人工</span>';
@@ -1236,7 +1239,7 @@
             '<span class="tag">' + esc(it.typeLabel || "任务点") + "</span>" +
             '<button class="btn btn-sm btn-ghost" data-open="' + esc(it.entryUrl || "#") + '">打开</button></div>';
         }).join("");
-        var meta = "未完成 " + (t.pendingCount || 0) + (t.expiredCount ? " · 窗口已过 " + t.expiredCount : "");
+        var meta = "未完成 " + (t.pendingCount || 0) + (t.expiredCount ? " · 窗口已过 " + t.expiredCount : "") + (t.belowThresholdCount ? " · 未达标 " + t.belowThresholdCount : "");
         return '<div class="tree-task"><div class="tree-task-head"><span class="title" style="font-weight:600;">' + esc(t.name) + '</span><span class="grow"></span><span class="meta">' + meta + "</span></div>" + items + "</div>";
       }).join("");
       return '<div class="tree-group">' + head + tasks + "</div>";
