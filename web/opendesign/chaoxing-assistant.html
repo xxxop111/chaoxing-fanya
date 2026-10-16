@@ -501,7 +501,7 @@
 
     <div class="demo-banner" id="demo-banner" hidden data-od-id="demo-banner">
       <strong>演示模式</strong>
-      <span>未检测到 <span class="num">127.0.0.1</span> 上的本地服务，界面展示的是示例数据；接入真实后端后会自动切换。</span>
+      <span>未连接到本地服务，当前显示的是示例数据。</span>
       <button type="button" id="demo-dismiss">知道了</button>
     </div>
 
@@ -511,7 +511,7 @@
         <div class="page-head">
           <div>
             <h1>账号</h1>
-            <p class="lede">后端无会话：每次需要账号的请求都要重新带上用户名 / 密码，或勾选「复用本机登录状态」使用已保存的 cookies.txt。</p>
+            <p class="lede">登录一次即可开始；已经有登录状态时，勾选下面的开关就能免密使用。</p>
           </div>
         </div>
         <div class="grid-1-2">
@@ -530,18 +530,18 @@
               <label class="switch">
                 <input type="checkbox" id="acc-cookies" />
                 <span class="switch-ui"><span class="thumb"></span></span>
-                <span class="switch-text">复用本机登录状态（use_cookies）</span>
+                <span class="switch-text">复用本机登录状态</span>
               </label>
               <div class="row wrap" style="gap:12px;">
                 <button class="btn btn-primary" type="submit" id="btn-login-courses">登录并获取课程</button>
                 <button class="btn btn-secondary" type="button" id="btn-login-only">仅校验账号</button>
               </div>
-              <p class="mono-note" id="account-msg">登录成功会把 cookies 落到本机 cookies.txt，之后可免密使用。</p>
+              <p class="mono-note" id="account-msg">登录状态只保存在本机。</p>
             </form>
           </div>
           <div class="stack">
             <div class="card" data-od-id="account-session-card">
-              <div class="card-head"><div><h2>当前会话</h2><div class="sub">内存态，重启进程即失效</div></div></div>
+              <div class="card-head"><div><h2>当前会话</h2><div class="sub">关闭程序后需重新登录</div></div></div>
               <dl class="kv">
                 <dt>登录状态</dt><dd id="session-state">未登录</dd>
                 <dt>账号</dt><dd id="session-user">—</dd>
@@ -550,10 +550,10 @@
               </dl>
             </div>
             <div class="card" data-od-id="account-tips-card">
-              <div class="card-head"><div><h2>接入说明</h2></div></div>
+              <div class="card-head"><div><h2>登录提示</h2></div></div>
               <div class="stack" style="gap:12px;">
-                <p class="lede">全部请求使用相对路径 <span class="mono-note">/api/…</span>，端口由运行时动态分配，切勿写死端口。</p>
-                <p class="lede">登录被超星拒绝会返回 HTTP 401，其 <span class="mono-note">msg</span> 是超星原话（如要求短信验证码 / 滑块验证）。</p>
+                <p class="lede">如果提示需要短信验证码或滑块验证，按提示在手机上完成，再回来点一次登录。</p>
+                <p class="lede">长时间不用会掉线，重新登录即可。</p>
               </div>
             </div>
           </div>
@@ -565,7 +565,7 @@
         <div class="page-head">
           <div>
             <h1>课程与任务点</h1>
-            <p class="lede">先勾选课程，再对 <span class="mono-note">task.chaoxing.com</span> 的「任务」做只读盘点；盘点绝不会改动学习记录。</p>
+            <p class="lede">勾选课程后点「盘点任务点」；盘点只读取状态，不会改动学习记录。</p>
           </div>
           <div class="head-actions">
             <button class="btn btn-secondary" id="btn-fetch-courses">刷新课程列表</button>
@@ -622,7 +622,7 @@
         <div class="page-head">
           <div>
             <h1>运行与日志</h1>
-            <p class="lede">任务状态与日志各 1 秒轮询一次；日志是队列消费，取走即清空，请以本页缓冲为准。</p>
+            <p class="lede">这里能看到任务进度与实时日志。</p>
           </div>
           <div class="head-actions" id="run-actions"></div>
         </div>
@@ -631,12 +631,12 @@
             <div id="run-summary"></div>
           </div>
           <div class="card card-plain" id="run-active-card" hidden data-od-id="run-active-card">
-            <div class="card-head"><div><h2>当前视频进度</h2><div class="sub">超过 10 秒无心跳的条目会被后端自动移除</div></div></div>
+            <div class="card-head"><div><h2>当前视频进度</h2></div></div>
             <div id="run-active-jobs"></div>
           </div>
           <div class="card card-plain" data-od-id="run-log-card">
             <div class="card-head">
-              <div><h2>实时日志</h2><div class="sub">等宽字体 · 四色级别 · 自动滚底</div></div>
+              <div><h2>实时日志</h2></div>
               <label class="switch" style="min-height:auto;">
                 <input type="checkbox" id="log-autoscroll" checked />
                 <span class="switch-ui"><span class="thumb"></span></span>
@@ -653,7 +653,7 @@
         <div class="page-head">
           <div>
             <h1>待审批</h1>
-            <p class="lede">所有会写入账号的内容先在这里登记、逐条批准后才提交；队列只在内存里，重启后清空。</p>
+            <p class="lede">会写入账号的操作先在这里排队，你逐条批准后才会提交。</p>
           </div>
           <div class="head-actions">
             <label class="switch" style="min-height:auto;">
@@ -672,7 +672,7 @@
         <div class="page-head">
           <div>
             <h1>设置</h1>
-            <p class="lede">POST /api/config 是整份覆盖写：这里保存的是完整的配置对象。字段名不要改动。</p>
+            <p class="lede">填好后点「保存配置」即可生效。</p>
           </div>
           <div class="head-actions">
             <button class="btn btn-secondary" id="btn-config-reload">重新读取</button>
@@ -682,20 +682,20 @@
         <div class="stack">
           <div class="card card-plain" data-od-id="settings-ai-card">
             <div class="card-head">
-              <div><h2>AI 问答接口（tiku_config）</h2><div class="sub">endpoint / key / model 同时非空才算配好</div></div>
+              <div><h2>AI 问答接口</h2><div class="sub">填好接口地址、密钥与模型即可使用</div></div>
               <button class="btn btn-secondary" id="btn-ai-test">测试连接</button>
             </div>
             <div class="grid-2">
-              <div class="field"><label for="ai-provider">供应商（provider）</label>
+              <div class="field"><label for="ai-provider">供应商</label>
                 <select class="select" id="ai-provider"><option value="">（不使用题库）</option><option>AI</option><option>SiliconFlow</option><option>TikuAdapter</option></select>
               </div>
-              <div class="field"><label for="ai-model">模型（model）</label><input class="input" id="ai-model" placeholder="deepseek-chat" /></div>
-              <div class="field" style="grid-column:1/-1;"><label for="ai-endpoint">接口地址（endpoint）</label><input class="input" id="ai-endpoint" placeholder="https://api.deepseek.com/v1/chat/completions" /></div>
-              <div class="field" style="grid-column:1/-1;"><label for="ai-key">密钥（key）</label><input class="input" id="ai-key" type="password" placeholder="sk-…" /></div>
-              <div class="field"><label for="ai-cover">覆盖率阈值（cover_rate）</label><input class="input" id="ai-cover" type="number" step="0.05" min="0" max="1" /></div>
-              <div class="field"><label for="ai-delay">查询延迟 / 秒（delay）</label><input class="input" id="ai-delay" type="number" step="0.5" min="0" /></div>
-              <div class="field"><label for="ai-conc">并发数（ai_concurrency）</label><input class="input" id="ai-conc" type="number" step="1" min="1" /></div>
-              <div class="field"><label for="ai-interval">最小间隔 / 秒（min_interval_seconds）</label><input class="input" id="ai-interval" type="number" step="0.5" min="0" /></div>
+              <div class="field"><label for="ai-model">模型</label><input class="input" id="ai-model" placeholder="deepseek-chat" /></div>
+              <div class="field" style="grid-column:1/-1;"><label for="ai-endpoint">接口地址</label><input class="input" id="ai-endpoint" placeholder="https://api.deepseek.com/v1/chat/completions" /></div>
+              <div class="field" style="grid-column:1/-1;"><label for="ai-key">密钥</label><input class="input" id="ai-key" type="password" placeholder="sk-…" /></div>
+              <div class="field"><label for="ai-cover">覆盖率阈值</label><input class="input" id="ai-cover" type="number" step="0.05" min="0" max="1" /></div>
+              <div class="field"><label for="ai-delay">查询延迟 / 秒</label><input class="input" id="ai-delay" type="number" step="0.5" min="0" /></div>
+              <div class="field"><label for="ai-conc">并发数</label><input class="input" id="ai-conc" type="number" step="1" min="1" /></div>
+              <div class="field"><label for="ai-interval">最小间隔 / 秒</label><input class="input" id="ai-interval" type="number" step="0.5" min="0" /></div>
             </div>
             <label class="switch" style="margin-top:16px;">
               <input type="checkbox" id="ai-submit" />
@@ -708,11 +708,11 @@
           <div class="card card-plain" data-od-id="settings-run-card">
             <div class="card-head"><div><h2>运行参数</h2></div></div>
             <div class="grid-2">
-              <div class="field"><label for="run-speed">视频倍速（speed，1.0–2.0）</label><input class="input" id="run-speed" type="number" step="0.1" min="1" max="2" /></div>
-              <div class="field"><label for="run-jobs">并发视频数（jobs）</label><input class="input" id="run-jobs" type="number" step="1" min="1" /></div>
-              <div class="field" style="grid-column:1/-1;"><label for="run-maxch">每门课只刷前 N 章（max_chapters，0 = 不限制）</label><input class="input" id="run-maxch" type="number" step="1" min="0" /></div>
+              <div class="field"><label for="run-speed">视频倍速（1.0–2.0）</label><input class="input" id="run-speed" type="number" step="0.1" min="1" max="2" /></div>
+              <div class="field"><label for="run-jobs">并发视频数</label><input class="input" id="run-jobs" type="number" step="1" min="1" /></div>
+              <div class="field" style="grid-column:1/-1;"><label for="run-maxch">每门课只刷前 N 章（0 = 不限制）</label><input class="input" id="run-maxch" type="number" step="1" min="0" /></div>
               <div class="field" style="grid-column:1/-1;">
-                <label>未开启章节（notopen_action）</label>
+                <label>未开启章节</label>
                 <div class="seg" id="seg-notopen" role="group">
                   <button type="button" data-val="retry" aria-pressed="true">重试几次后放弃</button>
                   <button type="button" data-val="continue" aria-pressed="false">直接跳过</button>
@@ -723,7 +723,7 @@
 
           <div class="grid-2">
             <div class="card card-plain" data-od-id="settings-notify-card">
-              <div class="card-head"><div><h2>通知（notification_config）</h2></div></div>
+              <div class="card-head"><div><h2>通知</h2></div></div>
               <div class="stack" style="gap:16px;">
                 <div class="field"><label for="nt-provider">供应商</label>
                   <select class="select" id="nt-provider"><option value="">（不通知）</option><option>ServerChan</option><option>Qmsg</option><option>Bark</option><option>Telegram</option></select>
@@ -733,7 +733,7 @@
               </div>
             </div>
             <div class="card card-plain" data-od-id="settings-ocr-card">
-              <div class="card-head"><div><h2>OCR（ocr_config）</h2><div class="sub">provider + key 会写入进程环境变量并即时生效</div></div></div>
+              <div class="card-head"><div><h2>OCR 识别</h2></div></div>
               <div class="stack" style="gap:16px;">
                 <div class="field"><label for="ocr-provider">供应商</label>
                   <select class="select" id="ocr-provider"><option value="">（不使用）</option><option>siliconflow</option><option>openai</option><option>claude</option><option>qwen</option><option>openai_compatible</option></select>
@@ -752,7 +752,7 @@
         <div class="page-head">
           <div>
             <h1>关于与诊断</h1>
-            <p class="lede">用于确认「加载的是不是最新构建」，以及当前配置文件路径与运行端口。</p>
+            <p class="lede">查看服务状态、配置文件位置与当前版本。</p>
           </div>
           <div class="head-actions">
             <button class="btn btn-secondary" id="btn-about-refresh">重新探测</button>
@@ -760,10 +760,10 @@
         </div>
         <div class="grid-2">
           <div class="card card-plain" data-od-id="about-health-card">
-            <div class="card-head"><div><h2>服务状态</h2><div class="sub">GET /api/health</div></div></div>
+            <div class="card-head"><div><h2>服务状态</h2></div></div>
             <dl class="kv">
               <dt>存活探测</dt><dd id="about-health">—</dd>
-              <dt>前端构建（webBuild）</dt><dd id="about-build">—</dd>
+              <dt>前端构建</dt><dd id="about-build">—</dd>
               <dt>运行模式</dt><dd id="about-mode">—</dd>
               <dt>本地服务地址</dt><dd id="about-origin">—</dd>
             </dl>
@@ -773,13 +773,11 @@
             <dl class="kv">
               <dt>配置文件</dt><dd>web_config.json（可写）</dd>
               <dt>登录状态</dt><dd>cookies.txt（本机）</dd>
-              <dt>任务状态存放</dt><dd>进程内存 · 重启即失效</dd>
-              <dt>审批队列</dt><dd>进程内存 · 重启即清空</dd>
-            </dl>
+                                        </dl>
           </div>
         </div>
         <div class="card card-plain" style="margin-top:24px;" data-od-id="about-desktop-card">
-          <div class="card-head"><div><h2>桌面壳回执</h2><div class="sub">仅桌面模式存在，浏览器 / 开发模式会 404，需容错处理</div></div></div>
+          <div class="card-head"><div><h2>桌面壳回执</h2><div class="sub">仅桌面窗口内可用</div></div></div>
           <dl class="kv">
             <dt>窗口心跳</dt><dd>GET /api/heartbeat · 每 5 秒</dd>
             <dt>关窗通知</dt><dd>navigator.sendBeacon("/api/window-closed", "") · pagehide</dd>

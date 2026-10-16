@@ -1059,9 +1059,8 @@ def _window_reason(message: str) -> str:
 
     span = m.group(0).lstrip("至 ")
     if datetime.datetime.now() > end:
-        return (f"学习窗口已结束（{span}），平台不再允许进入 —— "
-                f"这类任务点无法补完成，需联系老师处理")
-    return f"学习窗口尚未开放（{span}），等窗口开启后再盘点即可读到模式"
+        return f"学习窗口已结束（{span}），平台不再允许进入，无法补完成（需联系老师）"
+    return f"学习窗口尚未开放（{span}），等窗口开启后再盘点"
 
 
 def _format_progress(value: Any) -> str:
@@ -1271,8 +1270,8 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
                     elif redo_times > 0:
                         tail = f"平台还剩 {redo_times} 次重做机会，请到课程页面手动重做"
                     else:
-                        tail = "平台不给重做次数（redoTimes=0），只能请老师开启重做"
-                    note = f"已提交但得分 {score:g}，低于达标线 {threshold:g}；{tail}"
+                        tail = "平台未开放重做，请老师开启重做"
+                    note = f"得分 {score:g}，低于达标线 {threshold:g}；{tail}"
                 items.append({
                     "planId": item.plan_id,
                     "name": item.name,
