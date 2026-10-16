@@ -183,6 +183,9 @@ def test_run_task_uses_parallel_branch_when_concurrency_gt_1(monkeypatch):
     monkeypatch.setattr(type(runner.client), "load_task_items", lambda self, t: None)
     monkeypatch.setattr(type(runner.client), "check_allow_study", lambda self, t: (True, ""))
     monkeypatch.setattr(type(runner.client), "refresh_task", lambda self, t: None)
+    # run_task 执行前会探一次学习窗口（只读 GET）：单测里不能真发请求
+    monkeypatch.setattr(type(runner.client), "get_study_url",
+                        lambda self, *a, **k: {"url": "https://example.test/x"})
     monkeypatch.setattr(FanyaTaskRunner, "_run_items_parallel",
                         lambda self, course, task, cands: used.append("parallel"))
     monkeypatch.setattr(FanyaTaskRunner, "run_item",
@@ -196,6 +199,8 @@ def test_run_task_uses_parallel_branch_when_concurrency_gt_1(monkeypatch):
     monkeypatch.setattr(type(runner_serial.client), "load_task_items", lambda self, t: None)
     monkeypatch.setattr(type(runner_serial.client), "check_allow_study", lambda self, t: (True, ""))
     monkeypatch.setattr(type(runner_serial.client), "refresh_task", lambda self, t: None)
+    monkeypatch.setattr(type(runner_serial.client), "get_study_url",
+                        lambda self, *a, **k: {"url": "https://example.test/x"})
     runner_serial.run_task({"courseId": "1"}, task)
     assert used == ["serial", "serial"]
 

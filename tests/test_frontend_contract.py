@@ -166,3 +166,19 @@ def test_expired_items_are_collapsed_by_default(html):
     assert "项已收起" in html, "全部收起后没有给出提示"
     assert "it.expired" in html, "收起逻辑没有按 expired 判定"
 
+
+def test_finished_items_are_collapsed_until_redo_is_on(html):
+    """已完成的条目也不该默认摆成「可勾选项」。
+
+    真实反馈（2026-10-16）：数学建模里 9 个已完成项被预勾选（status 是 auto/partial
+    就算可勾），点执行后 runner 按 ``is_finish`` 丢弃它们，日志只剩
+    「待完成 0 个」+「成功 0 / 失败 0 / 跳过 0」——用户以为工具没检查出过期。
+    现在：已完成项由「包含已完成」（``#preview-redo``，本来就是这个意思）开关展开。
+    """
+    assert "showFinished" in html, "前端没有按「包含已完成」开关决定是否列已完成项"
+    assert "it.isFinish" in html, "收起逻辑没有按 isFinish 判定"
+    assert 'id="preview-redo"' in html and '$("#preview-redo").addEventListener' in html, \
+        "开关变了不重渲染，收起状态不会跟着变"
+    assert "已完成 " in html and "项已收起" in html, "全部收起后没有给出提示"
+
+

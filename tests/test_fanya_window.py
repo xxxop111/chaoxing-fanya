@@ -13,7 +13,9 @@ plan 8110517「5.1 人口增长-马尔萨斯模型视频教学」仍能正常播
 这里钉住三件事：
 1. 窗口报错 -> (expired / not_open) 的判定；
 2. 探测结果如何影响「待处理 / 可自动完成 / 窗口已过」的计数；
-3. ``run_item`` 在窗口失败时：章节继续做，其它类型如实跳过。
+3. ``run_item`` 在窗口失败时：章节继续做，其它类型如实跳过；
+4. ``run_task`` 执行前会先探窗口，并把「已完成 / 窗口已过 / 待完成」逐条报出来
+   —— 不能再出现「待完成 0 个」+「成功 0 / 失败 0 / 跳过 0」这种静默结果。
 """
 
 import pytest
@@ -185,3 +187,81 @@ def test_run_item_other_types_are_skipped_when_window_closed(monkeypatch):
     assert seen == [], "窗口关闭的作业没有入口，不该硬闯"
     assert result["skipped"] is True
     assert "无法进入任务点" in result["message"]
+
+
+# ------------------------------------------------- 执行时的逐条交代（不再静默）
+
+def _runner_offline(monkeypatch, events: list) -> FanyaTaskRunner:
+    """把 run_task 的外围依赖全部短路，只留下「计数 + 留痕」这段逻辑。"""
+    runner = FanyaTaskRunner(chaoxing=None, client=_FakeClient({}),
+                             options={}, on_event=events.append)
+    client_type = type(runner.client)
+    monkeypatch.setattr(client_type, "load_task_items", lambda self, t: None, raising=False)
+    monkeypatch.setattr(client_type, "check_allow_study", lambda self, t: (True, ""), raising=False)
+    monkeypatch.setattr(client_type, "refresh_task", lambda self, t: None, raising=False)
+    monkeypatch.setattr("api.fanya_task._describe_ai_practice_items", lambda *a, **k: None)
+    monkeypatch.setattr("api.fanya_task._describe_quiz_items", lambda *a, **k: None)
+    monkeypatch.setattr("api.fanya_task.classify_items", lambda t: None)
+    monkeypatch.setattr(FanyaTaskRunner, "run_item",
+                        lambda self, course, task, item, client=None: {"planId": item.plan_id})
+    return runner
+
+
+def test_run_task_accounts_for_finished_and_expired_items(monkeypatch):
+    """执行时必须逐条交代，不能出现「待完成 0 / 跳过 0」这种什么都没说的结果。
+
+    真实反馈（2026-10-16）：数学建模里勾了 9 个已完成项点执行，日志只有
+    「共 16 个任务点，待完成 0 个」+「成功 0 / 失败 0 / 跳过 0」，
+    另外 17 个窗口已过的任务点一个字都没提。
+    """
+    done = _item(41, name="已完成文档", is_finish=True, supported=True,
+                 handled_by="document")
+    expired = _item(42, name="过期视频", supported=True, handled_by="video",
+                    window_state="expired", window_note="2026-09-30 23:59 已结束")
+    todo = _item(43, name="待做作业", supported=True, handled_by="course_work")
+    task = _task([done, expired, todo])
+
+    events: list[dict] = []
+    runner = _runner_offline(monkeypatch, events)
+    runner.run_task({"courseId": "1"}, task, only_plan_ids=[41])
+
+    started = [e for e in events if e["type"] == "task_start"]
+    assert started, "任务开始事件不能因为「没得做」就省掉"
+    assert started[0]["pending"] == 0, "勾到的都是已完成项，可执行数应为 0"
+    assert started[0]["finishedCount"] == 1, "已完成数量必须报出来"
+    assert started[0]["expiredCount"] == 1, "窗口已过数量必须报出来（哪怕没勾它）"
+
+    rows = [e for e in events if e["type"] == "item_done"]
+    assert [r["planId"] for r in rows] == [41], "勾到的已完成项要留一条跳过记录"
+    assert rows[0]["skipped"] is True
+    assert "已完成" in rows[0]["message"]
+
+
+def test_run_task_marks_expired_items_as_skipped_rows(monkeypatch):
+    """没勾选的任务点里，窗口已过的也要逐条记成「跳过」（不能再静默丢弃）。"""
+    expired = _item(51, name="过期讨论", supported=True, handled_by="topic",
+                    window_state="expired", window_note="2026-09-13 23:59 已结束")
+    todo = _item(52, name="待做作业", supported=True, handled_by="course_work")
+    task = _task([expired, todo])
+
+    events: list[dict] = []
+    runner = _runner_offline(monkeypatch, events)
+    runner.run_task({"courseId": "1"}, task)
+
+    rows = [e for e in events if e["type"] == "item_done"]
+    assert [r["planId"] for r in rows] == [51]
+    assert "窗口已过" in rows[0]["message"]
+    assert "2026-09-13" in rows[0]["message"], "跳过原因要带上窗口终点"
+
+
+def test_run_task_is_silent_for_tasks_outside_the_selection(monkeypatch):
+    """勾选执行会遍历所有任务；无关任务不该再刷「待完成 0 个」占满日志。"""
+    task = _task([_item(61, supported=True, handled_by="course_work")])
+    events: list[dict] = []
+    runner = _runner_offline(monkeypatch, events)
+
+    runner.run_task({"courseId": "1"}, task, only_plan_ids=[999])
+
+    assert events == [], "没勾到这个任务里的任何任务点时，应静默返回"
+    assert runner.results == []
+

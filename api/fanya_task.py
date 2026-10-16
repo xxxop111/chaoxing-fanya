@@ -1530,6 +1530,12 @@ class FanyaTaskRunner:
             logger.error("任务「{}」任务点读取失败: {}", task.name, exc)
             return self.results
 
+        wanted = {int(x) for x in only_plan_ids} if only_plan_ids else None
+        if wanted is not None and not any(int(i.plan_id) in wanted for i in task.items):
+            # 这次勾选里没有本任务的任务点。勾选执行会遍历所选课程的所有任务，
+            # 不为无关任务做识别/探测，也不占日志。
+            return self.results
+
         # 必须先识别 AI实践 子模式 / 自测状态，再 classify_items：
         # resolve_item() 依赖 item.extra["ai_mode"] 才能选出模式专属处理器
         # （代码实践 / 思维阶梯）。顺序反了的话 AI实践 会被判成「不支持」而被跳过
@@ -1541,20 +1547,68 @@ class FanyaTaskRunner:
         task.allow_study = allow
         task.allow_study_message = allow_msg
 
-        wanted = {int(x) for x in only_plan_ids} if only_plan_ids else None
+        # 执行前先把学习窗口探一遍（只读 GET；必须在 classify_items 之后，
+        # unreachable 依赖 handled_by）。不探的话，「窗口已过」的任务点只能靠逐条
+        # 尝试去撞，撞完日志里既没有它们的计数、也没有跳过记录 —— 真实反馈：
+        # 勾了一堆已完成项，日志只给出「待完成 0 个」+「成功 0 / 失败 0 / 跳过 0」，
+        # 17 个窗口已过一字未提。
+        try:
+            _probe_item_windows(self.client, task)
+        except Exception as exc:  # noqa: BLE001 - 探测失败不该挡住执行
+            logger.debug("窗口探测失败（{}）：{}", task.name, exc)
+
+        finished = [i for i in task.items if i.is_finish and not self.redo]
+        expired = [i for i in task.items if not i.is_finish and i.unreachable]
+        todo = [i for i in task.items if not i.is_finish and not i.unreachable]
+        below = [i for i in task.items if is_below_threshold(i)]
+        logger.info(
+            "任务「{}」：共 {} 个任务点 —— 已完成 {}（不重做）、窗口已过 {}（补不了）、"
+            "未达标 {}、待完成 {}（其中可自动化 {}）",
+            task.name, len(task.items), len(finished), len(expired), len(below),
+            len(todo), len([i for i in todo if i.supported]),
+        )
+
         candidates = []
         for item in task.items:
             if wanted is not None and int(item.plan_id) not in wanted:
                 continue
             if item.is_finish and not self.redo:
                 continue
+            if item.unreachable:
+                continue
             candidates.append(item)
 
-        logger.info(
-            "任务「{}」：共 {} 个任务点，待完成 {} 个，其中可自动化 {} 个",
-            task.name, len(task.items), len(candidates),
-            len([i for i in candidates if i.supported]),
-        )
+        self._emit(type="task_start", courseId=str(course.get("courseId")),
+                   taskId=task.task_id, name=task.name, pending=len(candidates),
+                   finishedCount=len(finished), expiredCount=len(expired))
+
+        # 被跳过的任务点逐条留痕：否则「跳过 N」永远是 0，用户看不出到底发生了什么。
+        for item in task.items:
+            if wanted is not None and int(item.plan_id) not in wanted:
+                continue
+            if not item.is_finish and item.unreachable:
+                message = "窗口已过（跳过）：" + (item.window_note or "平台不再允许进入")
+            elif item.is_finish and not self.redo and wanted is not None:
+                # 勾了已完成的条目：说清楚「它本来就已经做完了，这次不重做」
+                message = "已完成（跳过）：平台已记录该任务点完成，未开启重做"
+            else:
+                continue
+            result = {
+                "courseId": str(course.get("courseId")),
+                "courseTitle": course.get("title") or "",
+                "taskId": task.task_id,
+                "taskName": task.name,
+                "planId": item.plan_id,
+                "name": item.name,
+                "typeLabel": item.type_label,
+                "planType": item.plan_type,
+                "handler": adapter_for(item.plan_type).handler,
+                "ok": False,
+                "skipped": True,
+                "message": message,
+            }
+            self.results.append(result)
+            self._emit(type="item_done", **result)
 
         if not task.allow_study:
             # 服务端会直接拒绝未到学习时间的任务点（getToStudyUrl 返回
@@ -1583,8 +1637,11 @@ class FanyaTaskRunner:
                        taskId=task.task_id, name=task.name, progress=task.progress)
             return self.results
 
-        self._emit(type="task_start", courseId=str(course.get("courseId")),
-                   taskId=task.task_id, name=task.name, pending=len(candidates))
+        if not candidates:
+            logger.warning(
+                "任务「{}」没有可执行的任务点（已完成 {}、窗口已过 {}）",
+                task.name, len(finished), len(expired),
+            )
 
         if self.concurrency > 1 and len(candidates) > 1:
             self._run_items_parallel(course, task, candidates)

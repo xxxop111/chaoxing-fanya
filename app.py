@@ -751,7 +751,9 @@ def _new_fanya_task(task_id: str, kind: str):
         'current_task': '',
         'logs': [],
         'start_time': time.time(),
-        'stats': {'pending': 0, 'done': 0, 'failed': 0, 'skipped': 0},
+        'stats': {'pending': 0, 'done': 0, 'failed': 0, 'skipped': 0,
+                  # 只统计不写库的旁路计数：已完成（不重做）/ 窗口已过（补不了）
+                  'expired': 0, 'finished': 0},
     }
     return stop_event
 
@@ -913,6 +915,10 @@ def fanya_execute():
                     elif kind == 'task_start':
                         task_status[task_id]['current_task'] = payload.get('name', '')
                         stats['pending'] += payload.get('pending', 0)
+                        # 已完成/窗口已过是「这次没做、但必须让用户知道」的两类，
+                        # 单独累计，避免汇总里只剩「成功 0 / 失败 0 / 跳过 0」。
+                        stats['expired'] += int(payload.get('expiredCount') or 0)
+                        stats['finished'] += int(payload.get('finishedCount') or 0)
 
                 runner = FanyaTaskRunner(
                     chaoxing=chaoxing,
@@ -949,8 +955,10 @@ def fanya_execute():
                     stats = task_status[task_id]['stats']
                     task_status[task_id]['status'] = 'completed'
                     logger.info(
-                        "执行结束：成功 {} 个，失败 {} 个，跳过 {} 个",
+                        "执行结束：成功 {} 个，失败 {} 个，跳过 {} 个；"
+                        "本次共发现 已完成 {} 个（不重做）、窗口已过 {} 个（补不了）",
                         stats['done'], stats['failed'], stats['skipped'],
+                        stats.get('finished', 0), stats.get('expired', 0),
                     )
             except Exception as exc:
                 logger.error(f"执行任务失败: {exc}")

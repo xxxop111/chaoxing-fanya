@@ -989,3 +989,54 @@ type-2 分支；作答接口在 SPA 的懒加载 chunk 里。与另外两种模�
   可靠的当前章是 `get-progress.progress[]` 里第一条 `status != 2` 的行。
 * `visited` 防空转守卫：`get-progress` 有滞后，推进不顺时会原地打转。
 
+## 9. 执行口径：已完成 / 窗口已过 / 待完成 必须逐类交代（2026-10-16 用户反馈后修正）
+
+### 9.1 用户看到的问题
+
+界面把**已完成**的任务点也当成可勾选项预勾上（`status` 为 `auto/partial`、且
+`resolve_item()` 从不看 `is_finish`），用户勾着它们点「执行」，日志只有：
+
+```
+任务「线性规划」：共 16 个任务点，待完成 0 个，其中可自动化 0 个
+执行结束：成功 0 个，失败 0 个，跳过 0 个
+```
+
+16 个任务点里 9 个已完成、7 个窗口已过，**一个都没说** —— 用户的原话是
+「过期了，没检查出来」。
+
+### 9.2 三类的判定（执行前一次性算清，全部只读）
+
+| 类别 | 判据 | 处理 |
+| --- | --- | --- |
+| 已完成 | `item.is_finish and not redo` | 不重做；勾到它时逐条记「已完成（跳过）」 |
+| 窗口已过 | `not item.is_finish and item.unreachable` | 不尝试（`getToStudyUrl` 必然拒绝）；勾到它时记「窗口已过（跳过）：<窗口终点>」 |
+| 待完成 | 其余 | 正常执行 |
+
+`unreachable` 依赖 `handled_by`，因此 `_probe_item_windows()` 必须在
+`classify_items()` **之后**、选候选**之前**调用（只读 GET，失败不挡执行）。
+
+### 9.3 输出契约
+
+* `run_task` 的 `task_start` 事件带 `pending` / `finishedCount` / `expiredCount`，
+  `app.py` 把它们累计进 `stats['pending'/'finished'/'expired']`；
+* 逐类计数行：`任务「X」：共 N 个任务点 —— 已完成 a（不重做）、窗口已过 b（补不了）、未达标 c、待完成 d（其中可自动化 e）`；
+* 结束行：`执行结束：成功 x 个，失败 y 个，跳过 z 个；本次共发现 已完成 a 个（不重做）、窗口已过 b 个（补不了）`；
+* 跳过项同时进 `results`（`skipped=True` + 可读的 `message`），界面按明细显示；
+* `only_plan_ids` 里**没有**任何本任务点 ⇒ `run_task` 直接静默返回（勾选执行会遍历
+  所选课程的全部任务，不为无关任务刷日志）。
+
+### 9.4 界面口径
+
+* 「包含已完成」（`#preview-redo`）**默认关闭**：已完成项与窗口已过项都收起，只显示
+  「已完成 N 项已收起（勾上「包含已完成」可展开）/ 窗口已过 M 项已收起（勾上「显示窗口已过」可展开）」；
+* 任务标题右侧 meta 始终显示 `未完成 N · 窗口已过 M · 未达标 K · 已完成 J`（计数不受收起影响）；
+* 打开「包含已完成」后这些条目才会出现并被勾选 —— 此时执行请求同时带
+  `options.redo = true`，runner 会把它们当**重做**候选（口径自洽：要么不看，要么真重做）。
+
+### 9.5 回归用例
+
+`tests/test_fanya_window.py`：`test_run_task_accounts_for_finished_and_expired_items`、
+`test_run_task_marks_expired_items_as_skipped_rows`、
+`test_run_task_is_silent_for_tasks_outside_the_selection`；
+`tests/test_frontend_contract.py`：`test_finished_items_are_collapsed_by_default`。
+

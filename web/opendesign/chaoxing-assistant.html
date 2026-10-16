@@ -587,7 +587,7 @@
               <div class="card-head">
                 <div><h2>任务点清单</h2><div class="sub" id="preview-sub">选择课程后开始盘点</div></div>
                 <div class="row" style="gap:8px;">
-                  <span class="switch-text mono-note">包含已完成</span>
+                  <span class="switch-text mono-note" title="勾上后列表里显示已完成的条目，执行时会重做它们">包含已完成</span>
                   <label class="switch" style="min-height:auto;">
                     <input type="checkbox" id="preview-redo" />
                     <span class="switch-ui"><span class="thumb"></span></span>
@@ -1239,9 +1239,20 @@
       if (!co.tasks || !co.tasks.length) return '<div class="tree-group">' + head + '<p class="lede">该课程没有可盘点的任务点。</p></div>';
       var tasks = co.tasks.map(function (t) {
         var all = t.items || [];
-        // 窗口已过 = 平台不再允许进入，留在列表里只会把「能做的事」淹掉；默认收起，工具栏可展开
-        var hidden = all.filter(function (it) { return !!it.expired && !state.showExpired; });
-        var items = all.filter(function (it) { return !(!!it.expired && !state.showExpired); }).map(function (it) {
+        // 窗口已过（平台不再允许进入）与已完成（平台已记完成）都不该跟「能做的事」
+        // 混在一起：前者由「显示窗口已过」展开，后者由「包含已完成」展开。
+        // 已完成项以前会被当成可勾选项预勾上，点执行却一事无成 —— runner 按
+        // is_finish 丢弃它们，日志只剩「待完成 0 / 跳过 0」，用户以为没检查出来。
+        var redoBox = $("#preview-redo");
+        var showFinished = !!(redoBox && redoBox.checked);
+        function hiddenBy(it) {
+          if (!!it.expired && !state.showExpired) return "expired";
+          if (!!it.isFinish && !it.expired && !showFinished) return "finished";
+          return "";
+        }
+        var hiddenExpired = all.filter(function (it) { return hiddenBy(it) === "expired"; });
+        var hiddenFinished = all.filter(function (it) { return hiddenBy(it) === "finished"; });
+        var items = all.filter(function (it) { return !hiddenBy(it); }).map(function (it) {
           var selectable = it.status === "auto" || it.status === "partial";
           if (selectable) anySelectable = true;
           return '<div class="tree-item' + (selectable ? "" : " is-disabled") + '" data-od-id="plan-' + esc(it.planId) + '">' +
@@ -1250,10 +1261,14 @@
             '<span class="tag">' + esc(it.typeLabel || "任务点") + "</span>" +
             '<button class="btn btn-sm btn-ghost" data-open="' + esc(it.entryUrl || "#") + '">打开</button></div>';
         }).join("");
-        if (!items && hidden.length) {
-          items = '<p class="lede" style="margin:2px 0 0 2px;">窗口已过 ' + hidden.length + ' 项已收起（勾上「显示窗口已过」可展开）</p>';
+        if (!items) {
+          var hints = [];
+          if (hiddenFinished.length) hints.push("已完成 " + hiddenFinished.length + " 项已收起（勾上「包含已完成」可展开）");
+          if (hiddenExpired.length) hints.push("窗口已过 " + hiddenExpired.length + " 项已收起（勾上「显示窗口已过」可展开）");
+          if (hints.length) items = '<p class="lede" style="margin:2px 0 0 2px;">' + hints.join("；") + "</p>";
         }
-        var meta = "未完成 " + (t.pendingCount || 0) + (t.expiredCount ? " · 窗口已过 " + t.expiredCount : "") + (t.belowThresholdCount ? " · 未达标 " + t.belowThresholdCount : "");
+        var finishedCount = all.filter(function (it) { return !!it.isFinish; }).length;
+        var meta = "未完成 " + (t.pendingCount || 0) + (t.expiredCount ? " · 窗口已过 " + t.expiredCount : "") + (t.belowThresholdCount ? " · 未达标 " + t.belowThresholdCount : "") + (finishedCount ? " · 已完成 " + finishedCount : "");
         return '<div class="tree-task"><div class="tree-task-head"><span class="title" style="font-weight:600;">' + esc(t.name) + '</span><span class="grow"></span><span class="meta">' + meta + "</span></div>" + items + "</div>";
       }).join("");
       return '<div class="tree-group">' + head + tasks + "</div>";
@@ -1315,6 +1330,12 @@
   function finishPreview(btn, html) { btn.disabled = false; btn.innerHTML = html; $("#courses-progress-card").hidden = true; }
   $("#preview-show-expired").addEventListener("change", function () {
     state.showExpired = this.checked;
+    if (state.preview) renderPreviewTree();
+  });
+  // 「包含已完成」开关同时决定「列表里显不显示已完成项」——它本来就是发给
+  // 后端的 options.redo（重做已完成的），列表不跟着变的话，用户会勾到一堆
+  // 已经做完的条目去执行，然后日志什么也不说。
+  $("#preview-redo").addEventListener("change", function () {
     if (state.preview) renderPreviewTree();
   });
 
