@@ -1238,6 +1238,10 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
             task.allow_study_message = allow_msg
 
             items = []
+            # 任务卡片上的三个计数用**逐条算出来的 status**，不能用 item.supported：
+            # 低分作业 / 进不去的任务点会被上面改写成 manual，而 item.supported 仍是
+            # 原始值，直接用会让卡片显示「可完成 1」而这个 1 是工具根本不会碰的作业。
+            task_pending = task_completable = task_expired = 0
             for item in task.items:
                 status, handler, note = resolve_item(item)
                 ai_mode = item.extra.get("ai_mode")
@@ -1307,10 +1311,13 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
                     if item.unreachable:
                         # 窗口已结束 / 尚未开放：单列，不混进「待处理」
                         result["summary"]["expiredCount"] += 1
+                        task_expired += 1
                     else:
                         result["summary"]["pendingCount"] += 1
+                        task_pending += 1
                         if status in (STATUS_AUTO, STATUS_PARTIAL):
                             result["summary"]["completableCount"] += 1
+                            task_completable += 1
                         elif status == STATUS_MANUAL:
                             result["summary"]["manualCount"] += 1
                         else:
@@ -1324,10 +1331,9 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
                 "allowStudy": task.allow_study,
                 "allowStudyMessage": task.allow_study_message,
                 "encryTaskUserId": task.encry_task_user_id,
-                "pendingCount": len([i for i in task.pending_items if not i.unreachable]),
-                "completableCount": len([i for i in task.pending_items
-                                         if not i.unreachable and i.supported]),
-                "expiredCount": len([i for i in task.pending_items if i.unreachable]),
+                "pendingCount": task_pending,
+                "completableCount": task_completable,
+                "expiredCount": task_expired,
                 "belowThresholdCount": len([i for i in task.items
                                             if is_below_threshold(i)]),
                 "groups": task.extra.get("groups") or [],

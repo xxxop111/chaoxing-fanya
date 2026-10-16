@@ -284,3 +284,35 @@ def test_preview_marks_low_score_work_as_manual():
     # 低分作业只算「待处理 + 需人工」，不再计进可自动完成
     assert summary["pendingCount"] == 2
 
+
+def test_task_counts_do_not_advertise_low_score_work_as_completable():
+    """任务卡片上的计数必须排除低分作业。
+
+    回归：任务级计数原来直接数 ``item.supported``，而低分作业被改写成 manual 后
+    这个字段仍是 True，于是卡片会显示「未完成 2 · 可完成 2」，其中 1 个是工具
+    根本不会碰的作业 —— 用户按这个提示去跑，只会得到「已经提交过了」。
+    """
+    low = _item(61, plan_type=4, name="Logistic模型作业",
+                score={"totalScore": 44.5},
+                extra=_breakthrough(enableWorkScore=1, workScore=50))
+    good = _item(62, plan_type=4, score={"totalScore": 92.0},
+                 extra=_breakthrough(enableWorkScore=1, workScore=50))
+    task = FanyaTask(task_id=1, name="任务", encry_task_user_id="tu",
+                     items=[low, good])
+
+    client = _PreviewClient(task, "var redoTimes = 0 + 0 - 0;")
+    preview = build_task_preview(None, [{"courseId": "1", "clazzId": "2",
+                                         "title": "数学建模"}],
+                                 client=client, probe_windows=True)
+
+    entry = preview["courses"][0]["tasks"][0]
+    assert entry["belowThresholdCount"] == 1
+    assert entry["pendingCount"] == 2
+    assert entry["completableCount"] == 1, "低分作业不该出现在「可完成」里"
+    assert entry["expiredCount"] == 0
+
+    summary = preview["summary"]
+    assert summary["completableCount"] == 1
+    # 任务级与汇总级必须一致
+    assert summary["pendingCount"] == entry["pendingCount"]
+
