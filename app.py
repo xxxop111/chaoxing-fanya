@@ -52,6 +52,15 @@ def load_web_config() -> Dict:
       return {}
 
 
+def _saved_settings() -> Dict:
+  """本地配置里的 settings 段（读不到、或形状不对，就给空字典）。"""
+  try:
+      settings = (load_web_config() or {}).get("settings")
+  except Exception:
+      return {}
+  return settings if isinstance(settings, dict) else {}
+
+
 def save_web_config(data: Dict) -> bool:
   """保存前端配置到本地 JSON 文件"""
   try:
@@ -236,9 +245,18 @@ def start_study():
             max_chapters = 0
         if max_chapters < 0:
             max_chapters = 0
-        tiku_config = data.get('tiku_config', {})
-        notification_config = data.get('notification_config', {})
-        ocr_config = data.get('ocr_config', {})
+        tiku_config = data.get('tiku_config') or {}
+        notification_config = data.get('notification_config') or {}
+        ocr_config = data.get('ocr_config') or {}
+        # 请求里没带（或带空）就回落到本地已保存的配置：界面只在打开「设置」页时才读一次配置，
+        # 直接点「开始」时这三项会是空的，任务就退化成「没有答题密钥 / 没有通知」。
+        if not (tiku_config and notification_config and ocr_config):
+            saved = _saved_settings()
+            if not isinstance(tiku_config, dict):
+                tiku_config = {}
+            tiku_config = tiku_config or saved.get('tiku_config') or {}
+            notification_config = notification_config or saved.get('notification_config') or {}
+            ocr_config = ocr_config or saved.get('ocr_config') or {}
         
         # 设置 OCR 配置环境变量
         if ocr_config.get('provider') and ocr_config.get('key'):

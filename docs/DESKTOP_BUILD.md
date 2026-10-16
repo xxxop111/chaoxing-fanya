@@ -119,6 +119,7 @@ cd D:\03-开发\项目\ds\chaoxing-fanya
 | 安装包编译 | ✅ `Successful compile`，`chaoxing-fanya-setup-1.0.0.exe` 生成（**63,426,422 字节**） |
 | **安装包载荷 + 自启动** | ✅ `tools\verify_installer.py` 全过：14 项检查 + 装出来的 exe 通过冒烟测试，退出码 0 |
 | 装到 `%LOCALAPPDATA%\Programs` | ❌ **本会话内做不了**：DSH 会话给我的进程是受限令牌（日志 `User privileges: None`），写安装目录里的 `unins000.dat` 得 `CreateFile failed; code 5`。必须你在资源管理器里双击；见 5.1 |
+| 一键安装并配置 | ✅ `一键安装并配置.cmd` 的配置步骤实测通过（`CX_SKIP_INSTALL=1 CX_NO_LAUNCH=1`）：退出码 0，落盘的 `web_config.json` 顶层键与密钥长度不变；见 5.2 |
 
 > 看日志注意：**打包版把 `desktop_app.log` 写在自己（exe）旁边**，仓库根目录那份是源码模式跑的。
 > 排查打包版时看 `dist\chaoxing-fanya\desktop_app.log`。
@@ -172,6 +173,38 @@ FAIL  C:\Users\35278\AppData\Local\Programs\ChaoxingFanya\probe.dat PermissionEr
 仍然需要用户自己做的两件事：写卸载注册表项（否则「应用」列表里没有它）与建快捷方式。
 这两步在用户会话里没有任何限制，双击即可。
 
+### 5.2 装好之后不用手填：`一键安装并配置.cmd`
+
+5.1 的结论是「安装必须由本人在自己的会话里跑」。所以仓库根放了一个批处理，把
+「静默安装 → 写入配置 → 启动程序」串成一次双击：
+
+```text
+一键安装并配置.cmd
+```
+
+1. 静默安装 `dist\installer\chaoxing-fanya-setup-1.0.0.exe`
+   （`/SILENT /SUPPRESSMSGBOXES /NORESTART`，日志写到 `%TEMP%\chaoxing-fanya-install.log`）；
+2. 把 `installer\web_config.json`（已配好的登录信息 + AI 密钥）复制成安装目录里的 `web_config.json`
+   —— 程序就是从 exe 旁边读这份文件（`app.py:36` `CONFIG_FILE = app_path("web_config.json")`）；
+3. `start` 起程序。已装过就跳过安装、只刷新配置；已经在跑就先 `--stop` 再写。
+
+* **`installer\web_config.json` 是配置种子**：含真实账号与密钥，被 `.gitignore:161` 的
+  `web_config.json` 规则忽略，既不进 git，也不进安装包（`.iss` 的 `[Files]` 排除同名文件）。
+  它由根目录那份 `web_config.json` 复制而来，只把历史值 `notopen_action: "ask"` 归一成 `retry`
+  （旧值在新界面上两个分段按钮都不亮）。
+* 批处理用 **GBK + CRLF** 写盘：cmd 按控制台 ANSI 代码页（936）读文件，UTF-8 会让路径里的中文变乱码。
+* 调试钩子（先 `set` 再运行）：`CX_DEST=...` 换目标目录、`CX_SKIP_INSTALL=1` 只写配置、
+  `CX_NO_LAUNCH=1` 装完不启动。已实测：`CX_SKIP_INSTALL=1 CX_NO_LAUNCH=1 CX_DEST=%TEMP%\cx_cfg_test`
+  → 退出码 0，落盘的配置顶层键（`settings` / `selectedCourses` / `rememberedLogin`）与密钥长度都不变。
+
+界面侧配套改了三处（`web/opendesign/chaoxing-assistant.html`），否则「配置好了」只是文件躺在硬盘上：
+
+| 改动 | 为什么 |
+| --- | --- |
+| 启动时 `probe().then(function () { loadConfig(); … })` | 原来只有打开「设置」页才读配置；没进过设置页就点「开始」时 `state.config` 是 `null`，`/api/start` 不会带 `tiku_config`，任务等于没有 AI 密钥 |
+| `prefillAccount()`：用 `rememberedLogin` 预填账号/密码/`use_cookies` | 装好后第一次打开就带着账号，不用重输 |
+| `rememberLogin(p)`：登录成功后写回 `rememberedLogin` | 在界面里换过账号也留得住；基于已读到的 `rawConfig` 合并（`POST /api/config` 是整份覆盖写），一次都没读到过就不写，免得把 `settings` 抹空 |
+
 ## 6. 冒烟测试（每次改完打包链必跑）
 
 ```powershell
@@ -215,6 +248,7 @@ FAIL  C:\Users\35278\AppData\Local\Programs\ChaoxingFanya\probe.dat PermissionEr
 | 安装包里出现 `winforms.py.orig` | 补丁脚本留在 site-packages 的回滚备份被 `collect_all` 收走 | spec 已过滤 `*.py.orig`；`.iss` 的 `Excludes` 也加了它 |
 | 启动后出现带地址栏的 Edge/Chrome 窗口 | 走了浏览器兜底分支 | 看 `desktop_app.log` 里 webview 的报错；确认打包版没排除 `webview`/`clr_loader`/`pythonnet` |
 | `RedirectionGuard status ... Enabled in enforcing mode` | Win11 24H2+ 的进程缓解策略，正常 | 无需处理 |
+| `PermissionError: [WinError 32] ... dist\chaoxing-fanya\.webview\EBWebView\...`（PyInstaller 清理 dist 时） | 有个打包版实例还在跑，占着自己的 WebView2 用户目录 | 先 `dist\chaoxing-fanya\chaoxing-fanya.exe --stop`（或 `Get-Process chaoxing-fanya \| Stop-Process -Force`）再重打 |
 
 ## 8. 历史遗留（已不用）
 

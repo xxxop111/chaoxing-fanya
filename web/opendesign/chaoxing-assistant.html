@@ -1113,6 +1113,25 @@
   function loginPayload() {
     return { username: $("#acc-username").value.trim(), password: $("#acc-password").value, use_cookies: $("#acc-cookies").checked };
   }
+  function prefillAccount() {
+    // 启动时就用配置里的 rememberedLogin 预填账号表单，省得每次都手输。
+    var rl = (state.rawConfig && state.rawConfig.rememberedLogin) || null;
+    if (!rl) return;
+    if (rl.username) $("#acc-username").value = rl.username;
+    if (rl.password) $("#acc-password").value = rl.password;
+    if (rl.useCookies) $("#acc-cookies").checked = true;
+  }
+  function rememberLogin(p) {
+    // 登录成功后把账号记回配置。POST /api/config 是整份覆盖写，所以必须拿已读到的
+    // rawConfig 做合并；一次都没读到过就宁可不写，免得把 settings 抹成空。
+    if (!p.username && !p.password) return Promise.resolve();
+    var base = state.rawConfig;
+    if (!base) return Promise.resolve();
+    var next = {};
+    Object.keys(base).forEach(function (k) { next[k] = base[k]; });
+    next.rememberedLogin = { username: p.username, password: p.password, useCookies: !!p.use_cookies };
+    return call("/api/config", { method: "POST", body: next }).then(function (r) { if (r.status) state.rawConfig = next; });
+  }
   function setLoginBusy(busy, which) {
     $$("#login-form button").forEach(function (b) { b.disabled = busy; });
     if (busy) { var b = $(which); b.dataset.html = b.innerHTML; b.innerHTML = '<span class="spinner"></span> 处理中…'; }
@@ -1125,6 +1144,7 @@
     if ($("#acc-cookies").checked) state.hasCookies = true;
     msg.textContent = res.msg || "登录成功"; msg.style.color = "var(--success)";
     toast(res.msg || "登录成功", "ok");
+    rememberLogin(loginPayload());
     renderAccount();
     return true;
   }
@@ -1142,6 +1162,7 @@
       if (Array.isArray(c.data)) state.courses = c.data;
       msg.textContent = c.msg || ("已获取 " + state.courses.length + " 门课程"); msg.style.color = "var(--success)";
       toast(msg.textContent, "ok");
+      rememberLogin(p);
       renderAccount();
     }).finally(function () { setLoginBusy(false); });
   });
@@ -1480,6 +1501,7 @@
       state.rawConfig = raw;
       state.config = raw.settings ? raw.settings : raw;
       fillConfig();
+      prefillAccount();
     });
   }
   function fillConfig() {
@@ -1576,7 +1598,9 @@
   $$(".nav button[data-view]").forEach(function (b) { b.addEventListener("click", function () { setView(b.dataset.view); setNav(false); }); });
   var saved = localStorage.getItem("od-cx-view");
   setView(NAMES[saved] ? saved : "account", { keepScroll: true });
-  probe().then(function () { loadApprovals(true); });
+  // 启动就读一次本地配置：一是把 rememberedLogin 预填到账号页，二是让「运行与日志」
+  // 直接开跑时 state.config 已经就位（否则 /api/start 不会带上 AI 密钥）。
+  probe().then(function () { loadConfig(); loadApprovals(true); });
 })();
 </script>
 </body>
