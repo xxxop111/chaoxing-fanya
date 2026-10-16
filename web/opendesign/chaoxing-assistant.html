@@ -1219,6 +1219,12 @@
     if (st === "manual") return '<span class="pill pill-muted">需人工</span>';
     return '<span class="pill pill-idle">暂不支持</span>';
   }
+  function submitPill(it) {
+    // 作业的作答页里读到的「还剩几次提交机会」（判分页读不到；没探测过就是 null）
+    if (!it || it.submitRemaining == null) return "";
+    if (it.submitRemaining <= 1) return '<span class="pill pill-warn">不可重交</span>';
+    return '<span class="pill pill-muted">可重交 ' + it.submitRemaining + " 次</span>";
+  }
   function renderPreviewTree() {
     var el = $("#preview-tree"), foot = $("#preview-footer");
     if (!state.preview) { el.innerHTML = ""; foot.hidden = true; return; }
@@ -1233,7 +1239,7 @@
           if (selectable) anySelectable = true;
           return '<div class="tree-item' + (selectable ? "" : " is-disabled") + '" data-od-id="plan-' + esc(it.planId) + '">' +
             '<input class="check" type="checkbox" data-plan="' + esc(it.planId) + '" data-course="' + esc(co.courseId) + '" data-task="' + esc(t.taskId) + '"' + (selectable ? " checked" : " disabled") + '>' +
-            '<span class="grow"><span class="title">' + esc(it.name) + " " + statusPill(it.status, it) + '</span><span class="sub">' + esc(it.note || "") + '</span></span>' +
+            '<span class="grow"><span class="title">' + esc(it.name) + " " + statusPill(it.status, it) + submitPill(it) + '</span><span class="sub">' + esc(it.note || "") + '</span></span>' +
             '<span class="tag">' + esc(it.typeLabel || "任务点") + "</span>" +
             '<button class="btn btn-sm btn-ghost" data-open="' + esc(it.entryUrl || "#") + '">打开</button></div>';
         }).join("");

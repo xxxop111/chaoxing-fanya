@@ -977,20 +977,34 @@ def _parse_redo_times(html: str) -> Optional[int]:
 
 
 def _probe_work_redo_times(client: FanyaTaskClient, task: FanyaTask) -> None:
-    """为「已出分但低于达标线」的作业查一次还能重做几次（**只读**）。
+    """为作业任务点读一次「还能交几次 / 还能重做几次」（**只读**）。
 
-    作业的重做次数只出现在判定页的 JS 里，而判定页要先 ``getToStudyUrl`` 拿跳转
-    （已提交的作业这时拿到的是「查看」页而不是答题页），所以每个低分作业要花两次
-    请求。只对低分作业做 —— 正常任务点一次都不会多发。
+    作业的次数藏在两种页面里，各有一种写法（2026-10-16 全账号语料实测）：
 
-    结果写进 ``item.extra["redo_times"]``：``0`` = 平台根本不给重做次数（实测
-    2026-10-16 的「Logistic模型作业」就是这种，页面里没有任何修改入口），
-    ``None`` = 没读到（页面打不开 / 结构变了，不要猜）。
+    * **已提交** → 判定页 JS：``var redoTimes = 0 + 0 - 0;``（教师给的重做次数；
+      实测 6 个作业 = 0、2 个作业 = 3）；
+    * **未提交** → 作答页隐藏域：``limitWorkSubmitTimes`` / ``addTimes``
+      （平台允许的提交次数与已提交次数；实测 3 个作业都是 100 / 0），
+      这两个字段**只有 id 没有 name**。
+
+    判定页要靠 ``getToStudyUrl`` 先拿跳转（已提交时给的是「查看」页），所以每个
+    任务点最多两次请求。只扫**未完成**的作业；读不到就什么都不写（不猜）。
+    结果写进 ``item.extra``：``redo_times``（判定页，0 = 平台不给重做）或
+    ``submit_limit``/``submit_count``/``submit_remaining``（作答页）。
     """
+    from api.fanya_work import _parse_submit_limit_html
+
     for item in task.items:
-        if item.plan_type != PLAN_TYPE_WORK or not is_below_threshold(item):
+        if item.plan_type != PLAN_TYPE_WORK:
             continue
-        if item.extra.get("redo_times") is not None:
+        # 只对「有信息可用」的作业发请求：
+        #   * 未完成且还没出分 → 交卷前能读到作答页的提交次数；
+        #   * 已出分但低于达标线 → 判分页里能读到还能重做几次；
+        #   * 其余（已达标 / 已完成）既没有风险也没有新信息，不发请求。
+        if not (is_below_threshold(item) or (not item.is_finish and item_score(item) is None)):
+            continue
+        extra = item.extra
+        if extra.get("redo_times") is not None or extra.get("submit_limit") is not None:
             continue
         try:
             study_url = client.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
@@ -1001,11 +1015,18 @@ def _probe_work_redo_times(client: FanyaTaskClient, task: FanyaTask) -> None:
             resp.encoding = "utf-8"
             html = resp.text
         except Exception as exc:  # noqa: BLE001 - 读不到就不下结论
-            logger.debug("作业重做次数读取失败（{}）：{}", item.name[:24], exc)
+            logger.debug("作业次数读取失败（{}）：{}", item.name[:24], exc)
             continue
         times = _parse_redo_times(html)
         if times is not None:
-            item.extra["redo_times"] = times
+            extra["redo_times"] = times
+            continue
+        parsed_limit = _parse_submit_limit_html(html)
+        if parsed_limit is not None:
+            limit, used = parsed_limit
+            extra["submit_limit"] = limit
+            extra["submit_count"] = used
+            extra["submit_remaining"] = max(limit - used, 0)
 
 
 def _describe_ai_practice_items(client: FanyaTaskClient, course: dict, task: FanyaTask, redo: bool = False) -> None:
@@ -1276,6 +1297,15 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
                     else:
                         tail = "平台未开放重做，请老师开启重做"
                     note = f"得分 {score:g}，低于达标线 {threshold:g}；{tail}"
+                submit_remaining = item.extra.get("submit_remaining")
+                if (not item.is_finish and item.plan_type == PLAN_TYPE_WORK
+                        and submit_remaining is not None and submit_remaining <= 1):
+                    # 未提交的作业也可能只有一次机会：作答页自己写着只允许提交 1 次
+                    # （实测 2026-10-16 全账号 3 个未提交作业都是 100 次，但这是平台
+                    # 设置项，真会出现 1 次）—— 提前告诉用户，别以为交了还能改。
+                    hint = ("平台只允许提交 1 次（交卷后不能再改）：本工具默认只保存草稿，"
+                            "需要交卷时请在待审批里核对答案后批准")
+                    note = f"{note}；{hint}" if note else hint
                 items.append({
                     "planId": item.plan_id,
                     "name": item.name,
@@ -1304,6 +1334,9 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
                     "threshold": threshold,
                     "belowThreshold": below_threshold,
                     "redoTimes": redo_times if isinstance(redo_times, int) else None,
+                    # 作答页写着「还能提交几次」（只对未完成作业探测；判分页读不到）
+                    "submitLimit": item.extra.get("submit_limit"),
+                    "submitRemaining": submit_remaining,
                 })
                 if below_threshold:
                     result["summary"]["belowThresholdCount"] += 1
@@ -2954,11 +2987,14 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
     except (TypeError, ValueError):
         redo_times = None
     single_shot = redo_times is None or redo_times <= 0
+    conf = getattr(tiku, "_conf", None) or {}
     try:
-        allow_single_shot = _opt_in((getattr(tiku, "_conf", None) or {}).get("allow_one_shot_submit"))
+        allow_single_shot = _opt_in(conf.get("allow_one_shot_submit"))
+        # 作答页上写着「允许提交 N 次」时是否照它执行（默认不信，见 fanya_work.build_prepared）
+        trust_page_limit = _opt_in(conf.get("allow_page_submit_times"))
     except Exception as exc:  # noqa: BLE001 - 配置形态不定
-        logger.debug("读取 allow_one_shot_submit 失败，按未放行处理: {}", exc)
-        allow_single_shot = False
+        logger.debug("读取一次性作业相关配置失败，按未放行处理: {}", exc)
+        allow_single_shot = trust_page_limit = False
     if single_shot:
         logger.warning(
             "[作业] 「{}」的平台重做次数{}，本次不会自动交卷；"
@@ -2971,6 +3007,7 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
             save_only=save_only, cover_rate=cover_rate, on_log=on_log,
             verifier=verifier, single_shot=single_shot,
             allow_single_shot=allow_single_shot,
+            trust_page_limit=trust_page_limit,
         )
         if ok and _is_submitted(msg):
             msg = _append_score_check(ctx, msg)
@@ -2982,6 +3019,7 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
         cover_rate=cover_rate, on_log=on_log,
         verifier=verifier, single_shot=single_shot,
         allow_single_shot=allow_single_shot,
+        trust_page_limit=trust_page_limit,
     )
     if not ok:
         return False, msg
@@ -3004,8 +3042,9 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
 
     warning = ""
     if prepared.get("single_shot"):
-        warning = ("\n⚠️ 平台没给这个作业重做次数（或查不到）：批准后会直接交卷、"
-                   "不可逆（交上去就不能改了）—— 请先核对上面的答案。")
+        why = prepared.get("single_shot_note") or "平台没给这个作业重做次数（或查不到）"
+        warning = (f"\n⚠️ {why}：批准后会直接交卷、不可逆（交上去就不能改了）"
+                   "—— 请先核对上面的答案。")
     entry_id = ctx.register_approval(
         kind="course_work",
         preview=f"{ctx.label}\n{msg}{warning}",

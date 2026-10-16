@@ -357,10 +357,14 @@ https://data-xxt.aichaoxing.com/analysis/ac_mark?…
 **背景（用户追问「为什么会出现只有一次机会、而且分数很低」）**：作业交上去之后
 能不能改，取决于平台给的 `redoTimes`。它**只在已判分的作业详情页里**才有
 （页面模板：`var redoTimes = 0 + 0 - 0;`，是个算式，必须用 `_parse_redo_times`
-解析，不能 `int()`）；**未提交**的作答页里没有任何次数信息 —— 也就是说，交卷前
-"还剩几次机会"是**不可知**的。实测：全账号唯一一个「未完成 + 窗口开放」的作业就是
+解析，不能 `int()`）。实测：全账号唯一一个「未完成 + 窗口开放」的作业就是
 8379428（planId 8379428 已经交过、`redoTimes=0`、得分 44.5 < 达标线 50），其余作业
 `getToStudyUrl` 全部报「不在学习时间内」（窗口已过）。
+
+> 📌 2026-10-16 更正：**未提交**的作答页里确实还有一组次数隐藏域
+> （`limitWorkSubmitTimes` / `addTimes`，只有 id 没有 name），见下面的
+> §6.2.3「作业允许提交几次」。原先写的「交卷前不可知」只对
+> **已判分**的作业成立。
 
 **发现的洞**（`_audit_hole.py`，纯本地可复现）：
 
@@ -424,6 +428,65 @@ https://data-xxt.aichaoxing.com/analysis/ac_mark?…
 > （`if __name__ == "__main__"`）原来夹在文件中间，`_run_all()` 用 `globals()`
 > 收集用例，于是**它下面定义的用例永远不会执行**（`pytest tests` 才发现）。
 > runner 现在放在文件末尾。
+
+#### 6.2.3 作业允许提交几次：作答页的隐藏域（2026-10-16 语料实测）
+
+用户追问「你不知道哪次作业只有一次资格，但可以看别的作业推断出来吧」。于是把全账号
+的作业都翻了一遍（**只读**，只发 GET），结论如下。
+
+**两个字段**（未提交的作答页，`mooc2/work/dowork`）：
+
+```html
+<input id="limitWorkSubmitTimes" type="hidden" value="100"/>   <!-- 平台允许提交几次 -->
+<input id="addTimes" type="hidden" value="0"/>                 <!-- 已经提交过几次 -->
+```
+
+⚠️ 它们**只有 `id`、没有 `name`** —— 按 `name` 收集表单字段的
+`parse_work_page` 原本一个都抓不到（现在按 id 单独取，见 `_hidden_int`）。
+页面自己的用法：
+
+```js
+var limitWorkSubmitTimes = $("#limitWorkSubmitTimes").val() || 100;
+if (parseInt(addTimes) > parseInt(limitWorkSubmitTimes)) { showWorkVerify(); }
+```
+
+**语料（27 门课，18 个作业任务点，15 个已判分）**：
+
+| 页面形态 | 数量 | 读到的字段 |
+| --- | --- | --- |
+| 已判分（→ `work/view`，隐藏域 8~11 个） | 8 个读到 `redoTimes` | `redoTimes = 0`（**6 个，一次性**）、`= 3`（2 个） |
+| 已判分但页面结构不同 | 7 个 | 只有 `tasktips`「未达到及格线，请重做」，读不到次数 |
+| 未提交（→ 作答页 `dowork`） | 3 个 | `limitWorkSubmitTimes = 100`、`addTimes = 0` |
+
+**怎么用**（`api/fanya_work.py`）：
+
+* 剩余 `<= 1` 次 → **坐实**是一次性作业（`single_shot=True`，只保存草稿）；
+* 剩余 `>= 2` 次 → 页面说还能再交，但**「平台允许提交次数」与「教师给的重做次数」
+  是不是同一件事，2026-10-16 还没验证过**（6 个 `redoTimes=0` 的作业与 3 个
+  `limit=100` 的作业从未在同一份作业上同时观测到）。所以默认**仍按一次性处理**，
+  只把这个数字写进日志、审批预览与盘点（`submitLimit`/`submitRemaining`）；
+* 想让工具按页面上的次数直接交卷：`settings.tiku_config` 里加
+  `allow_page_submit_times: "true"`（`_opt_in` 只认 `1/true/yes/on`）。此时
+  剩余 `>= 2` 就按「交错了还能重做」处理（部分未答上只会打一条提醒日志）。
+* 「查不到」时行为不变：按一次性处理（保守）。
+* 盘点（`_probe_work_redo_times`）现在会看**未完成且还没有分数**的作业 ——
+  这类作业的跳转就是作答页，顺手把次数记进 `item.extra`
+  （`submit_limit`/`submit_count`/`submit_remaining`）；已达标、已完成的作业
+  一个请求都不发。作答页写着「只能提交 1 次」的未完成作业，盘点里会直接给出
+  「平台只允许提交 1 次（交卷后不能再改），本工具默认只保存草稿」的提示。
+
+**怎么验证这套推断**（留给下次真机）：下一次出现「未完成 + 窗口开放」的作业时，
+运行日志里会有 `作答页写着本作业可提交 N 次（已提交 M 次…）`；交卷后再回读该作业的
+`redoTimes` —— 若 `N >= 2` 而 `redoTimes = 0`，说明两者不是一回事，就必须保持
+「默认不信」；反之就可以把它当成可靠信号。
+
+回归保护：`test_parse_work_page_reads_submit_limit_hidden_fields`、
+`test_parse_submit_limit_html_tolerates_attribute_order`、
+`test_build_prepared_distrusts_page_limit_by_default`、
+`test_build_prepared_trusts_page_limit_when_opted_in`、
+`test_build_prepared_page_limit_of_one_seals_single_shot`、
+`test_summarize_prepared_tells_the_user_how_many_submissions_left`、
+`test_probe_work_redo_times_reads_submit_limit_for_ungraded_work`。
 
 ### 6.3 视频（planType 10）——累计观看时长门槛
 

@@ -111,8 +111,13 @@ def parse_work_page(html: str) -> dict:
             "answerFields": answer_fields,
         })
 
+    limit = _hidden_int(soup, _SUBMIT_LIMIT_ID)
+    used = _hidden_int(soup, _SUBMIT_COUNT_ID)
+    remaining = max(limit - (used or 0), 0) if limit is not None else None
+
     return {"action": action, "formData": form_data, "questions": questions,
-            "answerwqbid": ",".join(q["id"] for q in questions) + ","}
+            "answerwqbid": ",".join(q["id"] for q in questions) + ",",
+            "submitLimit": limit, "submitCount": used, "submitRemaining": remaining}
 
 
 # 一次性作业：平台没给重做次数（或次数已经用完）时，交卷不可逆。
@@ -122,6 +127,44 @@ def parse_work_page(html: str) -> dict:
 SINGLE_SHOT_MIN_RATE = 1.0
 _OPT_IN_TRUE = ("1", "true", "yes", "on")
 
+#: 作答页里写着「本作业允许提交多少次」的两个隐藏域。它们**只有 id、没有 name**
+#: （所以按 name 收集表单字段的代码抓不到），平台自己这样读：
+#: ``var limitWorkSubmitTimes = $("#limitWorkSubmitTimes").val() || 100;``
+#: ``if (parseInt(addTimes) > parseInt(limitWorkSubmitTimes)) { showWorkVerify(); }``
+_SUBMIT_LIMIT_ID = "limitWorkSubmitTimes"
+_SUBMIT_COUNT_ID = "addTimes"
+
+
+def _hidden_int(soup: Any, element_id: str) -> Optional[int]:
+    """按 id 取隐藏域里的非负整数；找不到或不是纯数字时返回 None。"""
+    node = soup.find(id=element_id)
+    if node is None:
+        return None
+    raw = str(node.get("value", "") or "").strip()
+    if not re.fullmatch(r"\d+", raw):
+        return None
+    return int(raw)
+
+
+def _parse_submit_limit_html(html: str) -> Optional[tuple]:
+    """从作答页 HTML 里解出 ``(允许提交次数, 已提交次数)``；读不到返回 None。
+
+    与 :func:`_hidden_int` 同一组字段，只是走正则（给不引入 BeautifulSoup 的
+    调用方用，例如任务盘点的 ``_probe_work_redo_times``）。属性顺序不保证，
+    所以先定位 ``<input … id="…" …>`` 标签，再在标签里找 ``value``。
+    """
+    def _value(element_id: str) -> Optional[int]:
+        tag = re.search(rf'<input[^>]*id="{element_id}"[^>]*>', html or "")
+        if not tag:
+            return None
+        value = re.search(r'value="(\d+)"', tag.group(0))
+        return int(value.group(1)) if value else None
+
+    limit = _value(_SUBMIT_LIMIT_ID)
+    if limit is None:
+        return None
+    return limit, (_value(_SUBMIT_COUNT_ID) or 0)
+
 
 def _opt_in(value: Any) -> bool:
     """把配置里的 "true"/"1"/"yes"/"on" 读成 True（其余一律 False）。"""
@@ -130,7 +173,8 @@ def _opt_in(value: Any) -> bool:
 
 def submission_blockers(*, total: int, found: int, rate: float, cover_rate: float = 0.0,
                         single_shot: bool = False,
-                        allow_single_shot: bool = False) -> list:
+                        allow_single_shot: bool = False,
+                        single_shot_note: str = "") -> list:
     """列出「这一次不该自动交卷」的理由；空列表表示可以交。
 
     2026-10-16 自查结论：``cover_rate`` 默认是 0（配置里根本没有这个键），
@@ -141,13 +185,17 @@ def submission_blockers(*, total: int, found: int, rate: float, cover_rate: floa
     * 一题未命中 → 绝不自动交（空白卷必然低分）；
     * 一次性作业 → 只有用户显式放行、且整卷都答上时才交；
     * ``cover_rate`` 设了阈值时照旧生效。
+
+    ``single_shot_note`` 用来替换「一次性」的理由文案（例如作答页其实写着
+    「可提交 100 次」，只是那个次数还没被验证过能不能真的重做）。
     """
     reasons: list = []
     if total and found <= 0:
         reasons.append("一道题都没答上（空白卷必然低分）")
     if single_shot:
+        why = single_shot_note or "平台没给这个作业重做次数（或查不到）"
         if not allow_single_shot:
-            reasons.append("平台没给这个作业重做次数（或查不到），交卷不可逆")
+            reasons.append(f"{why}，交卷不可逆")
         elif found < total:
             reasons.append(f"一次性作业还有 {total - found} 题没答上，交卷不可逆")
     if cover_rate and rate < cover_rate:
@@ -472,7 +520,8 @@ def complete_course_work(session: requests.Session, entry_url: str, tiku: Any, *
                          save_only: bool = False, cover_rate: float = 0.0,
                          on_log: Optional[Callable] = None, timeout: float = 30.0,
                          verifier: Any = None, single_shot: bool = False,
-                         allow_single_shot: bool = False
+                         allow_single_shot: bool = False,
+                         trust_page_limit: bool = False
                          ) -> tuple[bool, str]:
     """完成一个课程作业任务点。
 
@@ -521,7 +570,8 @@ def complete_course_work(session: requests.Session, entry_url: str, tiku: Any, *
 
     prepared = build_prepared(parsed, final_url, tiku, cover_rate=cover_rate, log=log,
                               verifier=verifier, single_shot=single_shot,
-                              allow_single_shot=allow_single_shot)
+                              allow_single_shot=allow_single_shot,
+                              trust_page_limit=trust_page_limit)
     if prepared["total"] == 0:
         return False, "作业页没有题目"
 
@@ -545,19 +595,55 @@ def complete_course_work(session: requests.Session, entry_url: str, tiku: Any, *
 
 def build_prepared(parsed: dict, referer: str, tiku: Any, *, cover_rate: float = 0.0,
                    log: Optional[Callable] = None, verifier: Any = None,
-                   single_shot: bool = False, allow_single_shot: bool = False) -> dict:
+                   single_shot: bool = False, allow_single_shot: bool = False,
+                   trust_page_limit: bool = False) -> dict:
     """把「读到的题目 + 题库答案」整理成一个可提交/可送审的载荷（不做任何写操作）。
 
     ``single_shot=True`` 表示这是「平台不给重做次数（或查不到）」的作业：
     除非 ``allow_single_shot`` 显式放行且整卷都答上，否则 ``do_submit`` 一律
     为 False（只保存草稿）。判断依据见 :func:`submission_blockers`。
+
+    ``trust_page_limit=True``（题库设置 ``allow_page_submit_times``）才允许
+    「作答页写着可提交 N≥2 次」直接把一次性标记翻掉；默认不信 —— 页面上的
+    提交次数与教师给的「重做次数」是不是同一件事，2026-10-16 的语料还没有
+    验证过（见 docs/FANYA_TASK_API.md「作业允许提交几次」）。
     """
     log = log or (lambda m: logger.info(m))
     payload, found, total, details = build_submission(parsed, tiku, verifier=verifier)
     rate = (found / total) if total else 0.0
+
+    # 作答页自己也写着「允许提交多少次」（id-only 隐藏域，2026-10-16 语料实测）：
+    #   剩余 <= 1 次  → 一定是一次性作业，标记坐实；
+    #   剩余 >= 2 次  → 页面说还能再交，但它与「教师给的重做次数」是否同一件事
+    #                   没有验证过，所以默认仍按一次性处理，只是把数字告诉用户。
+    remaining = parsed.get("submitRemaining")
+    limit, used = parsed.get("submitLimit"), parsed.get("submitCount")
+    single_shot_note = ""
+    if remaining is not None:
+        if remaining <= 1:
+            if not single_shot:
+                log(f"作答页写着本作业只允许提交 {limit} 次"
+                    f"（已提交 {used or 0} 次），按一次性作业处理")
+            single_shot = True
+        elif trust_page_limit:
+            if single_shot:
+                log(f"作答页写着本作业可提交 {limit} 次（已提交 {used or 0} 次，"
+                    f"剩 {remaining} 次）：交错了还能在课程页面重做")
+            single_shot = False
+        else:
+            single_shot = True
+            single_shot_note = (f"作答页写着本作业可提交 {limit} 次（已提交 {used or 0} 次，"
+                                f"剩 {remaining} 次），但能不能真的重做还没验证过")
+            log(single_shot_note + "：本次仍按一次性作业处理（只保存草稿）。"
+                "想按页面次数直接交卷，可在题库设置里加 allow_page_submit_times=true")
+
     reasons = submission_blockers(total=total, found=found, rate=rate,
                                   cover_rate=cover_rate, single_shot=single_shot,
-                                  allow_single_shot=allow_single_shot)
+                                  allow_single_shot=allow_single_shot,
+                                  single_shot_note=single_shot_note)
+    if not reasons and remaining is not None and remaining >= 2 and found < total:
+        log(f"本作业还有 {total - found} 题没答上，得分可能偏低；"
+            f"平台还剩 {remaining} 次提交机会，交完可在课程页面重做")
     if reasons:
         log("本次不自动提交：" + "；".join(reasons)
             + "（改为只保存草稿，可在课程页面核对后自己提交）")
@@ -574,14 +660,27 @@ def build_prepared(parsed: dict, referer: str, tiku: Any, *, cover_rate: float =
         "do_submit": not reasons,
         "blocked_reason": "；".join(reasons),
         "single_shot": bool(single_shot),
+        "single_shot_note": single_shot_note,
+        "submitLimit": parsed.get("submitLimit"),
+        "submitCount": parsed.get("submitCount"),
+        "submitRemaining": remaining,
         "answerwqbid": parsed.get("answerwqbid", ""),
     }
 
 
 def summarize_prepared(prepared: dict, limit: int = 6) -> str:
     """把送审载荷整理成人看的预览文本。"""
+    remaining = prepared.get("submitRemaining")
+    if remaining is None:
+        chance = "（平台允许提交的次数：页面上读不到，按只有一次处理）"
+    elif remaining <= 1:
+        chance = f"（平台还剩 {remaining} 次提交机会：交卷不可逆，请先核对答案）"
+    else:
+        chance = (f"（平台还剩 {remaining} 次提交机会"
+                  f"：可提交 {prepared.get('submitLimit')} 次、已提交 "
+                  f"{prepared.get('submitCount') or 0} 次，交错还能重做）")
     lines = [f"共 {prepared['total']} 题，题库命中 {prepared['found']} 题"
-             f"（覆盖率 {prepared['rate']:.0%}）"]
+             f"（覆盖率 {prepared['rate']:.0%}）{chance}"]
     for row in prepared.get("details", [])[:limit]:
         mark = "✓" if row.get("answered") else "✗"
         answer = (row.get("answer") or "(未命中)").replace("\n", " ")
@@ -615,7 +714,8 @@ def submit_prepared(session: requests.Session, prepared: dict, *,
 def prepare_course_work(session: requests.Session, entry_url: str, tiku: Any, *,
                         cover_rate: float = 0.0, on_log: Optional[Callable] = None,
                         timeout: float = 30.0, verifier: Any = None,
-                        single_shot: bool = False, allow_single_shot: bool = False
+                        single_shot: bool = False, allow_single_shot: bool = False,
+                        trust_page_limit: bool = False
                         ) -> tuple[bool, str, dict]:
     """**只准备、不写任何东西**：读题 + 查题库，返回送审载荷。
 
@@ -651,6 +751,7 @@ def prepare_course_work(session: requests.Session, entry_url: str, tiku: Any, *,
 
     prepared = build_prepared(parsed, final_url, tiku, cover_rate=cover_rate, log=log,
                               verifier=verifier, single_shot=single_shot,
-                              allow_single_shot=allow_single_shot)
+                              allow_single_shot=allow_single_shot,
+                              trust_page_limit=trust_page_limit)
     prepared["entry_url"] = entry_url
     return True, summarize_prepared(prepared), prepared

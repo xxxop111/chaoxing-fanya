@@ -819,6 +819,95 @@ def test_opt_in_only_accepts_truthy_strings():
         assert _opt_in(value) is False, value
 
 
+# --- 「作业允许提交几次」：作答页的隐藏域（id-only）与它的一次性判定 ---
+
+def _work_parsed_with_limit(limit: int, used: int = 0, n: int = 2) -> dict:
+    parsed = _work_parsed(n)
+    parsed.update({"submitLimit": limit, "submitCount": used,
+                   "submitRemaining": max(limit - used, 0)})
+    return parsed
+
+
+def test_parse_work_page_reads_submit_limit_hidden_fields():
+    """作答页这两个隐藏域**只有 id、没有 name**（旧代码按 name 收集，抓不到）。"""
+    from api.fanya_work import parse_work_page
+
+    html = """
+    <html><body><form action="/save">
+      <input type="hidden" id="limitWorkSubmitTimes" value="100"/>
+      <input type="hidden" id="addTimes" value="0"/>
+      <input type="hidden" name="answerwqbid" value="q1,"/>
+      <div class="singleQuesId" data="q1">
+        <h3>题目1</h3><ul><li>A. 甲</li><li>B. 乙</li></ul>
+        <input type="hidden" name="answertypeq1" value="0"/>
+        <input type="text" name="answerq1" value=""/>
+      </div>
+    </form></body></html>
+    """
+    parsed = parse_work_page(html)
+    assert parsed["submitLimit"] == 100
+    assert parsed["submitCount"] == 0
+    assert parsed["submitRemaining"] == 100
+    assert parsed["formData"].get("answerwqbid") == "q1,"
+
+
+def test_parse_submit_limit_html_tolerates_attribute_order():
+    from api.fanya_work import _parse_submit_limit_html
+
+    assert _parse_submit_limit_html(
+        '<input value="3" type="hidden" id="limitWorkSubmitTimes">'
+        '<input value="1" id="addTimes">') == (3, 1)
+    assert _parse_submit_limit_html("<p>没有这些字段</p>") is None
+
+
+def test_build_prepared_distrusts_page_limit_by_default():
+    """页面写着可交 100 次，但「能不能真重做」没验证过 → 默认仍只存草稿。"""
+    from api import fanya_work as fw
+
+    prepared = fw.build_prepared(_work_parsed_with_limit(100), "http://x",
+                                 _AnswerBookTiku({"题目1": "A", "题目2": "B"}),
+                                 single_shot=True)
+    assert prepared["do_submit"] is False, prepared
+    assert prepared["single_shot"] is True
+    assert "还没验证过" in prepared["blocked_reason"]
+    assert prepared["submitRemaining"] == 100
+
+
+def test_build_prepared_trusts_page_limit_when_opted_in():
+    from api import fanya_work as fw
+
+    prepared = fw.build_prepared(_work_parsed_with_limit(100), "http://x",
+                                 _AnswerBookTiku({"题目1": "A", "题目2": "B"}),
+                                 single_shot=True, trust_page_limit=True)
+    assert prepared["single_shot"] is False
+    assert prepared["do_submit"] is True, prepared
+    assert prepared["blocked_reason"] == ""
+
+
+def test_build_prepared_page_limit_of_one_seals_single_shot():
+    from api import fanya_work as fw
+
+    prepared = fw.build_prepared(_work_parsed_with_limit(1), "http://x",
+                                 _AnswerBookTiku({"题目1": "A", "题目2": "B"}),
+                                 single_shot=False, trust_page_limit=True)
+    assert prepared["single_shot"] is True
+    assert prepared["do_submit"] is False
+    assert "不可逆" in prepared["blocked_reason"]
+
+
+def test_summarize_prepared_tells_the_user_how_many_submissions_left():
+    from api import fanya_work as fw
+
+    prepared = fw.build_prepared(_work_parsed_with_limit(100), "http://x",
+                                 _AnswerBookTiku({"题目1": "A", "题目2": "B"}),
+                                 trust_page_limit=True)
+    assert "还剩 100 次提交机会" in fw.summarize_prepared(prepared)
+
+    one = fw.build_prepared(_work_parsed_with_limit(1), "http://x",
+                            _AnswerBookTiku({"题目1": "A", "题目2": "B"}))
+    assert "交卷不可逆" in fw.summarize_prepared(one)
+
+
 def test_submission_blockers_reports_cover_rate():
     from api.fanya_work import submission_blockers
 
@@ -874,6 +963,19 @@ def test_handle_course_work_treats_unknown_redo_times_as_one_shot():
         assert ft.handle_course_work(ctx)[0] is True
         assert captured["single_shot"] is True
         assert captured["allow_single_shot"] is True
+
+        # 4) 配置允许「按作答页写的提交次数交卷」→ trust_page_limit 传下去
+        ctx.item = SimpleNamespace(extra={"submit_limit": 100, "submit_remaining": 100})
+        ctx.chaoxing.tiku._conf = dict(_Tiku._conf, allow_page_submit_times="true")
+        captured.clear()
+        assert ft.handle_course_work(ctx)[0] is True
+        assert captured["trust_page_limit"] is True
+
+        # 5) 没开这个开关时，页面上的次数默认不采信
+        ctx.chaoxing.tiku._conf = dict(_Tiku._conf)
+        captured.clear()
+        assert ft.handle_course_work(ctx)[0] is True
+        assert captured["trust_page_limit"] is False
     finally:
         fw.complete_course_work = real_complete
 

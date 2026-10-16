@@ -143,3 +143,14 @@ def test_preview_surfaces_below_threshold(html):
     assert "belowThreshold" in html, "状态标签没有用未达标标记"
     assert "未达标" in html, "界面上看不到「未达标」字样"
     assert "expiredCount" in html, "窗口已过的计数被改掉了"
+
+
+def test_preview_surfaces_submit_allowance(html):
+    """作业「还能提交几次」也要看得见（只有一次机会的作业不能显示成随便交）。
+
+    数据来自作答页的 ``limitWorkSubmitTimes``/``addTimes``（见 docs §6.2.3）：
+    后端把 ``submitRemaining`` 放进盘点结果，前端据此给出「不可重交」/「可重交 N 次」。
+    """
+    assert "submitRemaining" in html, "前端没有读盘点的 submitRemaining"
+    assert "不可重交" in html and "可重交" in html, "作业的提交次数没有做成标签"
+

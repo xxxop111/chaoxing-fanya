@@ -226,6 +226,21 @@ def test_probe_work_redo_times_only_touches_low_score_works():
     assert len(client.urls) == 1
 
 
+def test_probe_work_redo_times_reads_submit_limit_for_ungraded_work():
+    """还没交过的作业：作答页里读到「允许提交几次」，写进 extra（只读）。"""
+    ungraded = _item(45, plan_type=4, score=None,
+                     extra=_breakthrough(enableWorkScore=1, workScore=50))
+    client = _RedoClient(
+        '<input type="hidden" id="limitWorkSubmitTimes" value="100"/>'
+        '<input type="hidden" id="addTimes" value="0"/>')
+    _probe_work_redo_times(client, _task([ungraded]))
+
+    assert ungraded.extra["submit_limit"] == 100
+    assert ungraded.extra["submit_count"] == 0
+    assert ungraded.extra["submit_remaining"] == 100
+    assert "redo_times" not in ungraded.extra
+
+
 def test_probe_work_redo_times_survives_unreadable_page():
     low = _item(44, plan_type=4, score={"totalScore": 44.5},
                 extra=_breakthrough(enableWorkScore=1, workScore=50))
