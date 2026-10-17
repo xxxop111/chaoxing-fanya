@@ -113,11 +113,47 @@ cd D:\03-开发\项目\ds\chaoxing-fanya
 
 | 出现的地方 | 从哪里来 |
 | --- | --- |
-| exe 的文件图标（→ **任务管理器**、任务栏、资源管理器） | `chaoxing.ico`，由 `chaoxing-fanya.spec` 的 `icon=` 嵌入，并 `('chaoxing.ico', '.')` 随包带出 |
-| 窗口标题栏 / 托盘图标 | `desktop_app._icon_path()` 读 exe 旁边的 `chaoxing.ico`（找不到退 `resource/chaoxing.ico`，再退系统默认图标） |
+| exe 的文件图标（→ **任务管理器**、任务栏、资源管理器） | `chaoxing.ico`，由 `chaoxing-fanya.spec` 的 `icon=` 嵌入 |
+| 窗口标题栏 / 托盘图标 | `desktop_app._icon_path()`：exe 旁边的 `chaoxing.ico` → `resource/chaoxing.ico` → **从 exe 自身资源里抠一张**（`_extract_icon_from_exe`，缓存到 `%TEMP%\chaoxing-fanya-app.ico`）→ 系统默认图标 |
 | 安装包自身与快捷方式 | `installer/chaoxing-fanya.iss`：`SetupIconFile=..\chaoxing.ico`、`UninstallDisplayIcon`、`[Icons]` |
 | 界面侧栏 logo | `web/opendesign/chaoxing-assistant.html` 的 `.brand-mark`（CSS 画同一个渐变块 + 「学」，不再用线条 SVG） |
 | 浏览器标签页图标 | 同文件的 `<link rel="icon" href="data:image/svg+xml,...">`（内联，不额外带文件，也不违反「单文件自包含」） |
+
+#### 2026-10-17 修过的坑：任务栏一块白、托盘是「默认图标」
+
+现象：装好的版本，任务栏按钮是**白色空白方块**，托盘里是 Windows 的通用图标。
+
+真因（两层，都有实测）：
+
+1. **`chaoxing.ico` 没落在 exe 旁边**。spec 里 `datas=[('chaoxing.ico', '.')]`，但 PyInstaller 6 的
+   onedir 布局会把 datas 放进 `_internal/`，不是 `dist/chaoxing-fanya/` 根目录。
+   于是 `_icon_path()` 在 exe 目录找不到，`resource/chaoxing.ico` 也不存在 → 返回 `None`；
+   托盘 `_load_icon()` 只能退到 `SystemIcons.Application`（就是用户说的「默认图标」）。
+2. **pywebview 的兜底也失效**。`webview/platforms/winforms.py` 在 `icon` 不是有效文件时会调
+   `ExtractIconW(GetModuleHandleW(None), sys.executable, 0)`，本机返回 0 → 窗体保留 WinForms
+   默认图标 → 任务栏那块白。
+
+修法：
+
+* `tools/build_desktop.py` 新增 `step_icon()`：打包后把 `chaoxing.ico` **复制到产物根目录**
+  （`dist/chaoxing-fanya/chaoxing.ico`），安装包原样带上 → `_icon_path()` 命中真实文件，
+  pywebview 走 `Form.Icon = Icon(path)`，托盘同一张图。
+  日志里能看到 `[ok] …\chaoxing.ico (26160 字节)`。
+* `desktop_app._extract_icon_from_exe()` 作为第二道兜底：从 `sys.executable` 的资源里抠图标，
+  `Icon.Save` 到临时目录缓存。注意它必须先 `_ensure_dotnet_runtime()` 再
+  `clr.AddReference("System.Drawing.Common")`，否则 `from System.Drawing import Icon` 直接
+  `ModuleNotFoundError`（这条实测踩过）。
+
+验证方式（不用肉眼看托盘）：
+
+```powershell
+# 1) 安装目录里应有 ico，且 exe 图标可取出
+Test-Path "$env:LOCALAPPDATA\Programs\ChaoxingFanya\chaoxing.ico"
+# 2) 让程序自己算一遍「托盘会用哪张图」，存成 PNG 看
+.venv\Scripts\python.exe -c "import os, desktop_app; desktop_app.BASE_DIR=os.path.join(os.environ['LOCALAPPDATA'],'Programs','ChaoxingFanya'); desktop_app._ensure_dotnet_runtime(); from System.Drawing import Icon as I, SystemIcons; t=desktop_app._TrayIcon.__new__(desktop_app._TrayIcon); ic=t._load_icon(I, SystemIcons); ic.ToBitmap().Save('_tray.png'); print(ic.Width, ic.Handle==SystemIcons.Application.Handle)"
+```
+
+`ic.Handle == SystemIcons.Application.Handle` 必须是 `False`，`_tray.png` 应该是蓝色「学」。
 
 重新生成（每个尺寸都在 4× 画布上重画再降采样，避免 16×16 把「学」糊成一团）：
 

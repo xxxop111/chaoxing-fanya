@@ -34,6 +34,7 @@ import ctypes
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -424,8 +425,57 @@ def _icon_path() -> str | None:
         candidate = os.path.join(BASE_DIR, name)
         if os.path.exists(candidate):
             return candidate
-    bundled = os.path.join(getattr(sys, "_MEIPASS", BASE_DIR), "resource", "chaoxing.ico")
-    return bundled if os.path.exists(bundled) else None
+    for root in (getattr(sys, "_MEIPASS", BASE_DIR), BASE_DIR):
+        bundled = os.path.join(root, "resource", "chaoxing.ico")
+        if os.path.exists(bundled):
+            return bundled
+    return _extract_icon_from_exe()
+
+
+def _extract_icon_from_exe() -> str | None:
+    """兜底：从 exe 自身的资源里抠出图标，落到临时目录缓存一份 .ico。
+
+    为什么需要：打包产物里没有 ``chaoxing.ico`` 时，pywebview 的 WinForms 后端会退回去调
+    ``ExtractIconW(GetModuleHandleW(None), sys.executable, 0)``；这个调用在某些机器上返回 0，
+    窗口就保留 WinForms 的默认空白图标 → **任务栏上一块白**；托盘那边同样只能拿
+    ``SystemIcons.Application``（那个「默认图标」）。既然 exe 本身嵌了正确图标，就直接取出来用，
+    任务栏和托盘都能拿到同一张图。
+    """
+    cached = os.path.join(tempfile.gettempdir(), "chaoxing-fanya-app.ico")
+    try:
+        if os.path.getsize(cached) > 0:
+            return cached
+    except OSError:
+        pass
+    try:
+        # 必须先切到带 WinForms 的 .NET 桌面运行时、并显式引用 System.Drawing.Common，
+        # 否则 `from System.Drawing import Icon` 会直接 ModuleNotFoundError（这里是实锤过的）。
+        _ensure_dotnet_runtime()
+        import clr  # noqa: F401  # 触发 pythonnet 初始化
+
+        try:
+            clr.AddReference("System.Drawing.Common")
+        except Exception:  # noqa: BLE001 - 老运行时里叫 System.Drawing
+            try:
+                clr.AddReference("System.Drawing")
+            except Exception:  # noqa: BLE001
+                pass
+        from System.Drawing import Icon  # type: ignore
+        from System.IO import FileMode, FileStream  # type: ignore
+
+        icon = Icon.ExtractAssociatedIcon(sys.executable)
+        if icon is None:
+            return None
+        stream = FileStream(cached, FileMode.Create)
+        try:
+            icon.Save(stream)
+        finally:
+            stream.Dispose()
+            icon.Dispose()
+        return cached if os.path.getsize(cached) > 0 else None
+    except Exception as exc:  # noqa: BLE001 - 取不到图标不该影响启动
+        log(f"从 exe 提取图标失败（任务栏/托盘会用系统默认图标）：{exc}")
+        return None
 
 
 # ----------------------------------------------------------------------

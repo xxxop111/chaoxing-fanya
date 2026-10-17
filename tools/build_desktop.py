@@ -11,7 +11,9 @@
    ``web/dist/index.html``，并清掉旧 React 构建留下的 ``web/dist/assets``；
 3. 检查 ``web/dist`` 是否存在（缺失也能打包，但窗口会是空的）；
 4. 调 PyInstaller 按 ``chaoxing-fanya.spec`` 打包到 ``dist/chaoxing-fanya/``。
-5. 校验产物里确实带上了内嵌窗口需要的文件（webview 程序集、pythonnet 运行时、
+5. 把 ``chaoxing.ico`` 复制到产物**根目录**（PyInstaller 6 只会把它塞进 ``_internal/``，
+   而窗口/托盘图标要的是 exe 旁边那份真实文件，否则任务栏一块白、托盘用系统默认图标）。
+6. 校验产物里确实带上了内嵌窗口需要的文件（webview 程序集、pythonnet 运行时、
    clr_loader、vendor/webview2、web/dist）。
 
 用法::
@@ -60,7 +62,7 @@ def load_patch_module():
 
 
 def step_patch() -> bool:
-    log("步骤 1/4：修补 pywebview 运行环境")
+    log("步骤 1/6：修补 pywebview 运行环境")
     os.chdir(ROOT)
     patch = load_patch_module()
     changed = patch.replace_webview2_assemblies(verbose=True)
@@ -85,7 +87,7 @@ def step_sync_frontend() -> None:
     换界面只需要替换 ``web/opendesign/chaoxing-assistant.html`` 再打包，
     不必碰 Flask、也不必有 Node 工具链。
     """
-    log("步骤 2/5：同步前端（opendesign 单文件 → web/dist/index.html）")
+    log("步骤 2/6：同步前端（opendesign 单文件 → web/dist/index.html）")
     if not OPENDESIGN_HTML.is_file():
         log(f"  [!] 缺少 {OPENDESIGN_HTML.relative_to(ROOT)} —— 沿用现有 web/dist")
         return
@@ -108,7 +110,7 @@ def step_sync_frontend() -> None:
 
 
 def step_check_web() -> None:
-    log("步骤 3/5：检查前端产物 web/dist")
+    log("步骤 3/6：检查前端产物 web/dist")
     index = ROOT / "web" / "dist" / "index.html"
     if index.is_file():
         mtime = index.stat().st_mtime
@@ -127,7 +129,7 @@ def step_check_web() -> None:
 
 
 def step_build() -> int:
-    log("步骤 3/4：PyInstaller 打包（onedir）")
+    log("步骤 4/6：PyInstaller 打包（onedir）")
     os.chdir(ROOT)
     cmd = [
         sys.executable,
@@ -159,8 +161,30 @@ REQUIRED = [
 ]
 
 
+def step_icon() -> bool:
+    """把窗口/托盘图标放进产物目录。
+
+    PyInstaller 只把 ``chaoxing.ico`` 嵌进 exe 资源，**不会**在 onedir 产物里留一份独立文件；
+    而 pywebview 的 WinForms 后端只有在 ``icon`` 指向真实文件时才直接 ``Form.Icon = Icon(path)``，
+    否则退回 ``ExtractIconW``（有些机器返回 0 → 任务栏显示一块白），托盘也只能用系统默认图标。
+    所以这里补一份 ``dist/chaoxing-fanya/chaoxing.ico``（安装包会原样带上）。
+    """
+    log("步骤 5/6：放窗口/托盘图标")
+    src = ROOT / "chaoxing.ico"
+    dst = DIST_DIR / "chaoxing.ico"
+    if not src.is_file():
+        log(f"  [xx] 缺少 {src}")
+        return False
+    if not DIST_DIR.is_dir():
+        log(f"  [xx] 没有产物目录 {DIST_DIR}")
+        return False
+    shutil.copy2(src, dst)
+    log(f"  [ok] {dst} ({dst.stat().st_size} 字节)")
+    return True
+
+
 def step_verify() -> bool:
-    log("步骤 5/5：校验产物")
+    log("步骤 6/6：校验产物")
     if not EXE.is_file():
         log(f"  [xx] 没有生成 {EXE}")
         return False
@@ -208,7 +232,8 @@ def main() -> int:
             log(f"[xx] PyInstaller 返回 {code}")
             return code
 
-    ok = step_verify()
+    icon_ok = step_icon()
+    ok = step_verify() and icon_ok
     if args.run and ok:
         step_run()
     return 0 if ok else 1

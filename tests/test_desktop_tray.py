@@ -143,6 +143,28 @@ def test_icon_path_is_a_string():
     assert isinstance(desktop_app._icon_path(), str)
 
 
+def test_icon_path_prefers_the_shipped_file(monkeypatch, tmp_path):
+    """产物里带了 chaoxing.ico 就直接用，不去碰 exe 资源。"""
+    ico = tmp_path / "chaoxing.ico"
+    ico.write_bytes(b"ICO")
+    monkeypatch.setattr(desktop_app, "BASE_DIR", str(tmp_path))
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    monkeypatch.setattr(
+        desktop_app,
+        "_extract_icon_from_exe",
+        lambda: (_ for _ in ()).throw(AssertionError("有 ico 文件时不该走兜底")),
+    )
+    assert desktop_app._icon_path() == str(ico)
+
+
+def test_icon_path_falls_back_to_the_exe_resource(monkeypatch, tmp_path):
+    """安装目录里没有 chaoxing.ico 时要从 exe 资源里抠 —— 否则任务栏一块白、托盘是默认图标。"""
+    monkeypatch.setattr(desktop_app, "BASE_DIR", str(tmp_path))
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    monkeypatch.setattr(desktop_app, "_extract_icon_from_exe", lambda: str(tmp_path / "x.ico"))
+    assert desktop_app._icon_path() == str(tmp_path / "x.ico")
+
+
 def test_module_exposes_bridge_and_tray():
     assert hasattr(desktop_app, "DesktopBridge")
     assert hasattr(desktop_app, "_TrayIcon")
