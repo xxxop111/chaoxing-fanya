@@ -553,6 +553,142 @@ def test_build_submission_leaves_choice_empty_when_unmappable():
     assert details[0]["reason"] == "答案无法对应选项"
 
 
+# ---------------- 2026-10-17 事故：图片选项把字母答案全丢了 ----------------
+def test_resolve_choice_answer_trusts_letters_when_options_unknown():
+    """选项全是公式图时 allowed 为空，模型答对的字母必须采信，不能丢弃。
+
+    概率论「第二章章节测验」29 题只答上 4 题、整卷 14 分，就是这里丢的：
+    日志里 `从AI大模型答题获取答案 -> A`，紧跟 `无法对应到选项字母，本题按未命中处理：A`。
+    """
+    assert _resolve_choice_answer("A", []) == "A"
+    assert _resolve_choice_answer("答：C", []) == "C"
+    assert _resolve_choice_answer("AB", []) == "AB"
+    # 仍然拒绝把一段话当答案
+    assert _resolve_choice_answer("Logistic 曲线呈 S 形", []) is None
+    # 超出 A-H 的字母也不认
+    assert _resolve_choice_answer("Z", []) is None
+
+
+def test_parse_work_page_keeps_image_option_slots():
+    """`<li><img></li>` 的选项 get_text 是空串，但也必须占一个位置。"""
+    from api.fanya_work import parse_work_page
+
+    html = """
+    <form action="/mooc-ans/work/addStudentWorkNewWeb?workId=1" method="post">
+    <div class="singleQuesId" id="q1">
+      <h3 class="mark_name">1.（单选题）下列哪个是密度函数？</h3>
+      <ul class="mark_letter">
+        <li><img src="https://p.cldisk.com/a.png"></li>
+        <li><img src="https://p.cldisk.com/b.png"></li>
+        <li><img src="https://p.cldisk.com/c.png"></li>
+        <li><img src="https://p.cldisk.com/d.png"></li>
+      </ul>
+      <input name="answerq1" type="hidden" value="">
+      <input name="answertypeq1" type="hidden" value="0">
+    </div>
+    <input name="answerwqbid" type="hidden" value="q1">
+    </form>
+    """
+    parsed = parse_work_page(html)
+    assert parsed["questions"], "应至少解析出一道题"
+    options = parsed["questions"][0]["options"]
+    assert len(options) == 4, f"四个图片选项要有四个位置，实得 {options}"
+    assert all(o for o in options), "空文本要用占位符补上"
+
+
+def test_build_submission_blocks_image_paper_without_ocr():
+    """OCR 没生效时，图片题一律判未答上，并且标记 ocrBlocked 让整卷交不了。"""
+    work = {
+        "formData": {"answertypeq1": "0", "answerq1": ""},
+        "answerwqbid": "q1",
+        "questions": [{
+            "id": "q1", "type": "single", "typeCode": 0, "title": "下列哪个是密度函数？",
+            "options": ["（图片选项）"] * 4,
+            "answerFields": {"answertypeq1": "0", "answerq1": ""},
+        }],
+    }
+    import api.fanya_work as fw
+
+    saved = fw.ocr_gap
+    try:
+        fw.ocr_gap = lambda: "设置里没选 OCR 供应商"
+        payload, found, total, details = build_submission(work, _StubTiku("C"))
+        assert (found, total) == (0, 1)
+        assert payload["answerq1"] == ""
+        assert details[0]["ocrBlocked"] is True
+        assert "OCR" in details[0]["reason"]
+    finally:
+        fw.ocr_gap = saved
+
+
+def test_build_submission_answers_image_paper_when_ocr_available():
+    """选项是图片、但 OCR 可用时，字母答案要真正写进提交字段。"""
+    work = {
+        "formData": {"answertypeq1": "0", "answerq1": ""},
+        "answerwqbid": "q1",
+        "questions": [{
+            "id": "q1", "type": "single", "typeCode": 0, "title": "下列哪个是密度函数？",
+            "options": ["（图片选项）"] * 4,
+            "answerFields": {"answertypeq1": "0", "answerq1": ""},
+        }],
+    }
+    import api.fanya_work as fw
+
+    saved = fw.ocr_gap
+    try:
+        fw.ocr_gap = lambda: ""
+        payload, found, total, details = build_submission(work, _StubTiku("C"))
+        assert (found, total) == (1, 1)
+        assert payload["answerq1"] == "C"
+        assert details[0]["answered"] is True
+    finally:
+        fw.ocr_gap = saved
+
+
+def test_submission_blockers_explain_ocr_gap():
+    from api.fanya_work import submission_blockers
+
+    reasons = submission_blockers(total=29, found=29, rate=1.0, ocr_blocked=25)
+    assert any("OCR" in r for r in reasons), reasons
+    # OCR 题存在时不再拿「一次性」重复劝退
+    assert not any("不可逆" in r for r in reasons), reasons
+
+
+def test_ocr_reads_formula_images_when_vision_ocr_is_configured():
+    """配了界面里的视觉 OCR 就该走 OCR，不能只认 CHAOXING_ENABLE_OCR。"""
+    import api.answer as fa
+
+    saved = (fa.ENABLE_LOCAL_OCR, fa._vision_ocr_available, fa._ocr_image_to_text)
+    calls = []
+
+    def fake_ocr(url):
+        calls.append(url)
+        return "f(x)=1/2"
+
+    try:
+        fa.ENABLE_LOCAL_OCR = False
+        fa._vision_ocr_available = lambda: True
+        fa._ocr_image_to_text = fake_ocr
+        q = {
+            "title": '下列哪个是密度函数？<img src="https://p.cldisk.com/t.png">',
+            "options": '<img src="https://p.cldisk.com/a.png">\nB. 常数',
+        }
+        fa._apply_ocr_to_title_if_needed(q)
+        assert "f(x)=1/2" in q["title"]
+        assert "<img" not in q["title"]
+        assert "f(x)=1/2" in q["options"], "选项里的公式图也要识别"
+        assert len(calls) == 2
+
+        # 两条 OCR 都不可用时保持原样（不能把裸标签也当识别结果）
+        fa.ENABLE_LOCAL_OCR = False
+        fa._vision_ocr_available = lambda: False
+        q2 = {"title": '<img src="https://p.cldisk.com/t.png">'}
+        fa._apply_ocr_to_title_if_needed(q2)
+        assert q2["title"].startswith("<img")
+    finally:
+        fa.ENABLE_LOCAL_OCR, fa._vision_ocr_available, fa._ocr_image_to_text = saved
+
+
 # ----------------------------------------------------------------------
 # 大模型复核（verifier）：非大模型主题库串题时的兜底
 # 实测背景：题库把「Logistic 曲线形状」答成「周期正弦曲线」，整卷交成 4/9，
@@ -598,8 +734,14 @@ def test_verifier_failure_is_swallowed():
     assert found == 1
 
 
-def test_verifier_skipped_when_primary_unanswered():
-    """题库没命中时不去问模型（避免把本该留空的题变成「有答案」）。"""
+def test_verifier_fills_the_questions_the_bank_missed():
+    """题库没命中的题由大模型补答 —— 2026-10-17 事故后的行为反转。
+
+    旧行为是「题库没命中就留空」，理由是「避免把本该留空的题变成有答案」。
+    但概率论「第二章章节测验」29 题只命中 4 题、其余留空交上去只得 14 分，
+    而那门作业不可重做 —— 留空的代价远大于让模型顶上。现在：题库没命中
+    → 问模型；模型答得上就补进去，模型也答不上才算这道题没答案。
+    """
     calls = []
 
     class _Counting:
@@ -607,11 +749,26 @@ def test_verifier_skipped_when_primary_unanswered():
             calls.append(payload)
             return "B"
 
-    payload, found, _total, _details = build_submission(
+    payload, found, total, details = build_submission(
         _one_choice_work(), _StubTiku(None), verifier=_Counting())
+    assert len(calls) == 1, "题库没命中时必须去问模型"
+    assert payload["answerq1"] == "B"
+    assert (found, total) == (1, 1)
+    assert details[0]["source"] == "模型"
+
+
+def test_verifier_leaves_the_question_blank_when_it_also_cannot_answer():
+    """模型也答不上（None/拒答）时，这道题仍然是「没答案」，不会被塞进占位文本。"""
+
+    class _Refusing:
+        def query(self, _payload):
+            return "我无法看到题目，请提供文字描述"
+
+    payload, found, total, details = build_submission(
+        _one_choice_work(), _StubTiku(None), verifier=_Refusing())
     assert payload["answerq1"] == ""
-    assert found == 0
-    assert calls == []
+    assert (found, total) == (0, 1)
+    assert details[0]["answered"] is False
 
 
 def test_judgement_answer_normalised_to_true_false():
@@ -912,8 +1069,119 @@ def test_submission_blockers_reports_cover_rate():
     from api.fanya_work import submission_blockers
 
     reasons = submission_blockers(total=4, found=2, rate=0.5, cover_rate=0.8)
-    assert reasons and "低于设定阈值" in reasons[0]
+    assert reasons
+    assert any("低于设定阈值" in r for r in reasons), reasons
+    assert any("半张卷子不交" in r for r in reasons), reasons
     assert submission_blockers(total=4, found=4, rate=1.0, cover_rate=0.8) == []
+
+
+def test_submission_blockers_never_lets_a_partial_paper_through():
+    """一条题没答上就不允许交（2026-10-17 事故的硬规则，没有例外）。"""
+    from api.fanya_work import submission_blockers
+
+    reasons = submission_blockers(total=29, found=4, rate=4 / 29)
+    assert reasons and "还有 25 题没答上" in reasons[0]
+    # 一次性作业放行 + 覆盖率阈值 0，也照样拦住
+    assert submission_blockers(total=29, found=28, rate=28 / 29,
+                               single_shot=True, allow_single_shot=True)
+
+
+def test_handle_course_work_refuses_to_offer_a_partial_paper():
+    """29 题只答上 4 题时，**连审批项都不登记** —— 2026-10-17 的 14 分事故。
+
+    那天题库只命中 4/29，工具把 25 道空题一起交上去，整卷 14 分，而该作业
+    不可重做。旧代码只多打一句「建议核对」，批准后照样交 —— 现在不行：
+    答案不全时 handler 直接返回失败，审批栏里根本没有可批准的东西。
+    """
+    from types import SimpleNamespace
+
+    import api.fanya_work as fw
+    from api import fanya_task as ft
+
+    class _Tiku:
+        _conf = {"provider": "LIKE", "endpoint": "https://example.invalid/c",
+                 "key": "k", "model": "m"}
+        COVER_RATE = 0.0
+
+        def get_submit_params(self):
+            return "0"
+
+    registered = []
+
+    def _prepare(session, entry_url, tiku, **kwargs):
+        details = [{"qid": f"q{i}", "type": "single", "title": f"题目{i}",
+                    "answer": "A" if i <= 4 else None,
+                    "answered": i <= 4} for i in range(1, 30)]
+        return True, "prepared", {"total": 29, "found": 4, "rate": 4 / 29,
+                                  "payload": {}, "details": details,
+                                  "single_shot": True}
+
+    ctx = SimpleNamespace(
+        study_url={"url": "https://mooc2-ans.chaoxing.com/work?workId=1"},
+        chaoxing=SimpleNamespace(tiku=_Tiku()),
+        client=SimpleNamespace(session=object()),
+        require_approval=True,
+        label="第二章章节测验",
+        item=SimpleNamespace(extra={"redo_times": 0}),
+        register_approval=lambda **kwargs: registered.append(kwargs) or "ap-x",
+    )
+
+    real_prepare = fw.prepare_course_work
+    try:
+        fw.prepare_course_work = _prepare
+        ok, msg = ft.handle_course_work(ctx)
+    finally:
+        fw.prepare_course_work = real_prepare
+
+    assert ok is False, msg
+    assert registered == [], "答案不全时绝不能登记审批项"
+    assert "4/29" in msg and "已中止" in msg, msg
+    assert "题目5" in msg and "题目1" not in msg, "要点名没答案的那几道题，而不是已答上的"
+
+
+def test_handle_course_work_offers_approval_only_for_a_full_paper():
+    """答案齐全（29/29）时才登记审批项，且预览里不再出现「只答上」。"""
+    from types import SimpleNamespace
+
+    import api.fanya_work as fw
+    from api import fanya_task as ft
+
+    class _Tiku:
+        _conf = {"provider": "AI", "endpoint": "e", "key": "k", "model": "m"}
+        COVER_RATE = 0.0
+
+        def get_submit_params(self):
+            return "0"
+
+    registered = []
+
+    def _prepare(session, entry_url, tiku, **kwargs):
+        details = [{"qid": f"q{i}", "type": "single", "title": f"题目{i}",
+                    "answer": "A", "answered": True} for i in range(1, 30)]
+        return True, "prepared", {"total": 29, "found": 29, "rate": 1.0,
+                                  "payload": {}, "details": details,
+                                  "single_shot": True}
+
+    ctx = SimpleNamespace(
+        study_url={"url": "https://mooc2-ans.chaoxing.com/work?workId=1"},
+        chaoxing=SimpleNamespace(tiku=_Tiku()),
+        client=SimpleNamespace(session=object()),
+        require_approval=True,
+        label="第二章章节测验",
+        item=SimpleNamespace(extra={"redo_times": 0}),
+        register_approval=lambda **kwargs: registered.append(kwargs) or "ap-ok",
+    )
+
+    real_prepare = fw.prepare_course_work
+    try:
+        fw.prepare_course_work = _prepare
+        ok, msg = ft.handle_course_work(ctx)
+    finally:
+        fw.prepare_course_work = real_prepare
+
+    assert ok is True, msg
+    assert len(registered) == 1 and registered[0]["kind"] == "course_work"
+    assert "29/29" in msg and "只答上" not in msg, msg
 
 
 def test_handle_course_work_treats_unknown_redo_times_as_one_shot():

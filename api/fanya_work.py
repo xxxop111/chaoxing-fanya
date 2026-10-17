@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Callable, Optional
 
@@ -74,9 +75,12 @@ def parse_work_page(html: str) -> dict:
         ul = block.find("ul")
         options = []
         if ul is not None:
-            options = [re.sub(r"\s+", " ", li.get_text(" ", strip=True)).strip()
-                       for li in ul.find_all("li")]
-            options = [o for o in options if o]
+            raw_options = [re.sub(r"\s+", " ", li.get_text(" ", strip=True)).strip()
+                           for li in ul.find_all("li")]
+            # 空文本的选项**不能整条丢掉**（2026-10-17 事故）：图片选项的 li 里
+            # 只有一个 <img>，get_text 得到空串；全过滤掉会让选项数变成 0，
+            # 模型答对的字母（A/B/C）就无处可落，整卷被判成「没答上」。
+            options = [o or "（图片选项）" for o in raw_options]
 
         # 题干：去掉选项与作答区后的剩余内容（保留图片以支持 OCR）
         stem = BeautifulSoup(str(block), "lxml")
@@ -174,7 +178,8 @@ def _opt_in(value: Any) -> bool:
 def submission_blockers(*, total: int, found: int, rate: float, cover_rate: float = 0.0,
                         single_shot: bool = False,
                         allow_single_shot: bool = False,
-                        single_shot_note: str = "") -> list:
+                        single_shot_note: str = "",
+                        ocr_blocked: int = 0) -> list:
     """列出「这一次不该自动交卷」的理由；空列表表示可以交。
 
     2026-10-16 自查结论：``cover_rate`` 默认是 0（配置里根本没有这个键），
@@ -192,7 +197,16 @@ def submission_blockers(*, total: int, found: int, rate: float, cover_rate: floa
     reasons: list = []
     if total and found <= 0:
         reasons.append("一道题都没答上（空白卷必然低分）")
-    if single_shot:
+    elif total and found < total:
+        # 2026-10-17 事故（概率论第二章章节测验：29 题只答上 4 题，交卷 14 分，
+        # 不可重做）之后：**半张卷子一律不交**。要交就交完整卷；答不全就只存
+        # 草稿，让人自己补完再交。
+        reasons.append(f"还有 {total - found} 题没答上（半张卷子不交）")
+    if ocr_blocked:
+        reasons.append(
+            f"有 {ocr_blocked} 道题的题干是图片，而视觉 OCR 没生效"
+            "（设置里供应商/接口地址/模型至少缺一项），模型看不见公式，答案等于蒙")
+    if single_shot and not ocr_blocked:
         why = single_shot_note or "平台没给这个作业重做次数（或查不到）"
         if not allow_single_shot:
             reasons.append(f"{why}，交卷不可逆")
@@ -229,6 +243,11 @@ def _resolve_choice_answer(answer: str, options: list) -> Optional[str]:
 
     * 纯字母答案（``"B"``、``"AC"``、``"答：B"``）且字母都在选项范围内 → 直接用；
     * 选项原文或「B. 原文」→ 反查字母；
+    * **选项读不到时（全是图片选项）** 纯字母答案直接采信 —— 2026-10-17 事故：
+      概率论「第二章章节测验」的选项全是公式图，``parse_work_page`` 把空文本选项
+      全过滤掉，``allowed`` 变成空列表，于是模型答对的「A」「B」「C」全被判成
+      「无法对应选项字母」而留空，25 道题交白卷、整卷 14 分。宁可交一个字母
+      （错了也只是这一题错），也不能把答对的题主动丢成空。
     * 其余 → ``None``（宁可留空，也不写错）。
     """
     options = list(options or [])
@@ -239,6 +258,13 @@ def _resolve_choice_answer(answer: str, options: list) -> Optional[str]:
 
     letters = "".join(sorted({c.upper() for c in re.findall(r"[A-Za-z]", raw)}))
     core = re.sub(r"^[^A-Za-z]+|[^A-Za-z]+$", "", raw)
+    if not allowed:
+        # 选项未知（图片选项 / 解析不到 ul）：只接受「干净的字母串」，范围 A-H。
+        if letters and len(letters) <= 8 and all("A" <= x <= "H" for x in letters) \
+                and len(core) <= max(4, 2 * len(letters) + 2):
+            logger.warning("题目选项读不出来（可能是图片选项），采信字母答案 {}", letters)
+            return letters
+        return None
     # 纯字母答案：前后可以带「答：」这类引导词，但中间不能夹着一堆文本
     if letters and all(x in allowed for x in letters) and len(core) <= max(4, 2 * len(letters) + 2):
         return letters
@@ -299,6 +325,60 @@ def _ask_verifier(verifier: Any, q: dict) -> Optional[str]:
     return str(answer).strip()
 
 
+_IMAGE_HOSTS = ("p.ananas.chaoxing.com", "p.cldisk.com", "p.cdn.chaoxing.com")
+
+# 与 api/vision_ocr.py 的 PROVIDER_DEFAULTS 对齐：这些供应商不填接口地址也能用。
+_OCR_PROVIDER_ENDPOINT = {
+    "openai": "https://api.openai.com/v1/chat/completions",
+    "claude": "https://api.anthropic.com/v1/messages",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    "siliconflow": "https://api.siliconflow.cn/v1/chat/completions",
+}
+
+def ocr_gap() -> str:
+    """返回「OCR 为什么用不了」的人话说明；可用时返回空串。
+
+    两条链路任一条可用即可：本地 PaddleOCR（``CHAOXING_ENABLE_OCR``）或设置页里
+    配的视觉大模型。2026-10-17 事故复盘：用户配了 provider=openai_compatible
+    却没填接口地址，OCR 一直是关的，日志里只有一条 WARNING，整卷就这么瞎猜着
+    交了 14 分。所以这里必须能被上层问出来，并且说清楚缺哪一项。
+    """
+    try:
+        from api.decode import ENABLE_LOCAL_OCR
+        from api.vision_ocr import is_vision_ocr_enabled
+    except Exception:  # noqa: BLE001 - 探测失败按「不可用」处理
+        return "OCR 组件没加载起来"
+    if ENABLE_LOCAL_OCR or is_vision_ocr_enabled():
+        return ""
+    provider = os.environ.get("CHAOXING_VISION_OCR_PROVIDER", "").strip().lower()
+    key = os.environ.get("CHAOXING_VISION_OCR_KEY", "").strip()
+    endpoint = os.environ.get("CHAOXING_VISION_OCR_ENDPOINT", "").strip()
+    if not provider:
+        return "设置里没选 OCR 供应商"
+    if not key:
+        return "OCR 密钥是空的"
+    if not endpoint and provider not in _OCR_PROVIDER_ENDPOINT:
+        return f"供应商选了 {provider} 但没填接口地址"
+    return "OCR 配置没生效"
+
+
+def _ocr_available() -> bool:
+    return not ocr_gap()
+
+
+
+def _question_has_image(q: dict) -> bool:
+    """题干或选项里有没有我们读不出来的图片。"""
+    text = str(q.get("title") or "")
+    if "<img" in text or any(h in text for h in _IMAGE_HOSTS):
+        return True
+    for opt in q.get("options") or []:
+        opt = str(opt)
+        if opt.strip() == "（图片选项）" or "<img" in opt or any(h in opt for h in _IMAGE_HOSTS):
+            return True
+    return False
+
+
 def build_submission(parsed: dict, tiku: Any,
                      verifier: Any = None) -> tuple[dict, int, int, list]:
     """按题目查询题库并拼出提交字段。
@@ -320,10 +400,29 @@ def build_submission(parsed: dict, tiku: Any,
     found = 0
     details: list[dict] = []
     overridden = 0
+    model_filled = 0
+    # OCR 不可用的具体原因只探一次，逐题写进明细里，日志和审批预览都能说清楚。
+    _ocr_gap_reason = ocr_gap()
 
     for q in questions:
         qid = q["id"]
         answer: Optional[str] = None
+        reason = "未命中"
+        from_model = False
+        # 题干/选项是图片而 OCR 没起作用时，任何「答案」都是蒙的：直接把这一题
+        # 判成没答上，并记下 ocrBlocked，让整卷被完整性闸门拦下来（见
+        # submission_blockers 的 ocr_blocked）。绝不能再出现「看不见公式也照样
+        # 把 29 题全交上去、14 分不可重做」这种事故。
+        if _ocr_gap_reason and _question_has_image(q):
+            for name, original in q["answerFields"].items():
+                payload.setdefault(name, original)
+            details.append({"qid": qid, "type": q["type"], "title": q["title"],
+                            "answer": None, "answered": False,
+                            "reason": "题干是图片且 OCR 没生效：%s" % _ocr_gap_reason,
+                            "ocrBlocked": True})
+            logger.warning("题目 {} 的题干/选项是图片，但 OCR 不可用（{}），按未命中处理",
+                           qid, _ocr_gap_reason)
+            continue
         if tiku is not None:
             try:
                 answer = tiku.query({
@@ -339,20 +438,31 @@ def build_submission(parsed: dict, tiku: Any,
         if answer and _is_refusal(str(answer)):
             logger.warning("题库对题目 {} 返回了拒答文本，按未命中处理: {}",
                            qid, str(answer)[:60])
-            details.append({"qid": qid, "type": q["type"], "title": q["title"],
-                            "answer": None, "answered": False, "reason": "题库拒答"})
             answer = None
+            reason = "题库拒答"
 
-        # 大模型复核：只在答案是选择题、且主题库不是大模型时进行。
-        if answer and verifier is not None and q["type"] in _CHOICE_TYPES:
+        # 大模型：有主答案的选择题做复核，**没有主答案的题直接补答**。
+        # 2026-10-17 事故：概率论「第二章章节测验」29 题题库只命中 4 题，
+        # 其余 25 题留空交上去，整卷 14 分（且该作业不可重做）。从此
+        # 「题库没命中就留空」不再是可接受的默认——先让模型顶上，模型也
+        # 答不上才算没答上，而没答上的卷子根本不允许交（见
+        # fanya_task.handle_course_work 的完整性闸门）。
+        model_answer = None
+        if verifier is not None and (answer is None or q["type"] in _CHOICE_TYPES):
+            model_answer = _ask_verifier(verifier, q)
+        if answer and model_answer and q["type"] in _CHOICE_TYPES:
             primary = _choice_value(q, str(answer))
-            checked = _ask_verifier(verifier, q)
-            checked_value = _choice_value(q, checked) if checked else None
+            checked_value = _choice_value(q, model_answer)
             if primary and checked_value and primary != checked_value:
                 logger.warning("题目 {} 题库答案与大模型复核不一致（题库 {} / 模型 {}），"
                                "采用模型答案", qid, primary, checked_value)
-                answer = checked
+                answer = model_answer
                 overridden += 1
+        elif answer is None and model_answer:
+            answer = model_answer
+            from_model = True
+            model_filled += 1
+            logger.info("题目 {} 题库未命中，由大模型补答：{}", qid, str(model_answer)[:60])
 
         if answer:
             found += 1
@@ -363,7 +473,7 @@ def build_submission(parsed: dict, tiku: Any,
 
         if not answer:
             details.append({"qid": qid, "type": q["type"], "title": q["title"],
-                            "answer": None, "answered": False, "reason": "未命中"})
+                            "answer": None, "answered": False, "reason": reason})
             continue
 
         if q["type"] in ("single", "judgement", "multiple"):
@@ -395,13 +505,20 @@ def build_submission(parsed: dict, tiku: Any,
                     payload[name] = str(answer).strip()
                     break
         details.append({"qid": qid, "type": q["type"], "title": q["title"],
-                        "answer": str(answer).strip(), "answered": True})
+                        "answer": str(answer).strip(), "answered": True,
+                        "source": "模型" if from_model else "题库"})
 
     rate = (found / len(questions)) if questions else 0.0
-    logger.info("课程作业共 {} 题，题库命中 {} 题（覆盖率 {:.0%}）",
-                len(questions), found, rate)
+    logger.info("课程作业共 {} 题，命中 {} 题（覆盖率 {:.0%}）{}",
+                len(questions), found, rate,
+                f"，其中大模型补答 {model_filled} 题" if model_filled else "")
     if overridden:
         logger.info("其中 {} 题按大模型复核结果改写过（两个来源答案不一致）", overridden)
+    blank = [d for d in details if not d.get("answered")]
+    if blank:
+        logger.warning("仍有 {} 题没有答案（{}）：这些题会留空，整卷不允许交",
+                       len(blank),
+                       "；".join(str(d.get("title") or d.get("qid"))[:30] for d in blank[:8]))
     return payload, found, len(questions), details
 
 
@@ -640,7 +757,8 @@ def build_prepared(parsed: dict, referer: str, tiku: Any, *, cover_rate: float =
     reasons = submission_blockers(total=total, found=found, rate=rate,
                                   cover_rate=cover_rate, single_shot=single_shot,
                                   allow_single_shot=allow_single_shot,
-                                  single_shot_note=single_shot_note)
+                                  single_shot_note=single_shot_note,
+                                  ocr_blocked=sum(1 for d in details if d.get("ocrBlocked")))
     if not reasons and remaining is not None and remaining >= 2 and found < total:
         log(f"本作业还有 {total - found} 题没答上，得分可能偏低；"
             f"平台还剩 {remaining} 次提交机会，交完可在课程页面重做")
@@ -655,6 +773,7 @@ def build_prepared(parsed: dict, referer: str, tiku: Any, *, cover_rate: float =
         "total": total,
         "rate": rate,
         "details": details,
+        "ocr_blocked": sum(1 for d in details if d.get("ocrBlocked")),
         # 不满足「可以自动交卷」的条件时默认不提交；
         # 是否提交最终由调用方（含用户审批）决定。
         "do_submit": not reasons,

@@ -3213,27 +3213,42 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
     total = prepared["total"]
     found = prepared["found"]
 
+    if found == 0:
+        return False, (f"题库对这 {total} 题全部未命中（可能是纯图片题），"
+                       "已按未命中处理，未提交任何内容")
+
+    # 完整性闸门（2026-10-17 事故后加）：概率论「第二章章节测验」29 题里题库只
+    # 命中 4 题，审批时那句「建议核对」被当成提醒而不是禁令，批准后把 25 道空题
+    # 一起交了，整卷 14 分 —— 而该作业不可重做、无法挽回。所以：答案不全的卷子
+    # 连审批项都不登记，让「交半张卷子」根本没有入口。
+    if found < total:
+        blank_rows = [str(row.get("title") or row.get("qid"))
+                      for row in (prepared.get("details") or []) if not row.get("answered")]
+        logger.error("[作业] 「{}」{} 题只答上 {} 题，已中止（不登记审批、不写平台）：{}",
+                     getattr(ctx, "label", ""), total, found,
+                     "；".join(blank_rows[:5]) or "（明细缺失）")
+        return False, (
+            f"只答上 {found}/{total} 题，还有 {total - found} 题没答案"
+            f"（{'；'.join(blank_rows[:2])}{'…' if len(blank_rows) > 2 else ''}）。"
+            "半张卷子不交 —— 已中止，没有向平台写入任何内容。"
+            "请先补齐题库（或在设置里把题库换成大模型），再重新盘点。")
+
     def _submit() -> tuple[bool, str]:
         # 用户已批准 → 正式提交（pyFlag 置空）
+        if found < total:  # 老审批项也不能绕过完整性检查
+            return False, (f"答案不全（{found}/{total}），已拒绝提交；"
+                           "请重新盘点生成完整答案后再批准")
         logger.info("[作业] 审批通过，提交 {} 题答案", total)
         ok, msg = submit_prepared(session, prepared, force_submit=True)
         if ok and _is_submitted(msg):
             msg = _append_score_check(ctx, msg)
         return ok, msg
 
-    if found == 0:
-        return False, (f"题库对这 {total} 题全部未命中（可能是纯图片题），"
-                       "已按未命中处理，未提交任何内容")
-
     warning = ""
     if prepared.get("single_shot"):
         why = prepared.get("single_shot_note") or "平台没给这个作业重做次数（或查不到）"
         warning = (f"\n⚠️ {why}：批准后会直接交卷、不可逆（交上去就不能改了）"
                    "—— 请先核对上面的答案。")
-    # 命中率太低时「批准」等于把大片空白交上去，一次性作业尤其致命。
-    thin_warning = _thin_hit_warning(total, found)
-    if thin_warning:
-        warning += "\n⚠️ " + thin_warning
     entry_id = ctx.register_approval(
         kind="course_work",
         preview=f"{ctx.label}\n{msg}{warning}",
@@ -3241,10 +3256,9 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
         extra={"total": total, "found": found, "rate": prepared["rate"],
                "singleShot": bool(prepared.get("single_shot"))},
     )
-    return True, (f"已生成 {total} 题答案（命中 {found} 题），"
+    return True, (f"已生成 {total} 题答案（{total}/{total} 题都有答案），"
                   f"待审批后提交 [id={entry_id}]"
-                  + ("（该作业不可重做，批准即不可逆）" if prepared.get("single_shot") else "")
-                  + (f"（只答上 {found}/{total} 题，建议核对后再批准）" if thin_warning else ""))
+                  + ("（该作业不可重做，批准即不可逆）" if prepared.get("single_shot") else ""))
 
 
 @register_handler("chapter")

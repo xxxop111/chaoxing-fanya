@@ -750,6 +750,8 @@
                 <div class="field"><label for="ocr-key">密钥</label><input class="input" id="ocr-key" type="password" placeholder="sk-…" /></div>
                 <div class="field"><label for="ocr-endpoint">接口地址</label><input class="input" id="ocr-endpoint" placeholder="https://…" /></div>
                 <div class="field"><label for="ocr-model">模型</label><input class="input" id="ocr-model" placeholder="…" /></div>
+                <p class="mono-note" id="ocr-status" data-od-id="settings-ocr-status">OCR —</p>
+                <p class="mono-note" data-od-id="settings-ocr-tip">需要「能看图」的模型：通义 qwen-vl、硅基流动 Qwen2-VL、OpenAI gpt-4o 之类。DeepSeek 系列只能处理文字，读不了公式图；这类题本工具会直接留空、整卷不交，不会瞎猜。</p>
               </div>
             </div>
           </div>
@@ -1605,12 +1607,52 @@
     setVal("nt-provider", nc.provider || ""); setVal("nt-url", nc.url || ""); setVal("nt-tg", nc.tg_chat_id || "");
     var oc = c.ocr_config || {};
     setVal("ocr-provider", oc.provider || ""); setVal("ocr-key", oc.key || ""); setVal("ocr-endpoint", oc.endpoint || ""); setVal("ocr-model", oc.model || "");
+    renderOcrStatus();
     setVal("run-speed", c.speed != null ? c.speed : 1.0); setVal("run-jobs", c.jobs != null ? c.jobs : 4); setVal("run-maxch", c.max_chapters != null ? c.max_chapters : 0);
     // notopen_action 只有 retry / continue 两个合法值；历史配置里出现过 "ask"，
     // 落到未知值时要回退成 retry，否则分段控件两边都不亮。
     state.notopen = (c.notopen_action === "continue") ? "continue" : "retry";
     $$("#seg-notopen button").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.val === state.notopen)); });
   }
+  // OCR 到底有没有真的生效 —— 与 api/vision_ocr.py 的规则保持一致。
+  // 2026-10-17 事故：配了 provider=openai_compatible 却没填接口地址，OCR 一直是
+  // 关的，日志里只有一条 WARNING；结果 29 道公式图题的卷子被当成「没答上」的
+  // 空题交上去，14 分且不可重做。现在界面上直接说清楚缺什么。
+  var OCR_DEFAULT_ENDPOINT = {
+    openai: "https://api.openai.com/v1/chat/completions",
+    claude: "https://api.anthropic.com/v1/messages",
+    qwen: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    siliconflow: "https://api.siliconflow.cn/v1/chat/completions"
+  };
+  function ocrState() {
+    var provider = $("#ocr-provider").value;
+    var key = ($("#ocr-key").value || "").trim();
+    var endpoint = ($("#ocr-endpoint").value || "").trim();
+    if (!provider) {
+      return { ok: false, text: "未启用：题干是公式图片的题会一律留空，整卷不会自动交卷。" };
+    }
+    if (!key) {
+      return { ok: false, text: "未生效：供应商已选，但密钥是空的。" };
+    }
+    if (!endpoint && !OCR_DEFAULT_ENDPOINT[provider]) {
+      return { ok: false, text: "未生效：openai_compatible 必须自己填接口地址，只填供应商和密钥不够。" };
+    }
+    return { ok: true, text: "已启用 → " + (endpoint || OCR_DEFAULT_ENDPOINT[provider]) + "（公式图片会先识别成文字再答题）" };
+  }
+  function renderOcrStatus() {
+    var el = $("#ocr-status");
+    if (!el) return;
+    var s = ocrState();
+    el.textContent = "OCR " + s.text;
+    el.style.color = s.ok ? "var(--muted)" : "var(--danger)";
+  }
+  ["ocr-provider", "ocr-key", "ocr-endpoint", "ocr-model"].forEach(function (id) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener("input", renderOcrStatus);
+    el.addEventListener("change", renderOcrStatus);
+  });
+
   function setVal(id, v) { var el = document.getElementById(id); if (el) el.value = v == null ? "" : v; }
   function numVal(id, dflt) { var el = document.getElementById(id); var n = parseFloat(el && el.value); return isNaN(n) ? dflt : n; }
 

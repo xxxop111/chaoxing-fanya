@@ -1133,3 +1133,86 @@ type-2 分支；作答接口在 SPA 的懒加载 chunk 里。与另外两种模�
   一次机会）。新增 `_thin_hit_warning(total, found)`：命中不到一半时预览里追加
   「⚠️ 只答上 4/29 题（14%）：批准后其余 25 题会以空答案交卷…」，行文案也补
   「（只答上 4/29 题，建议核对后再批准）」。
+
+## 11. 2026-10-17 14 分事故：整卷只有 4 题答上就交了
+
+用户原话：*「我的章节测验怎么只有14分就交了，你必须帮我改过来」*。这不是显示
+问题，是**真的把 25 道空题交上去了**，而且该作业不可重做。事故链逐环拆开如下，
+每一环都改成「宁可停下，也不瞎交」。
+
+### 11.1 现场（日志逐行）
+
+```
+14:14:28  任务点已登记待审批：[作业] 第二章章节测验 — 已生成 29 题答案（命中 4 题），
+          待审批后提交 [id=ap-3]（该作业不可重做，批准即不可逆）
+          （只答上 4/29 题，建议核对后再批准）
+14:41:27  [作业] 审批通过，提交 29 题答案
+14:41:29  [作业] 交卷后暂未读到分数
+14:41:29  [ap-3] 已批准 -> 成功：作业已提交（29 题，命中 4 题）
+```
+
+界面把所有该拦的信号都摆出来了（「命中 4 题」「不可重做」「建议核对」），
+**但没有一处是硬的**：用户点「批准」，工具就照单交卷。设计错误在于「警告 +
+人工判断」被当成了安全措施。
+
+### 11.2 为什么只有 4 题
+
+1. 题库（`tiku`）查不到 → 29 题里 25 题没答案；
+2. 题库的 AI 兜底其实答了（14:13 的 DEBUG：`从AI大模型答题获取答案 … -> A`），
+   但 `build_submission` 把这 25 个答案全丢了，日志写明原因：
+   `题目 215222536 的答案无法对应到选项字母，本题按未命中处理：A`；
+3. 根因：这 25 题**选项本身是图片**（`p.cldisk.com`），解析器只认文字选项 → 选项
+   列表为空 → 无法把「A」映射到具体选项值 → 全部判未命中；
+4. 更深一层：题干/选项都是图片时本该先 OCR。用户配了 `ocr_config`
+   （provider=openai_compatible），**接口地址留空、密钥栏填的是模型名
+   `deepseek-flash`**，而 `_apply_ocr_to_title_if_needed` 只在本地 PaddleOCR
+   （`CHAOXING_ENABLE_OCR`）时生效 —— 视觉 OCR 那条链在这个函数里根本没接上，
+   日志只有一条 WARNING。于是 AI 全程在**没看过题干**的情况下猜答案。
+
+### 11.3 改成了什么
+
+* **整卷闸门**：`build_submission` 逐题记录 `found`；只要 `found < total`，
+  `prepare_course_work` 直接返回失败，**不登记审批、不生成可交卷的东西**：
+  「29 题只答上 4 题（14%）：缺 25 题，这种卷子不交」。原来的「⚠️ 命中不到一半
+  建议核对」警告已删除 —— 有硬闸门就不该再留一条「你可以硬交」的路。
+* **AI 补答**：题库没命中但 AI 给了答案的题，不再丢弃，直接写进 payload
+  （`details[i]["source"] = "AI"`），日志 `AI 补答 25 题`。AI 答案同样过
+  `_resolve_choice_answer`，能映射才收。
+* **图片选项不再被吃掉**：`parse_work_page` 遇到图片选项保留占位
+  `（图片选项）`，选项数量与真实题目一致；`_resolve_choice_answer` 在「选项
+  不认识」且答案本身就是干净的 A–H 字母时，按字母收下（平台提交的就是字母）。
+* **OCR 接线**：`_apply_ocr_to_title_if_needed` 现在同时认本地 PaddleOCR 和
+  设置页的视觉 OCR（`is_vision_ocr_enabled`），并且**选项字段也 OCR**
+  （原来只看题干）。
+* **OCR 不可用就别交**：`ocr_gap()` 返回人话原因（没选供应商 / 密钥空 /
+  openai_compatible 没填接口地址 / 模型空），`parse_work_page` 把它记在
+  `parsed["ocrBlocked"]`；`submission_blockers` 首位检查 —— 只要卷子里有图片题
+  而 OCR 不可用，直接失败：「这份卷子有 12 道题的题干是图片，但 OCR 没生效：
+  …。DeepSeek 这类文字模型不行，要 qwen-vl / Qwen2-VL / gpt-4o 这类能看图的」。
+* **设置页看得见**：设置页 OCR 卡片新增状态行（`#ocr-status`），按同一套规则
+  实时算「已启用 / 未启用 + 缺哪一项」，并写明「题干是公式图片的题会一律留空，
+  整卷不会自动交卷」。
+
+### 11.4 这套闸门明确不做什么
+
+* 不保证分数：OCR 认错公式、AI 答错，都会被如实记录，不会为了「看起来完成」
+  去凑答案。
+* 不自动降低标准：整卷不交 ≠ 帮你点「放弃」。作业窗口还在时，用户下次运行
+  配好 OCR 后会重新生成答案；窗口已过的作业仍然是「补不了」。
+
+### 11.5 回归用例
+
+`tests/test_parsers.py`：
+`test_build_submission_rejects_a_paper_that_is_mostly_blank`、
+`test_build_submission_accepts_ai_answers_when_the_bank_misses`、
+`test_image_options_do_not_swallow_the_letter_answer`、
+`test_build_submission_refuses_image_paper_without_ocr`、
+`test_build_submission_answers_image_paper_when_ocr_available`、
+`test_submission_blockers_explain_ocr_gap`；
+`tests/test_fanya_work_flow.py`：
+`test_prepare_course_work_refuses_when_the_bank_only_covers_a_few_questions`、
+`test_prepare_course_work_does_not_register_approval_for_a_thin_paper`；
+`tests/test_frontend_contract.py`：`test_settings_page_shows_why_ocr_is_off`。
+
+**Open objectives（截至本块）**：14 分已判、不可撤回（该作业无重做机会），只能
+保证同类事故不再发生 + 让用户配好视觉 OCR 后重跑其余窗口未过的作业。

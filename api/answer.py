@@ -19,6 +19,7 @@ from urllib3 import disable_warnings, exceptions
 from api.answer_check import *
 from api.logger import logger
 from api.decode import _ocr_image_to_text, ENABLE_LOCAL_OCR
+from api.vision_ocr import is_vision_ocr_enabled as _vision_ocr_available
 
 
 def _strip_json_block(md_str: str) -> str:
@@ -70,16 +71,19 @@ _IMG_TAG_PATTERN = re.compile(r'<img[^>]*src=["\'](.*?)["\'][^>]*>', re.IGNORECA
 
 
 def _apply_ocr_to_title_if_needed(q_info: dict) -> None:
-    """在题目标题中检测图片链接，并在本地 OCR 启用时用识别文本替换图片标签。
+    """在题目标题中检测图片链接，并在 OCR 可用时用识别文本替换图片标签。
 
     仅处理作业题目的标题字符串，不影响其他阅读类内容；
     当 OCR 不可用或识别失败时，不修改原始标题。
-    """
-    if not ENABLE_LOCAL_OCR:
-        return
 
-    title = q_info.get("title")
-    if not isinstance(title, str) or "<img" not in title:
+    2026-10-17 修正：原来这里只认 ``ENABLE_LOCAL_OCR``（环境变量
+    ``CHAOXING_ENABLE_OCR=1``，专指本地 PaddleOCR），于是**在界面里配置了
+    外部视觉 OCR 的用户一个公式图都识别不到** —— 概率论「第二章章节测验」
+    的题干全是 ``p.cldisk.com`` 公式图，模型只能对着 ``<img src=...>`` 猜，
+    29 题只答上 4 题。视觉 OCR（``CHAOXING_VISION_OCR_PROVIDER/KEY``，由
+    界面里的 ``ocr_config`` 写入）与本地 OCR 是两条路，任意一条可用就该走 OCR。
+    """
+    if not (ENABLE_LOCAL_OCR or _vision_ocr_available()):
         return
 
     def _repl(match: re.Match) -> str:
@@ -101,10 +105,16 @@ def _apply_ocr_to_title_if_needed(q_info: dict) -> None:
         # OCR 失败时也不要把裸露的 <img> 标签发给大模型，改为通用占位符
         return "[公式图片]"
 
-    new_title = _IMG_TAG_PATTERN.sub(_repl, title)
-    if new_title != title:
-        logger.debug(f"题目图片 OCR 处理后标题：{new_title}")
-        q_info["title"] = new_title
+    # 题干与选项都要处理：选项本身也常是公式图（「A. <img>B. <img>」），
+    # 只识别题干的话模型仍然分不清四个选项的差别。
+    for field in ("title", "options"):
+        value = q_info.get(field)
+        if not isinstance(value, str) or "<img" not in value:
+            continue
+        new_value = _IMG_TAG_PATTERN.sub(_repl, value)
+        if new_value != value:
+            logger.debug(f"题目图片 OCR 处理后 {field}：{new_value[:120]}")
+            q_info[field] = new_value
 
 class CacheDAO:
     """

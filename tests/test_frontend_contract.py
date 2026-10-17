@@ -200,6 +200,19 @@ def test_ai_direct_submit_is_a_switch_that_reaches_the_runner(html):
     assert "已完成 " in html and "项已收起" in html, "全部收起后没有给出提示"
 
 
+def test_settings_page_shows_why_ocr_is_off(html):
+    """14 分事故之后：OCR 到底有没有生效，必须能在设置页直接看见。
+
+    以前的 OCR 配置是「填了表单就算配了」——用户把模型名 ``deepseek-flash``
+    写进「密钥」、接口地址留空，界面上一切正常，等到交卷时才发现整卷是瞎猜的。
+    """
+    assert 'data-od-id="settings-ocr-status"' in html, "设置页没有 OCR 状态那一行"
+    assert 'id="ocr-status"' in html, "OCR 状态没有可以写入的元素"
+    assert "renderOcrStatus" in html, "OCR 状态没有渲染逻辑"
+    assert "未启用：题干是公式图片的题会一律留空" in html, "OCR 状态没有说清楚后果"
+    assert "DeepSeek" in html and "读不了公式图" in html, "没有说明为什么 DeepSeek 不行"
+
+
 def test_brand_mark_matches_the_windows_icon(html):
     """侧栏 logo 与 Windows 图标（chaoxing.ico）用同一套造型：蓝渐变圆角块 + 白「学」。
 
