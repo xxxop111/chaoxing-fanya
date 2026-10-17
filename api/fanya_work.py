@@ -210,8 +210,7 @@ def submission_blockers(*, total: int, found: int, rate: float, cover_rate: floa
         why = single_shot_note or "平台没给这个作业重做次数（或查不到）"
         if not allow_single_shot:
             reasons.append(f"{why}，交卷不可逆")
-        elif found < total:
-            reasons.append(f"一次性作业还有 {total - found} 题没答上，交卷不可逆")
+        # 放行一次性作业但答案不全：上面「还有 N 题没答上」已经拦住了，不必重复。
     if cover_rate and rate < cover_rate:
         reasons.append(f"覆盖率 {rate:.0%} 低于设定阈值 {cover_rate:.0%}")
     return reasons

@@ -1942,20 +1942,6 @@ def _awaits_approval(ok: bool, message: str) -> bool:
     return bool(ok) and "[id=" in (message or "")
 
 
-def _thin_hit_warning(total: int, found: int) -> str:
-    """题库命中不到一半时，返回一句「批准等于交白卷」的提醒（否则空串）。
-
-    实测 2026-10-17：概率论「第二章章节测验」29 题只命中 4 题，预览里没有任何
-    提示，用户很可能直接点批准 —— 而这类作业往往只有一次机会。
-    """
-    if not total or found * 2 >= total:
-        return ""
-    missed = total - found
-    return (f"只答上 {found}/{total} 题（{found / total:.0%}）：批准后其余 {missed} 题"
-            "会以空答案交卷。题库里没有这些题，建议先自己补几题，或者干脆别交"
-            "（交了不能改）。")
-
-
 HANDLERS: dict[str, Callable[[CompletionContext], tuple[bool, str]]] = {}
 
 
@@ -3213,10 +3199,6 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
     total = prepared["total"]
     found = prepared["found"]
 
-    if found == 0:
-        return False, (f"题库对这 {total} 题全部未命中（可能是纯图片题），"
-                       "已按未命中处理，未提交任何内容")
-
     # 完整性闸门（2026-10-17 事故后加）：概率论「第二章章节测验」29 题里题库只
     # 命中 4 题，审批时那句「建议核对」被当成提醒而不是禁令，批准后把 25 道空题
     # 一起交了，整卷 14 分 —— 而该作业不可重做、无法挽回。所以：答案不全的卷子
@@ -3224,14 +3206,22 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
     if found < total:
         blank_rows = [str(row.get("title") or row.get("qid"))
                       for row in (prepared.get("details") or []) if not row.get("answered")]
+        ocr_blocked = sum(1 for row in (prepared.get("details") or []) if row.get("ocrBlocked"))
         logger.error("[作业] 「{}」{} 题只答上 {} 题，已中止（不登记审批、不写平台）：{}",
                      getattr(ctx, "label", ""), total, found,
                      "；".join(blank_rows[:5]) or "（明细缺失）")
-        return False, (
+        if ocr_blocked:
+            from api.fanya_work import ocr_gap
+            raise TaskSkipped(
+                f"有 {ocr_blocked}/{total} 题的题干/选项是图片，而视觉 OCR 没生效"
+                f"（{ocr_gap() or '原因未知'}）：模型看不见公式，交上去只会白丢分，"
+                "所以这卷没交。请在「设置 → OCR」里配一个能看图的模型"
+                "（qwen-vl / Qwen2-VL / gpt-4o 之类，DeepSeek 不行），再重新盘点")
+        raise TaskSkipped(
             f"只答上 {found}/{total} 题，还有 {total - found} 题没答案"
             f"（{'；'.join(blank_rows[:2])}{'…' if len(blank_rows) > 2 else ''}）。"
             "半张卷子不交 —— 已中止，没有向平台写入任何内容。"
-            "请先补齐题库（或在设置里把题库换成大模型），再重新盘点。")
+            "请先补齐题库（或在设置里把题库换成大模型），再重新盘点")
 
     def _submit() -> tuple[bool, str]:
         # 用户已批准 → 正式提交（pyFlag 置空）
@@ -3256,7 +3246,7 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
         extra={"total": total, "found": found, "rate": prepared["rate"],
                "singleShot": bool(prepared.get("single_shot"))},
     )
-    return True, (f"已生成 {total} 题答案（{total}/{total} 题都有答案），"
+    return True, (f"已生成 {total} 题答案（{found}/{total} 题都有答案），"
                   f"待审批后提交 [id={entry_id}]"
                   + ("（该作业不可重做，批准即不可逆）" if prepared.get("single_shot") else ""))
 

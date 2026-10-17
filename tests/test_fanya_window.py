@@ -398,8 +398,3 @@ def test_awaits_approval_only_matches_pending_rows():
     assert ft._awaits_approval(False, "待审批后提交 [id=ap-4]") is False
 
 
-def test_thin_hit_warning_only_fires_below_half():
-    assert ft._thin_hit_warning(29, 4).startswith("只答上 4/29 题")
-    assert "25 题" in ft._thin_hit_warning(29, 4)
-    assert ft._thin_hit_warning(10, 5) == "", "一半命中不算「交白卷」"
-    assert ft._thin_hit_warning(0, 0) == ""

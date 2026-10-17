@@ -1172,9 +1172,11 @@ type-2 分支；作答接口在 SPA 的懒加载 chunk 里。与另外两种模�
 ### 11.3 改成了什么
 
 * **整卷闸门**：`build_submission` 逐题记录 `found`；只要 `found < total`，
-  `prepare_course_work` 直接返回失败，**不登记审批、不生成可交卷的东西**：
-  「29 题只答上 4 题（14%）：缺 25 题，这种卷子不交」。原来的「⚠️ 命中不到一半
-  建议核对」警告已删除 —— 有硬闸门就不该再留一条「你可以硬交」的路。
+  `handle_course_work` 抛 `TaskSkipped`（界面上是**跳过**，不是失败），
+  **不登记审批、不生成可交卷的东西**：「29 题只答上 4 题（14%）：缺 25 题，
+  这种卷子不交」。原来的「⚠️ 命中不到一半 建议核对」警告已删除 —— 有硬闸门
+  就不该再留「你可以硬交」的路。用 `TaskSkipped` 而不是 `(False, msg)`：这是
+  「按设计不交」，不是工具出错，所以清单里显示「跳过（需人工/需配置）」。
 * **AI 补答**：题库没命中但 AI 给了答案的题，不再丢弃，直接写进 payload
   （`details[i]["source"] = "AI"`），日志 `AI 补答 25 题`。AI 答案同样过
   `_resolve_choice_answer`，能映射才收。
@@ -1187,7 +1189,7 @@ type-2 分支；作答接口在 SPA 的懒加载 chunk 里。与另外两种模�
 * **OCR 不可用就别交**：`ocr_gap()` 返回人话原因（没选供应商 / 密钥空 /
   openai_compatible 没填接口地址 / 模型空），`parse_work_page` 把它记在
   `parsed["ocrBlocked"]`；`submission_blockers` 首位检查 —— 只要卷子里有图片题
-  而 OCR 不可用，直接失败：「这份卷子有 12 道题的题干是图片，但 OCR 没生效：
+  而 OCR 不可用，整卷跳过（`TaskSkipped`）：「有 12 道题的题干是图片，
   …。DeepSeek 这类文字模型不行，要 qwen-vl / Qwen2-VL / gpt-4o 这类能看图的」。
 * **设置页看得见**：设置页 OCR 卡片新增状态行（`#ocr-status`），按同一套规则
   实时算「已启用 / 未启用 + 缺哪一项」，并写明「题干是公式图片的题会一律留空，
@@ -1202,17 +1204,20 @@ type-2 分支；作答接口在 SPA 的懒加载 chunk 里。与另外两种模�
 
 ### 11.5 回归用例
 
-`tests/test_parsers.py`：
-`test_build_submission_rejects_a_paper_that_is_mostly_blank`、
-`test_build_submission_accepts_ai_answers_when_the_bank_misses`、
-`test_image_options_do_not_swallow_the_letter_answer`、
-`test_build_submission_refuses_image_paper_without_ocr`、
+`tests/test_parsers.py`（全部真实存在，`pytest tests -q` 与“单独的 python 直跑”都过）：
+`test_parse_work_page_keeps_image_option_slots`（图片选项不再被整条丢弃）、
+`test_resolve_choice_answer_trusts_letters_when_options_unknown`（选项读不到时信任 A–H）、
 `test_build_submission_answers_image_paper_when_ocr_available`、
-`test_submission_blockers_explain_ocr_gap`；
-`tests/test_fanya_work_flow.py`：
-`test_prepare_course_work_refuses_when_the_bank_only_covers_a_few_questions`、
-`test_prepare_course_work_does_not_register_approval_for_a_thin_paper`；
-`tests/test_frontend_contract.py`：`test_settings_page_shows_why_ocr_is_off`。
+`test_build_submission_blocks_image_paper_without_ocr`、
+`test_submission_blockers_explain_ocr_gap`、
+`test_submission_blockers_never_lets_a_partial_paper_through`、
+`test_verifier_fills_the_questions_the_bank_missed`（题库未命中时由大模型补答）、
+`test_verifier_leaves_the_question_blank_when_it_also_cannot_answer`、
+`test_ocr_reads_formula_images_when_vision_ocr_is_configured`、
+`test_handle_course_work_refuses_to_offer_a_partial_paper`（4/29 → `TaskSkipped`，不登记审批）、
+`test_handle_course_work_skips_an_image_paper_without_ocr`（图题 + 无 OCR → 跳过并指名去设置）、
+`test_handle_course_work_offers_approval_only_for_a_full_paper`（29/29 才给审批）；
+`tests/test_frontend_contract.py`：`test_settings_page_shows_why_ocr_is_off`（设置页能看出 OCR 没生效）。
 
 **Open objectives（截至本块）**：14 分已判、不可撤回（该作业无重做机会），只能
 保证同类事故不再发生 + 让用户配好视觉 OCR 后重跑其余窗口未过的作业。

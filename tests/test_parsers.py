@@ -1127,13 +1127,18 @@ def test_handle_course_work_refuses_to_offer_a_partial_paper():
     )
 
     real_prepare = fw.prepare_course_work
+    raised = None
     try:
         fw.prepare_course_work = _prepare
-        ok, msg = ft.handle_course_work(ctx)
+        try:
+            ft.handle_course_work(ctx)
+        except ft.TaskSkipped as exc:
+            raised = exc
     finally:
         fw.prepare_course_work = real_prepare
 
-    assert ok is False, msg
+    assert raised is not None, "答案不全时应该抛 TaskSkipped"
+    msg = str(raised)
     assert registered == [], "答案不全时绝不能登记审批项"
     assert "4/29" in msg and "已中止" in msg, msg
     assert "题目5" in msg and "题目1" not in msg, "要点名没答案的那几道题，而不是已答上的"
@@ -1183,6 +1188,58 @@ def test_handle_course_work_offers_approval_only_for_a_full_paper():
     assert len(registered) == 1 and registered[0]["kind"] == "course_work"
     assert "29/29" in msg and "只答上" not in msg, msg
 
+
+def test_handle_course_work_skips_an_image_paper_without_ocr():
+    """题干是图片而 OCR 不可用 → 跳过并指名去设置页配「能看图」的模型。"""
+    from types import SimpleNamespace
+
+
+    import api.fanya_work as fw
+    from api import fanya_task as ft
+
+    class _Tiku:
+        _conf = {"provider": "AI", "endpoint": "e", "key": "k", "model": "m"}
+        COVER_RATE = 0.0
+
+        def get_submit_params(self):
+            return "0"
+
+    registered = []
+
+    def _prepare(session, entry_url, tiku, **kwargs):
+        details = [{"qid": f"q{i}", "type": "single", "title": f"<img src=x>",
+                    "answer": None, "answered": False,
+                    "reason": "题干是图片且 OCR 没生效", "ocrBlocked": True}
+                   for i in range(1, 30)]
+        return True, "prepared", {"total": 29, "found": 0, "rate": 0.0,
+                                  "payload": {}, "details": details}
+
+    ctx = SimpleNamespace(
+        study_url={"url": "https://mooc2-ans.chaoxing.com/work?workId=1"},
+        chaoxing=SimpleNamespace(tiku=_Tiku()),
+        client=SimpleNamespace(session=object()),
+        require_approval=True,
+        label="第二章章节测验",
+        item=SimpleNamespace(extra={"redo_times": 0}),
+        register_approval=lambda **kwargs: registered.append(kwargs) or "ap-bad",
+    )
+
+    real_prepare = fw.prepare_course_work
+    raised = None
+    try:
+        fw.prepare_course_work = _prepare
+        try:
+            ft.handle_course_work(ctx)
+        except ft.TaskSkipped as exc:
+            raised = exc
+    finally:
+        fw.prepare_course_work = real_prepare
+
+    assert raised is not None, "图片题 + 无 OCR 应该抛 TaskSkipped"
+    text = str(raised)
+    assert "图片" in text and "OCR" in text, text
+    assert "能看图" in text or "qwen-vl" in text, text
+    assert registered == []
 
 def test_handle_course_work_treats_unknown_redo_times_as_one_shot():
     """平台查不到重做次数时，handler 必须按「只有一次机会」处理。"""
