@@ -183,6 +183,20 @@ def test_finished_items_are_collapsed_until_redo_is_on(html):
     assert "it.isFinish" in html, "收起逻辑没有按 isFinish 判定"
     assert 'id="preview-redo"' in html and '$("#preview-redo").addEventListener' in html, \
         "开关变了不重渲染，收起状态不会跟着变"
+
+
+def test_ai_direct_submit_is_a_switch_that_reaches_the_runner(html):
+    """「AI实践直接提交」必须是界面上的开关，不能只会改配置文件。
+
+    以前 execute 把 ``allow_ai_submit`` 写死成 false，用户想交卷只能去改
+    tiku 配置（还得知道键名）。现在工具栏有开关，值直接进 ``options``；
+    而且它写平台、部分不可撤销，所以默认关闭并记在本机。
+    """
+    assert 'id="preview-ai-submit"' in html, "找不到「AI实践直接提交」开关"
+    assert "AI实践直接提交" in html, "开关没有可见文案"
+    assert 'allow_ai_submit: $("#preview-ai-submit").checked' in html, \
+        "开关没有接到执行请求的 options.allow_ai_submit 上"
+    assert "od-cx-ai-submit" in html, "开关状态没有存在本机（刷新会丢）"
     assert "已完成 " in html and "项已收起" in html, "全部收起后没有给出提示"
 
 

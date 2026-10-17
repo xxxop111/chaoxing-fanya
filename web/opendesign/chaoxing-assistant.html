@@ -605,6 +605,11 @@
                   <input type="checkbox" id="preview-show-expired" />
                   <span class="mono-note">显示窗口已过</span>
                 </label>
+                <label class="row" style="gap:8px; align-items:center;"
+                       title="勾上后，AI实践（思维阶梯 / 情景对话 / AI剧情）会直接交卷；不勾时它们只出草稿并记为「跳过」，等你在待审批里逐条放行">
+                  <input type="checkbox" id="preview-ai-submit" />
+                  <span class="mono-note">AI实践直接提交</span>
+                </label>
               </div>
               <div id="preview-summary" class="grid-3" style="margin-bottom:16px;"></div>
               <div id="preview-tree"></div>
@@ -814,7 +819,7 @@
   var state = {
     view: "account", demo: false, healthOk: null, version: null, lastHeartbeat: null, rawConfig: null,
     username: "", hasCookies: false, courses: [], selected: {},
-    preview: null, previewTask: null, previewPending: false, showExpired: false,
+    preview: null, previewTask: null, previewPending: false, showExpired: false, aiSubmit: false,
     run: null, runKind: null, runId: null, console: [], autoScroll: true,
     approvals: [], approvalsPending: 0, showingDecided: false,
     config: null, notopen: "retry"
@@ -1332,6 +1337,16 @@
     state.showExpired = this.checked;
     if (state.preview) renderPreviewTree();
   });
+  // 「AI实践直接提交」：不勾时 AI实践 只出草稿并记为跳过（等审批），勾上才真的交卷。
+  // 这条链路会写进平台且部分不可撤销，所以默认关闭、并记在本机。
+  function applyAiSubmit(on) {
+    state.aiSubmit = !!on;
+    var box = $("#preview-ai-submit");
+    if (box) box.checked = state.aiSubmit;
+    try { localStorage.setItem("od-cx-ai-submit", state.aiSubmit ? "1" : "0"); } catch (e) {}
+  }
+  $("#preview-ai-submit").addEventListener("change", function () { applyAiSubmit(this.checked); });
+  try { if (localStorage.getItem("od-cx-ai-submit") === "1") applyAiSubmit(true); } catch (e) {}
   // 「包含已完成」开关同时决定「列表里显不显示已完成项」——它本来就是发给
   // 后端的 options.redo（重做已完成的），列表不跟着变的话，用户会勾到一堆
   // 已经做完的条目去执行，然后日志什么也不说。
@@ -1356,7 +1371,7 @@
     var byCourse = {};
     $$("#preview-tree input[data-plan]:checked").forEach(function (cb) { (byCourse[cb.dataset.course] = byCourse[cb.dataset.course] || []).push(cb.dataset.task); });
     var p = loginPayload();
-    call("/api/fanya/execute", { method: "POST", body: { use_cookies: p.use_cookies, username: p.username, password: p.password, course_list: Object.keys(byCourse), plan_ids: plans, tasks_by_course: byCourse, tiku_config: state.config ? state.config.tiku_config : undefined, options: { redo: $("#preview-redo").checked, concurrency: numVal("fanya-concurrency", 1), require_approval: true, allow_ai_submit: false, exam_submit: false, group_submit: false, browser_headless: true } } }).then(function (r) {
+    call("/api/fanya/execute", { method: "POST", body: { use_cookies: p.use_cookies, username: p.username, password: p.password, course_list: Object.keys(byCourse), plan_ids: plans, tasks_by_course: byCourse, tiku_config: state.config ? state.config.tiku_config : undefined, options: { redo: $("#preview-redo").checked, concurrency: numVal("fanya-concurrency", 1), require_approval: true, allow_ai_submit: $("#preview-ai-submit").checked, exam_submit: false, group_submit: false, browser_headless: true } } }).then(function (r) {
       if (!r.status) { toast(r.msg || "执行失败", "err"); return; }
       beginRun("fanya", r.data.task_id, plans.length + " 个任务点 · 任务引擎");
       toast("已开始执行，写入动作将登记到待审批", "ok");

@@ -2604,7 +2604,8 @@ def handle_ai_ladder(ctx: CompletionContext) -> tuple[bool, str]:
     """
     if ctx.require_approval and not ctx.options.get("allow_ai_submit"):
         raise TaskSkipped("思维阶梯尚未支持「生成后暂停」审批流程（链路本身已真机验证，"
-                          "得分 85）；如确认要直接交卷，请开启「允许 AI实践直接提交」选项")
+                          "得分 85）；如确认要直接交卷，请在任务点清单工具栏勾上"
+                          "「AI实践直接提交」")
 
 
     from api import fanya_ladder as ladder
@@ -2675,7 +2676,7 @@ def handle_ai_chat(ctx: CompletionContext) -> tuple[bool, str]:
     """
     if ctx.require_approval and not ctx.options.get("allow_ai_submit"):
         raise TaskSkipped("情景对话尚未支持「生成后暂停」审批流程，且该链路未真机验证；"
-                          "如确认要直接交卷，请开启「允许 AI实践直接提交」选项")
+                          "如确认要直接交卷，请在任务点清单工具栏勾上「AI实践直接提交」")
 
 
     from api import fanya_chat as chat
@@ -2712,7 +2713,8 @@ def handle_ai_story(ctx: CompletionContext) -> tuple[bool, str]:
     """
     if ctx.require_approval and not ctx.options.get("allow_ai_submit"):
         raise TaskSkipped("AI剧情会写入不可撤销的真实对话内容，且最后一章「上传报告」"
-                          "尚未自动化；如确认要执行，请开启「允许 AI实践直接提交」选项")
+                          "尚未自动化；如确认要执行，请在任务点清单工具栏勾上"
+                          "「AI实践直接提交」")
 
 
     from api import fanya_story as story

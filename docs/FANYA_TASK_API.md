@@ -1064,6 +1064,31 @@ type-2 分支；作答接口在 SPA 的懒加载 chunk 里。与另外两种模�
 这一页完成」。`handle_chapter()` 也加了同样的兜底：真的走到那里也**跳过**而不是
 报「章节未找到」。
 
+**2026-10-17 又往下挖了一层（仍然做不成，但把判据钉死了）**：
+
+* 用带 cookie 的真实浏览器（Playwright + 系统 Edge）打开微课页，抓到的链路是
+  `topicdetailsmiddle` → `mycourse/stu?microTopicId=` → 真正的学习页
+  `mycourse/studentstudy?chapterId=1222351333&microTopicId=239094628` →
+  内容页 `mooc-ans/knowledge/cards?…&isMicroCourse=true`（里面是 **4 个 PDF**，
+  由 `pan-yz.chaoxing.com/screen/v2/file_<objectid>` 渲染）。
+* 整整 52 秒的停留 + 滚动之后，`isFinish` 仍是 false；会话上报只有
+  `fystat-ans/log/setlog` 与 `stat2-ans/page/view/log`（page_enter / heartbeat），
+  没有完成上报。
+* `wk-view` 单独 GET 只返回 `{"status":true}`（只是浏览标记），
+  `studentstudyAjax` 带 `micTopicId` 也只是把页面拿回来。
+* 完成条量在任务点 JSON 里写着：`planBreakthroughSet.enableFinishPercent=1,
+  finishPercent=80` → 要靠 `jobCompleteRate` ≥ 80。已完成的 8375328 是
+  `jobCompleteRate=80.0`，这两个失败的恒为 `0.0`。
+* `knowledge/cards` 的 `mArg.attachments[]` 里每个 PDF 都带
+  `jobid / jtoken / enc / objectid / topicList`（`topicList` 列出该章节下 5 个
+  知识点 id）。拿这些 id 走既有的「阅读任务」上报
+  `ananas/job/readv2`（`Chaoxing.study_read`）→ 四个全部返回
+  **「无效的请求参数」**：PDF 卡片的进度由 pan-yz 阅读器自己的通道上报，
+  与 `readv2` 不是一套。
+
+结论没变（判「需人工」），但**"平台判据在 PDF 阅读器里"这句话现在有证据**，
+不再是猜测。要做成自动化，下一步是逆 pan-yz 阅读器的进度上报，属于另一件事。
+
 ### 10.2 AI实践 的「不能自动做」= 跳过，不是失败
 
 三处闸门原来都 `return False, "…"`，界面上就是红色「失败」。现在改成
@@ -1071,12 +1096,19 @@ type-2 分支；作答接口在 SPA 的懒加载 chunk 里。与另外两种模�
 
 | 处理器 | 条件 | 原文案 |
 | --- | --- | --- |
-| `ai_ladder` / `ai_chat` / `ai_story` | `require_approval` 且没开 `allow_ai_submit` | 需要开启「允许 AI实践直接提交」 |
+| `ai_ladder` / `ai_chat` / `ai_story` | `require_approval` 且没开 `allow_ai_submit` | 请在任务点清单工具栏勾上「AI实践直接提交」 |
 | `ai_upload` / `ai_story` | 最后一节是「上传报告/作品」，未自动化 | 同上 |
 | `ai_*` | 未识别子模式（学习窗口可能关闭） | 已经由 `supported=False` 落成跳过 |
 
 `TaskSkipped` 是 `api/fanya_task.py` 里的异常类型，`run_item` 捕它 → `skipped=True`，
 计入 `stats['skipped']`。
+
+**开关而不是改配置**：`options.allow_ai_submit` 由界面工具栏的
+「AI实践直接提交」（`#preview-ai-submit`）控制，默认**关**、状态记在
+`localStorage["od-cx-ai-submit"]`。以前 `execute` 把它写死 `false`，用户想交卷
+只能去 tiku 配置里改键名，等于没有这个功能。关着时 AI实践 只出草稿并记为「跳过」，
+在「待审批」里逐条放行；勾上后 `run_task` 直接把 `allow_ai_submit=True` 交给处理器，
+由它 `createPaper → answerQuestion → submitPaper` 一次走完。
 
 ### 10.3 「TypeError: cannot unpack non-iterable NoneType object」的守卫
 
