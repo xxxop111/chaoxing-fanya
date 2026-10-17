@@ -54,6 +54,7 @@ PLAN_TYPE_AUDIO = 22
 PLAN_TYPE_WORK = 4
 PLAN_TYPE_EXAM = 5
 PLAN_TYPE_CHAPTER = 8
+PLAN_TYPE_KNOWLEDGE = 1
 PLAN_TYPE_SIGN = 9
 PLAN_TYPE_QUIZ = 17
 
@@ -79,6 +80,15 @@ PLAN_TYPE_LABELS = {
 
 class FanyaTaskError(Exception):
     """任务引擎接口返回异常。"""
+
+
+class TaskSkipped(Exception):
+    """处理器判定「这件事得人来做」时抛出。
+
+    执行结果会记成**跳过**（``skipped=True``）而不是失败 —— 例如 AI实践要看「允许
+    AI实践直接提交」开关、或末章是尚未自动化的上传节点：工具没做的事，不该显示成
+    「执行失败」，否则用户会以为程序坏了。
+    """
 
 
 def _plan_type_label(plan_type: Any, fallback: str = "") -> str:
@@ -127,6 +137,10 @@ class FanyaPlanItem:
     # 因此不算进「待处理」——否则界面上会永远挂着一批做不了的作业。
     window_state: str = ""
     window_note: str = ""
+    # 任务点落地页的类型（探测 getToStudyUrl 时识别）：
+    #   "" 未知 / "micro_topic" = 知识点微课页（topicdetailsmiddle，判据是微课里的
+    #   阅读计时上报，本工具不支持）
+    page_kind: str = ""
 
     @property
     def window_blocked(self) -> bool:
@@ -646,7 +660,9 @@ register_adapter(PLAN_TYPE_DOCUMENT, "document", STATUS_AUTO, "文档",
 # 不在章节任务点里，无法复用 study_work → 需单独的课程作业适配器。
 register_adapter(PLAN_TYPE_WORK, "course_work", STATUS_AUTO, "作业",
                  "mooc2 课程作业：题库作答后提交（复用题库 submit/cover_rate 策略）")
-register_adapter(1, "chapter", STATUS_AUTO, "知识点", "复用章节任务点流程")
+register_adapter(1, "chapter", STATUS_AUTO, "知识点",
+                 "章节型知识点复用章节流程；微课型知识点（阅读计时上报）不支持")
+
 # 音频：与视频同构（audioStudy/learnPage + audioDataLog）。本账号没有音频任务点，
 # 因此无法真机验证；处理器会明确报错（而不是静默失败），所以仍然标记为可自动完成，
 # 但备注如实说明「未验证」。
@@ -737,6 +753,11 @@ def resolve_item(item: FanyaPlanItem) -> tuple[str, str, str]:
         if status in (STATUS_AUTO, STATUS_PARTIAL) and handler not in HANDLERS:
             return STATUS_PENDING, handler, f"{note}（处理器尚未实现）"
         return status, handler, note
+
+    if item.page_kind == "micro_topic":
+        return (STATUS_MANUAL, "chapter",
+                "知识点微课页：平台的完成判据是微课里的阅读计时上报，"
+                "本工具没有这条链路；请手动打开这一页完成")
 
     spec = adapter_for(item.plan_type)
     status, note = effective_status(spec)
@@ -869,6 +890,18 @@ def _window_state_from_message(message: str) -> tuple[str, str]:
     return "", note
 
 
+def _mark_reachable(item: FanyaPlanItem, payload: Optional[dict]) -> None:
+    """``getToStudyUrl`` 成功：标记可进入，并顺手识别落地页类型。"""
+    item.window_state = "open"
+    url = (payload or {}).get("url") or ""
+    if item.plan_type == PLAN_TYPE_KNOWLEDGE and "coursetopic/topicdetailsmiddle" in url:
+        # 知识点微课页（/mooc2-ans/coursetopic/topicdetailsmiddle?...&topicid=NNN）。
+        # 实测（2026-10-17）：这种页里 externalDataId 是 **topicId**、不是章节 id，
+        # 页面的完成判据是微课内容里的阅读计时上报（wk-view → 计时 → 上报），
+        # 没有章节任务点那套 get_job_list/process_job 可走。
+        item.page_kind = "micro_topic"
+
+
 def _probe_item_windows(client: FanyaTaskClient, task: FanyaTask,
                         max_workers: int = 8,
                         probe_client_factory: Optional[Callable[[], Any]] = None) -> None:
@@ -894,7 +927,7 @@ def _probe_item_windows(client: FanyaTaskClient, task: FanyaTask,
 
     def probe(item: FanyaPlanItem) -> None:
         try:
-            client.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
+            payload = client.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
         except FanyaTaskError as exc:
             message = str(exc)
             if "不在学习时间内" not in message:
@@ -905,7 +938,7 @@ def _probe_item_windows(client: FanyaTaskClient, task: FanyaTask,
         except Exception as exc:  # noqa: BLE001 - 探测失败不该影响盘点
             logger.debug("窗口探测失败（{}）：{}", item.name[:24], exc)
         else:
-            item.window_state = "open"
+            _mark_reachable(item, payload)
 
     if workers == 1:
         for item in pending:
@@ -922,7 +955,7 @@ def _probe_item_windows(client: FanyaTaskClient, task: FanyaTask,
             probe(item)
             return
         try:
-            probe_client.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
+            payload = probe_client.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
         except FanyaTaskError as exc:
             message = str(exc)
             if "不在学习时间内" not in message:
@@ -933,7 +966,37 @@ def _probe_item_windows(client: FanyaTaskClient, task: FanyaTask,
         except Exception as exc:  # noqa: BLE001
             logger.debug("窗口探测失败（{}）：{}", item.name[:24], exc)
         else:
-            item.window_state = "open"
+            _mark_reachable(item, payload)
+
+
+    if workers == 1:
+        for item in pending:
+            probe(item)
+        return
+
+    # 探测是纯 GET，用独立会话并发跑（共享 session 不是线程安全的）。
+    # ``probe_client_factory`` 让测试注入假客户端；生产路径复制全局会话。
+    factory = probe_client_factory
+
+    def probe_with(item: FanyaPlanItem) -> None:
+        probe_client = factory() if factory else None
+        if probe_client is None:
+            probe(item)
+            return
+        try:
+            payload = probe_client.get_study_url(task.encry_task_user_id, item.encrypt_plan_id)
+        except FanyaTaskError as exc:
+            message = str(exc)
+            if "不在学习时间内" not in message:
+                return
+            state, note = _window_state_from_message(message)
+            item.window_state = state or "expired"
+            item.window_note = note
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("窗口探测失败（{}）：{}", item.name[:24], exc)
+        else:
+            _mark_reachable(item, payload)
+
 
     def default_factory() -> Any:
         try:
@@ -1254,6 +1317,9 @@ def build_task_preview(chaoxing: Any, courses: list[dict],
                 _probe_item_windows(client, task)
                 # 低分作业：再查一次「还能重做几次」（只对低分作业，见该函数注释）
                 _probe_work_redo_times(client, task)
+                # 探测会顺手识别落地页类型（例如「知识点微课页」），重新分类一次：
+                # classify_items 是纯函数，重复调用没有副作用。
+                classify_items(task)
             allow, allow_msg = client.check_allow_study(task.encry_task_user_id)
             task.allow_study = allow
             task.allow_study_message = allow_msg
@@ -1556,6 +1622,9 @@ class FanyaTaskRunner:
             _probe_item_windows(self.client, task)
         except Exception as exc:  # noqa: BLE001 - 探测失败不该挡住执行
             logger.debug("窗口探测失败（{}）：{}", task.name, exc)
+        else:
+            # 探测会顺手识别页型（知识点微课页等），重新分类一次（纯函数）
+            classify_items(task)
 
         finished = [i for i in task.items if i.is_finish and not self.redo]
         expired = [i for i in task.items if not i.is_finish and i.unreachable]
@@ -1806,9 +1875,14 @@ class FanyaTaskRunner:
         )
 
         try:
-            ok, message = handler(ctx)
+            ok, message = _handler_outcome(handler_name, handler(ctx))
             result["ok"] = bool(ok)
             result["message"] = message or ("完成" if ok else "未成功")
+        except TaskSkipped as exc:
+            # 处理器明确表示「这件事要人来做」：算跳过，不算失败
+            result["ok"] = False
+            result["skipped"] = True
+            result["message"] = str(exc)
         except Exception as exc:  # noqa: BLE001 - 单个任务点失败不应中断整门课程
             logger.error("任务点 {} 处理异常: {}", label, exc)
             # ★ loguru 不认 ``exc_info=True``（那会被当成 sink 的格式参数，堆栈根本
@@ -1816,7 +1890,16 @@ class FanyaTaskRunner:
             logger.opt(exception=True).debug("异常详情")
             result["message"] = f"异常: {type(exc).__name__}: {exc}"
 
-        if result["ok"]:
+        # 「已登记待审批」的处理器（作业/讨论/AI实践）此刻什么都没写进平台，
+        # 回读任务点状态必然还是未完成 —— 那时候补一句「注意：任务点状态仍为未完成」
+        # 只会让人以为提交失败。实测 2026-10-17：审批模式的作业答案是
+        # 「已生成 29 题答案…待审批后提交 [id=ap-4]」，后面紧跟这句提示，
+        # 用户以为交卷没成功。
+        pending_approval = _awaits_approval(result["ok"], result["message"])
+
+        if pending_approval:
+            logger.info("任务点已登记待审批: {} — {}", label, result["message"])
+        elif result["ok"]:
             logger.info("任务点完成: {} — {}", label, result["message"])
             # scoreRefresh 在本账号上是空操作，因此改为重新拉取分组下的任务点来校验
             group_id = item.extra.get("group_encry_id") or task.group_encry_id
@@ -1850,7 +1933,47 @@ class FanyaTaskRunner:
 #: process_job 正常播放/上报。
 HANDLERS_WITHOUT_STUDY_URL = {"chapter"}
 
+def _awaits_approval(ok: bool, message: str) -> bool:
+    """这个任务点只是「登记了待审批」，平台里一个字都还没写？
+
+    审批模式下的处理器返回 ``"…待审批后提交 [id=ap-3]"``，此时回读任务点状态
+    必然是未完成 —— 不能拿它当「提交了但没生效」去提示用户。
+    """
+    return bool(ok) and "[id=" in (message or "")
+
+
+def _thin_hit_warning(total: int, found: int) -> str:
+    """题库命中不到一半时，返回一句「批准等于交白卷」的提醒（否则空串）。
+
+    实测 2026-10-17：概率论「第二章章节测验」29 题只命中 4 题，预览里没有任何
+    提示，用户很可能直接点批准 —— 而这类作业往往只有一次机会。
+    """
+    if not total or found * 2 >= total:
+        return ""
+    missed = total - found
+    return (f"只答上 {found}/{total} 题（{found / total:.0%}）：批准后其余 {missed} 题"
+            "会以空答案交卷。题库里没有这些题，建议先自己补几题，或者干脆别交"
+            "（交了不能改）。")
+
+
 HANDLERS: dict[str, Callable[[CompletionContext], tuple[bool, str]]] = {}
+
+
+def _handler_outcome(handler_name: str, outcome: object) -> tuple[bool, str]:
+    """把处理器的返回值收成 ``(ok, message)``，收不了就抛一条能查的话。
+
+    实测 2026-10-17：「第二章章节测验」那一轮只看到一个
+    ``TypeError: cannot unpack non-iterable NoneType object``，堆栈里只有
+    ``run_item`` 这一帧 —— 处理器跑完了却给了 ``None``，而日志里既没有它自己的
+    报错也没有半句交代，用户只能看见「异常」。这里把「返回了怪东西」变成
+    「哪个处理器返回了什么」，至少下一次能顺着名字查。
+    """
+    if isinstance(outcome, tuple) and len(outcome) == 2:
+        return bool(outcome[0]), outcome[1]
+    raise TypeError(
+        f"处理器 {handler_name} 返回了 {type(outcome).__name__}（{outcome!r}），"
+        f"不是 (ok, message) 二元组"
+    )
 
 
 def register_handler(name: str):
@@ -2480,8 +2603,9 @@ def handle_ai_ladder(ctx: CompletionContext) -> tuple[bool, str]:
     验证，因此默认拒绝直接交卷，需显式开启 ``options.allow_ai_submit``。
     """
     if ctx.require_approval and not ctx.options.get("allow_ai_submit"):
-        return False, ("思维阶梯尚未支持「生成后暂停」审批流程（链路本身已真机验证，"
-                       "得分 85）；如确认要直接交卷，请开启「允许 AI实践直接提交」选项")
+        raise TaskSkipped("思维阶梯尚未支持「生成后暂停」审批流程（链路本身已真机验证，"
+                          "得分 85）；如确认要直接交卷，请开启「允许 AI实践直接提交」选项")
+
 
     from api import fanya_ladder as ladder
 
@@ -2550,8 +2674,9 @@ def handle_ai_chat(ctx: CompletionContext) -> tuple[bool, str]:
     且暂未实现「生成后暂停」，需显式开启 ``options.allow_ai_submit``。
     """
     if ctx.require_approval and not ctx.options.get("allow_ai_submit"):
-        return False, ("情景对话尚未支持「生成后暂停」审批流程，且该链路未真机验证；"
-                       "如确认要直接交卷，请开启「允许 AI实践直接提交」选项")
+        raise TaskSkipped("情景对话尚未支持「生成后暂停」审批流程，且该链路未真机验证；"
+                          "如确认要直接交卷，请开启「允许 AI实践直接提交」选项")
+
 
     from api import fanya_chat as chat
 
@@ -2586,8 +2711,9 @@ def handle_ai_story(ctx: CompletionContext) -> tuple[bool, str]:
     默认不执行，需显式开启 ``options["allow_ai_submit"]``。
     """
     if ctx.require_approval and not ctx.options.get("allow_ai_submit"):
-        return False, ("AI剧情会写入不可撤销的真实对话内容，且最后一章「上传报告」"
-                       "尚未自动化；如确认要执行，请开启「允许 AI实践直接提交」选项")
+        raise TaskSkipped("AI剧情会写入不可撤销的真实对话内容，且最后一章「上传报告」"
+                          "尚未自动化；如确认要执行，请开启「允许 AI实践直接提交」选项")
+
 
     from api import fanya_story as story
 
@@ -2884,7 +3010,6 @@ def handle_group_task(ctx: CompletionContext) -> tuple[bool, str]:
 # ----------------------------------------------------------------------
 
 
-@register_handler("course_work")
 def _build_ai_verifier(tiku: Any) -> Any:
     """当主题库**不是**大模型时，额外造一个 AI 实例用于复核选择题答案。
 
@@ -2991,6 +3116,7 @@ def _append_score_check(ctx: CompletionContext, message: str) -> str:
     return f"{message}\n{tail}" if tail else message
 
 
+@register_handler("course_work")
 def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
     """完成「作业」任务点（mooc2 课程作业）。
 
@@ -3102,6 +3228,10 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
         why = prepared.get("single_shot_note") or "平台没给这个作业重做次数（或查不到）"
         warning = (f"\n⚠️ {why}：批准后会直接交卷、不可逆（交上去就不能改了）"
                    "—— 请先核对上面的答案。")
+    # 命中率太低时「批准」等于把大片空白交上去，一次性作业尤其致命。
+    thin_warning = _thin_hit_warning(total, found)
+    if thin_warning:
+        warning += "\n⚠️ " + thin_warning
     entry_id = ctx.register_approval(
         kind="course_work",
         preview=f"{ctx.label}\n{msg}{warning}",
@@ -3111,7 +3241,8 @@ def handle_course_work(ctx: CompletionContext) -> tuple[bool, str]:
     )
     return True, (f"已生成 {total} 题答案（命中 {found} 题），"
                   f"待审批后提交 [id={entry_id}]"
-                  + ("（该作业不可重做，批准即不可逆）" if prepared.get("single_shot") else ""))
+                  + ("（该作业不可重做，批准即不可逆）" if prepared.get("single_shot") else "")
+                  + (f"（只答上 {found}/{total} 题，建议核对后再批准）" if thin_warning else ""))
 
 
 @register_handler("chapter")
@@ -3152,7 +3283,15 @@ def handle_chapter(ctx: CompletionContext) -> tuple[bool, str]:
             point = candidate
             break
     if point is None:
+        if ctx.item.plan_type == PLAN_TYPE_KNOWLEDGE:
+            # externalDataId 是**知识点/微课** 的 topicId，不是章节 id：
+            # 这类页的完成判据是微课里的阅读计时上报，没有章节任务点可走。
+            raise TaskSkipped(
+                f"「{ctx.item.name}」是知识点/微课页（topicId={ext}），"
+                "平台的完成判据是微课里的阅读计时上报，本工具没有这条链路；"
+                "请手动打开这一页完成")
         return False, f"章节列表中未找到 id={ext} 的章节（可能已调整或删除）"
+
 
     try:
         jobs, job_info = chaoxing.get_job_list(course, point)

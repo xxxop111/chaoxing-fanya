@@ -1040,3 +1040,64 @@ type-2 分支；作答接口在 SPA 的懒加载 chunk 里。与另外两种模�
 `test_run_task_is_silent_for_tasks_outside_the_selection`；
 `tests/test_frontend_contract.py`：`test_finished_items_are_collapsed_by_default`。
 
+
+## 10. 2026-10-17 那轮反馈修的四件事
+
+用户截图里「概率论与数理统计」15 条任务点，4 条跑完是红的。逐条查下来是四件事，
+其中两件是「把不可自动化的东西报成失败」，一件是框架层的报错无信息，一件是提示误导。
+
+### 10.1 知识点（微课）不是章节，判「需人工」
+
+`externalDataId=239094628` 是**微课 topicId**，`get_course_point()` 的章节列表里
+根本不会有它，所以原来报「章节列表中未找到 id=239094628 的章节（可能已调整或删除）」
+—— 却把锅甩给了老师改课。实测取证（plan 9068620/9068621）：
+
+* `study_emptypage?knowledgeid=<topicId>` 只把 `cpi`/`knowledgeid` 记成「已学」，
+  `isFinish` 仍是 false，任务点不完成；
+* 微课页 `mooc2-ans/coursetopic?…` 的隐藏域里 `microTopicId=239094628`、
+  `chapterId=1222351333`，正文是 `/mooc2-ans/wk-view?courseId=&topicId=` 的 ajax；
+  完成判据是 wk-view 里的**阅读计时上报**（`studentstudyAjax` 那条链），本工具没有。
+
+所以新增 `page_kind`（`chapter` / `micro_topic` / `""`）：`_probe_item_windows()`
+探到 `coursetopic` + `microTopicId` 就标 `micro_topic`，`resolve_item()` 直接给
+`manual` + 「平台的完成判据是微课里的阅读计时上报，本工具没有这条链路；请手动打开
+这一页完成」。`handle_chapter()` 也加了同样的兜底：真的走到那里也**跳过**而不是
+报「章节未找到」。
+
+### 10.2 AI实践 的「不能自动做」= 跳过，不是失败
+
+三处闸门原来都 `return False, "…"`，界面上就是红色「失败」。现在改成
+`raise TaskSkipped(...)`，落成黄色「跳过」：
+
+| 处理器 | 条件 | 原文案 |
+| --- | --- | --- |
+| `ai_ladder` / `ai_chat` / `ai_story` | `require_approval` 且没开 `allow_ai_submit` | 需要开启「允许 AI实践直接提交」 |
+| `ai_upload` / `ai_story` | 最后一节是「上传报告/作品」，未自动化 | 同上 |
+| `ai_*` | 未识别子模式（学习窗口可能关闭） | 已经由 `supported=False` 落成跳过 |
+
+`TaskSkipped` 是 `api/fanya_task.py` 里的异常类型，`run_item` 捕它 → `skipped=True`，
+计入 `stats['skipped']`。
+
+### 10.3 「TypeError: cannot unpack non-iterable NoneType object」的守卫
+
+那一轮里「第二章章节测验」只有这一句，堆栈里只有 `run_item` 一帧，没有任何处理器
+痕迹。用当前代码对同一个任务点（plan 9069293）以审批模式复跑：返回
+「已生成 29 题答案（命中 4 题），待审批后提交 [id=ap-4]」，**无法复现** —— 说明它
+来自当时那个更旧的构建。
+
+为了下次不再只给一句 TypeError，`run_item` 改为经 `_handler_outcome(name, value)`
+收口：不是 `(ok, message)` 二元组就抛
+`处理器 <name> 返回了 <类型>（<值>），不是 (ok, message) 二元组`，并在 `except`
+里落成 `异常: TypeError: …`。这样日志里直接点名是哪个处理器。
+
+### 10.4 两处误导性提示
+
+* **审批项被说成「没提交成功」**：审批模式下处理器什么都没写，回读任务点必然
+  未完成，原来照样追加「（注意：任务点状态仍为未完成，可能需要等待老师评分或平台
+  同步）」。现在 `_awaits_approval(ok, message)`（含 `[id=ap-`）为真就只记
+  「任务点已登记待审批」，不回读、不加那句。
+* **低命中率没有警告**：plan 9069293 是 29 题只命中 4 题，预览里却只有
+  「已生成 29 题答案（命中 4 题）」—— 批准等于把 25 题空白交上去（这类作业往往
+  一次机会）。新增 `_thin_hit_warning(total, found)`：命中不到一半时预览里追加
+  「⚠️ 只答上 4/29 题（14%）：批准后其余 25 题会以空答案交卷…」，行文案也补
+  「（只答上 4/29 题，建议核对后再批准）」。

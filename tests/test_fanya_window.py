@@ -21,12 +21,18 @@ plan 8110517「5.1 人口增长-马尔萨斯模型视频教学」仍能正常播
 import pytest
 
 from api import base as base_module
+from api import fanya_task as ft
 from api.base import SessionManager
 from api.fanya_task import (
-    HANDLERS, HANDLERS_WITHOUT_STUDY_URL, PLAN_TYPE_CHAPTER, PLAN_TYPE_WORK,
-    FanyaPlanItem, FanyaTask, FanyaTaskError, FanyaTaskRunner,
-    _probe_item_windows, _window_state_from_message,
+    HANDLERS, HANDLERS_WITHOUT_STUDY_URL, PLAN_TYPE_CHAPTER, PLAN_TYPE_KNOWLEDGE,
+    PLAN_TYPE_WORK, STATUS_AUTO, STATUS_MANUAL,
+    FanyaPlanItem, FanyaTask, FanyaTaskError, FanyaTaskRunner, TaskSkipped,
+    _probe_item_windows, _window_state_from_message, resolve_item,
 )
+
+MICRO_TOPIC_URL = ("https://mooc2-ans.chaoxing.com/mooc2-ans/coursetopic/"
+                   "topicdetailsmiddle?taskEngine=true&courseid=266162038"
+                   "&clazzid=152604525&cpi=493917483&topicid=239094628&ut=s")
 
 PAST_WINDOW = ("任务点学习时间：2026-09-20 10:00至2026-09-30 23:59，"
                "当前不在学习时间内")
@@ -53,6 +59,8 @@ class _FakeClient:
         plan_id = int(str(encrypt_plan_id).lstrip("e") or 0)
         self.calls.append(plan_id)
         outcome = self.behaviour.get(plan_id, "open")
+        if isinstance(outcome, dict):  # 直接指定跳转报文（用来喂不同的落地页）
+            return outcome
         if outcome == "open":
             return {"url": f"https://example.test/{plan_id}"}
         raise FanyaTaskError(outcome)
@@ -265,3 +273,133 @@ def test_run_task_is_silent_for_tasks_outside_the_selection(monkeypatch):
     assert events == [], "没勾到这个任务里的任何任务点时，应静默返回"
     assert runner.results == []
 
+
+# ------------------------------------------ 知识点微课页：如实判「需人工」
+#
+# 真实反馈（2026-10-17）：概率论与数理统计里两个「知识点」任务点失败，报
+# 「章节列表中未找到 id=239094628 的章节」——那个 id 是**微课 topicId**，
+# 不是章节 id。这类页的完成判据是微课里的阅读计时上报（wk-view → 计时 → 上报），
+# 章节流程没有可走的任务点，所以只能在盘点阶段就判「需人工」。
+
+
+def test_probe_recognises_micro_topic_knowledge_page():
+    item = _item(71, PLAN_TYPE_KNOWLEDGE)
+    other = _item(72, PLAN_TYPE_KNOWLEDGE)
+    client = _FakeClient({71: {"url": MICRO_TOPIC_URL},
+                          72: {"url": "https://mooc1.chaoxing.com/mooc-ans/knowledge/cards?clazzid=1"}})
+    _probe_item_windows(client, _task([item, other]), probe_client_factory=lambda: client)
+
+    assert item.window_state == "open", "能拿到跳转就算可进入"
+    assert item.page_kind == "micro_topic"
+    assert other.page_kind == "", "普通章节型知识点不能被误判"
+
+
+def test_micro_topic_item_is_manual_not_auto():
+    status, handler, note = resolve_item(
+        _item(73, PLAN_TYPE_KNOWLEDGE, page_kind="micro_topic"))
+
+    assert status == STATUS_MANUAL
+    assert handler == "chapter"  # 清掉 handler 会连带影响 unreachable 判定
+    assert "微课" in note and "手动" in note
+
+
+def test_chapter_handler_skips_micro_topic_plan_instead_of_failing():
+    """万一没在盘点阶段识别出来：执行到 chapter 处理器时也要记「跳过」而不是「失败」。"""
+    from api.fanya_task import handle_chapter, CompletionContext
+
+    ctx = CompletionContext(
+        chaoxing=object(), client=None,
+        course={"courseId": "1", "clazzId": "2", "cpi": "3"},
+        task=_task([]),
+        item=_item(74, PLAN_TYPE_KNOWLEDGE, extra={"externalDataId": 239094628}),
+        generator=None, study_url={}, options={},
+        require_approval=False, approvals={}, stop_requested=lambda: False,
+    )
+    ctx.chaoxing = type("X", (), {"get_course_point": lambda *a, **k: {"points": []}})()
+    with pytest.raises(TaskSkipped) as info:
+        handle_chapter(ctx)
+    assert "知识点" in str(info.value) or "微课" in str(info.value)
+
+
+def test_run_item_records_task_skipped_as_skipped_row(monkeypatch):
+    """处理器抛 TaskSkipped（=这事得人来做）时，结果要算「跳过」，不算失败。"""
+    def fake_work(ctx):
+        raise TaskSkipped("需要人工：本工具没有这条链路")
+
+    monkeypatch.setitem(HANDLERS, "course_work", fake_work)
+
+    class _Client:
+        def get_study_url(self, *a, **k):
+            return {"url": "https://example.test/work"}
+
+        def verify_plan_finished(self, *a, **k):
+            return None
+
+    runner = FanyaTaskRunner(chaoxing=None, client=_Client(), options={})
+    item = _item(81, supported=True, handled_by="course_work")
+    result = runner.run_item({"courseId": "1"}, _task([item]), item)
+
+
+    assert result["skipped"] is True
+    assert result["ok"] is False
+    assert "需要人工" in result["message"]
+    assert not result["message"].startswith("异常"), "跳过不是异常"
+
+
+def test_every_registered_handler_is_callable():
+    """注册表里每个名字都必须绑定到真正的函数。
+
+    真实 bug（2026-10-17）：AI实践 那行写成了 ``register_handler("ai_practice")(None)``，
+    于是 ``HANDLERS["ai_practice"] = None``；``effective_status`` 只检查
+    ``handler not in HANDLERS``（名字在表里就放过），执行时 ``None(ctx)`` 直接
+    TypeError —— 界面上还写着「可自动完成」。
+    """
+    import api.fanya_task as ft
+
+    assert ft.HANDLERS, "处理器注册表不能是空的"
+    broken = {name: value for name, value in ft.HANDLERS.items() if not callable(value)}
+    assert broken == {}, f"这些处理器不是可调用对象：{sorted(broken)}"
+
+
+def test_knowledge_adapter_note_does_not_promise_micro_topics():
+    from api.fanya_task import adapter_for
+
+    spec = adapter_for(PLAN_TYPE_KNOWLEDGE)
+    assert spec.status == STATUS_AUTO, "章节型知识点仍是可自动的"
+    assert "微课" in spec.note and "不支持" in spec.note, "但说明里要讲清微课型做不了"
+
+
+
+
+# ------------------------------------ 处理器返回怪东西 / 「待审批」不当成「没提交成功」
+#
+# 真实反馈（2026-10-17）：「第二章章节测验」只得到一句
+# ``TypeError: cannot unpack non-iterable NoneType object``，堆栈里只有
+# ``run_item`` 一帧 —— 处理器跑完了却返回 None，日志里没有半句线索。
+# 另外审批模式的行被补上「注意：任务点状态仍为未完成」，让人误以为交卷失败。
+
+
+def test_handler_outcome_names_the_culprit_instead_of_a_bare_unpack_error():
+    assert ft._handler_outcome("video", (True, "ok")) == (True, "ok")
+    assert ft._handler_outcome("video", (0, "")) == (False, "")
+
+    with pytest.raises(TypeError) as caught:
+        ft._handler_outcome("course_work", None)
+
+    text = str(caught.value)
+    assert "course_work" in text, "报错必须点名是哪个处理器"
+    assert "NoneType" in text
+
+
+def test_awaits_approval_only_matches_pending_rows():
+    assert ft._awaits_approval(True, "已生成 3 题答案，待审批后提交 [id=ap-4]") is True
+    # 真提交了、只是状态没刷新：不是待审批，要照常回读并提示
+    assert ft._awaits_approval(True, "作业已提交（2 题）") is False
+    assert ft._awaits_approval(False, "待审批后提交 [id=ap-4]") is False
+
+
+def test_thin_hit_warning_only_fires_below_half():
+    assert ft._thin_hit_warning(29, 4).startswith("只答上 4/29 题")
+    assert "25 题" in ft._thin_hit_warning(29, 4)
+    assert ft._thin_hit_warning(10, 5) == "", "一半命中不算「交白卷」"
+    assert ft._thin_hit_warning(0, 0) == ""
