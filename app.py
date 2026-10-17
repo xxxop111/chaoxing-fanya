@@ -61,6 +61,28 @@ def _saved_settings() -> Dict:
   return settings if isinstance(settings, dict) else {}
 
 
+def apply_ocr_settings(ocr_config: Dict) -> bool:
+  """把 OCR 配置写进进程环境并让 vision_ocr 缓存失效；返回是否启用。
+
+  任务开始和盘点开始都要调：盘点时也可能真的去读题干（OCR 生效意味着图题能被
+  识别），而且这么调能保证「界面上写的状态」和「进程里实际用的配置」是同一份。
+  """
+  try:
+      from api.vision_ocr import apply_config_env
+      enabled = apply_config_env(
+          (ocr_config or {}).get('provider') or '',
+          (ocr_config or {}).get('key') or '',
+          (ocr_config or {}).get('endpoint') or '',
+          (ocr_config or {}).get('model') or '',
+      )
+      if enabled:
+          logger.info(f"已配置外部 AI 视觉 OCR: provider={(ocr_config or {}).get('provider')}")
+      return enabled
+  except Exception as exc:  # noqa: BLE001 - OCR 配不上不该拦住整个任务
+      logger.warning(f"应用 OCR 配置失败（图题会按跳过处理）：{exc}")
+      return False
+
+
 def save_web_config(data: Dict) -> bool:
   """保存前端配置到本地 JSON 文件"""
   try:
@@ -283,21 +305,8 @@ def start_study():
             notification_config = notification_config or saved.get('notification_config') or {}
             ocr_config = ocr_config or saved.get('ocr_config') or {}
         
-        # 设置 OCR 配置环境变量
-        if ocr_config.get('provider') and ocr_config.get('key'):
-            os.environ['CHAOXING_VISION_OCR_PROVIDER'] = ocr_config['provider']
-            os.environ['CHAOXING_VISION_OCR_KEY'] = ocr_config['key']
-            if ocr_config.get('endpoint'):
-                os.environ['CHAOXING_VISION_OCR_ENDPOINT'] = ocr_config['endpoint']
-            if ocr_config.get('model'):
-                os.environ['CHAOXING_VISION_OCR_MODEL'] = ocr_config['model']
-            # 重置 vision_ocr 模块的配置缓存，使新配置生效
-            try:
-                from api.vision_ocr import reset_vision_ocr_config
-                reset_vision_ocr_config()
-            except ImportError:
-                pass
-            logger.info(f"已配置外部 AI 视觉 OCR: provider={ocr_config['provider']}")
+        # 设置 OCR 配置环境变量（先清掉上一次的值，避免旧 endpoint/model 残留）。
+        apply_ocr_settings(ocr_config)
         
         # 创建任务ID
         task_id = f"{username}_{int(time.time())}"
@@ -780,6 +789,9 @@ def fanya_preview_start():
             sink_id = logger.add(capture.write, enqueue=True)
             try:
                 logger.info("开始盘点课程任务（只读，不会修改任何学习记录）")
+                # 盘点也要用同一份 OCR 配置：否则「设置页显示已启用、盘点时却读不了图题」
+                # 这种不一致会再次把整卷推向「跳过」。
+                apply_ocr_settings((_saved_settings().get('ocr_config') or {}))
                 _, all_courses = _fanya_login(username, password, use_cookies, tiku_config)
                 selected = _select_courses(all_courses, course_list)
                 logger.info(f"共选中 {len(selected)} 门课程，开始读取任务引擎任务点...")

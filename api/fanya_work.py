@@ -332,6 +332,9 @@ _OCR_PROVIDER_ENDPOINT = {
     "claude": "https://api.anthropic.com/v1/messages",
     "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "siliconflow": "https://api.siliconflow.cn/v1/chat/completions",
+    # DeepSeek 官方 API 也能读图（2026-10-17 实测）：同一个 key、deepseek-flash 模型，
+    # 公式图 1.8~2.2 秒/张，识别结果直接是 LaTeX。
+    "deepseek": "https://api.deepseek.com/chat/completions",
 }
 
 def ocr_gap() -> str:

@@ -1221,3 +1221,63 @@ type-2 分支；作答接口在 SPA 的懒加载 chunk 里。与另外两种模�
 
 **Open objectives（截至本块）**：14 分已判、不可撤回（该作业无重做机会），只能
 保证同类事故不再发生 + 让用户配好视觉 OCR 后重跑其余窗口未过的作业。
+
+
+## 12. 2026-10-17 追加：DeepSeek 官方 API 能读图，「OCR 用不了」不是必然
+
+### 12.1 结论更正
+
+上一轮我在文档和界面里写「DeepSeek 系列只能处理文字，读不了公式图」，**这是错的**。
+用用户自己的 key（`settings.tiku_config.key`）实测：
+
+```
+GET  https://api.deepseek.com/models            -> 200
+     models: ['deepseek-flash', 'deepseek-v4-pro']
+POST https://api.deepseek.com/chat/completions  -> 200（content 里带 image_url）
+     model=deepseek-flash, thinking={"type":"disabled"}
+     图 1「F(x)= 分段函数」-> $$F(x)=\begin{cases} 1, & x>2 \\ kx^3, & 0<x\leq 2 \\ 0, & x\leq 0 \end{cases}$$   1.8s / 42 tokens
+     图 2「k =」           -> $k=$                                                                                  1.8s /  2 tokens
+```
+
+两张图都是 chaoxing 真题里的公式图（`p.cldisk.com/star3/origin/*.png`），识别结果直接是
+LaTeX，速度 1.4~2.2 秒/张。
+
+### 12.2 两个必须同时满足的细节
+
+1. **必须关掉 thinking**：`deepseek-flash` 是推理模型，默认先吐 `reasoning_content`。
+   同一个请求带 thinking 时 `completion_tokens=211` 而 `content_len` 只有 81；不带
+   `max_tokens` 限制时更极端——200 tokens 全烧在思维链上，`content` 返回空串、
+   `finish_reason=length`，OCR 等于没做。`_call_openai_compatible()` 对含 `deepseek`
+   的 endpoint 自动加 `thinking={"type": "disabled"}`；端点若 400（不认该字段）会去掉它重试一次。
+2. **必须有 endpoint 默认值**：`PROVIDER_DEFAULTS` 原来只有 openai/claude/qwen/siliconflow，
+   DeepSeek 只能通过 `openai_compatible` 走，而那条路的 endpoint 是空串、必须手填——
+   用户填了 `provider=openai_compatible` + 把模型名 `deepseek-flash` 当「密钥」写进去，
+   于是 `ocr_gap()` 永远返回「没填接口地址」。现在补齐：
+
+   | provider | endpoint | model |
+   | --- | --- | --- |
+   | `deepseek` | `https://api.deepseek.com/chat/completions` | `deepseek-flash` |
+
+   `api/fanya_work.py::_OCR_PROVIDER_ENDPOINT` 同步加了 deepseek，`ocr_gap()` 不再把
+   「选了 deepseek 但没填地址」当错误。
+
+### 12.3 配置链路的另一个坑（顺手修掉）
+
+`app.py` 里把 `settings.ocr_config` 写进 `CHAOXING_VISION_OCR_*` 时，只写不删：
+用户后来把 OCR 关掉或改回默认地址，进程里仍留着上一次的 endpoint/model，
+界面显示「未启用」而实际还在用旧配置。现在每次启动任务前先把这四个变量 pop 掉再按配置写，
+并无条件 `reset_vision_ocr_config()`。
+
+### 12.4 回归用例
+
+`tests/test_parsers.py::test_deepseek_can_be_used_as_vision_ocr_provider`（默认 endpoint/model + `ocr_gap() == ""`）、
+`tests/test_frontend_contract.py::test_deepseek_is_offered_as_a_vision_provider`（下拉项 + 两个默认值 + 不许再写「读不了公式图」）。
+`pytest tests -q` -> 176 passed。
+
+### 12.5 现场状态
+
+用户机器上的 `web_config.json`（仓库根与安装目录两份）已改为
+`ocr_config = {provider: "deepseek", key: <与题库同一个 sk- key>, endpoint: "", model: "deepseek-flash"}`。
+原件备份为 `web_config.json.bak-ocr`。这条链路验证过：`api.answer._ocr_image_to_text()`
+对两张真题公式图分别返回 1.5s / 1.4s 的正确 LaTeX，日志出现
+「外部 AI 视觉 OCR 已启用: provider=deepseek, model=deepseek-flash」与「识别成功」。

@@ -654,6 +654,86 @@ def test_submission_blockers_explain_ocr_gap():
     assert not any("不可逆" in r for r in reasons), reasons
 
 
+def test_deepseek_can_be_used_as_vision_ocr_provider():
+    """DeepSeek 官方 API 能读图（2026-10-17 实测），别再把它当「只能处理文字」。
+
+    实测证据：GET https://api.deepseek.com/models -> ['deepseek-flash', 'deepseek-v4-pro']；
+    带 image_url 的 /chat/completions 返回 200，把 $F(x)$ 分段函数识别成 LaTeX，
+    1.8~2.2 秒/张、42 tokens（thinking 关闭时）。
+    """
+    import os
+    from api import vision_ocr as vo
+
+    defaults = vo.PROVIDER_DEFAULTS["deepseek"]
+    assert defaults["model"] == "deepseek-flash"
+    assert defaults["endpoint"].startswith("https://api.deepseek.com")
+    # 不填地址也能用：ocr_gap 认得这个默认地址
+    import api.fanya_work as fw
+    assert fw._OCR_PROVIDER_ENDPOINT.get("deepseek", "").startswith("https://api.deepseek.com")
+
+    saved_env = {k: os.environ.get(k) for k in (
+        "CHAOXING_VISION_OCR_PROVIDER", "CHAOXING_VISION_OCR_KEY",
+        "CHAOXING_VISION_OCR_ENDPOINT", "CHAOXING_VISION_OCR_MODEL")}
+    saved_local = fw.ENABLE_LOCAL_OCR if hasattr(fw, "ENABLE_LOCAL_OCR") else None
+    try:
+        import api.decode as dec
+        dec.ENABLE_LOCAL_OCR = False
+        os.environ["CHAOXING_VISION_OCR_PROVIDER"] = "deepseek"
+        os.environ["CHAOXING_VISION_OCR_KEY"] = "sk-test"
+        os.environ.pop("CHAOXING_VISION_OCR_ENDPOINT", None)
+        os.environ.pop("CHAOXING_VISION_OCR_MODEL", None)
+        vo.reset_vision_ocr_config()
+        assert vo.is_vision_ocr_enabled() is True
+        cfg = vo._load_vision_ocr_config()
+        assert cfg["endpoint"] == "https://api.deepseek.com/chat/completions"
+        assert cfg["model"] == "deepseek-flash"
+        assert fw.ocr_gap() == "", fw.ocr_gap()
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        vo.reset_vision_ocr_config()
+        if saved_local is not None:
+            import api.decode as dec
+            dec.ENABLE_LOCAL_OCR = saved_local
+
+
+def test_ocr_config_env_is_cleared_when_switching_or_disabling():
+    """界面上关掉 OCR 之后，进程里不能还留着上一次的 endpoint/model。
+
+    2026-10-17 实测：用户先配 openai_compatible（填了地址），再改回「不使用」，
+    旧变量还挂在进程里，界面写「未启用」而任务仍按旧配置跑。
+    """
+    import os
+    from api import vision_ocr as vo
+
+    saved = {k: os.environ.get(k) for k in vo._ENV_KEYS}
+    try:
+        os.environ["CHAOXING_VISION_OCR_ENDPOINT"] = "https://stale.example/v1"
+        os.environ["CHAOXING_VISION_OCR_MODEL"] = "stale-model"
+
+        assert vo.apply_config_env("deepseek", "sk-x") is True
+        assert os.environ["CHAOXING_VISION_OCR_PROVIDER"] == "deepseek"
+        # 没填就删掉，不能让上一次的值蒙混过关
+        assert "CHAOXING_VISION_OCR_ENDPOINT" not in os.environ
+        assert "CHAOXING_VISION_OCR_MODEL" not in os.environ
+        assert vo.is_vision_ocr_enabled() is True
+
+        assert vo.apply_config_env("", "") is False
+        for key in vo._ENV_KEYS:
+            assert key not in os.environ, key
+        assert vo.is_vision_ocr_enabled() is False
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        vo.reset_vision_ocr_config()
+
+
 def test_ocr_reads_formula_images_when_vision_ocr_is_configured():
     """配了界面里的视觉 OCR 就该走 OCR，不能只认 CHAOXING_ENABLE_OCR。"""
     import api.answer as fa

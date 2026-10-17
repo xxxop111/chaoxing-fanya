@@ -210,7 +210,19 @@ def test_settings_page_shows_why_ocr_is_off(html):
     assert 'id="ocr-status"' in html, "OCR 状态没有可以写入的元素"
     assert "renderOcrStatus" in html, "OCR 状态没有渲染逻辑"
     assert "未启用：题干是公式图片的题会一律留空" in html, "OCR 状态没有说清楚后果"
-    assert "DeepSeek" in html and "读不了公式图" in html, "没有说明为什么 DeepSeek 不行"
+
+
+def test_deepseek_is_offered_as_a_vision_provider(html):
+    """DeepSeek 官方 API 能读图（2026-10-17 实测），设置页必须能选它。
+
+    以前的说法是「DeepSeek 只能处理文字」，于是用户按提示去配别的供应商；
+    实际 deepseek-flash 把公式图认成 LaTeX 只要 2 秒。这里把默认地址、默认模型
+    和下拉项一起钉住，免得以后又被改回去。
+    """
+    assert "<option>deepseek</option>" in html, "OCR 供应商下拉里没有 deepseek"
+    assert 'deepseek: "https://api.deepseek.com/chat/completions"' in html, "缺 deepseek 默认接口地址"
+    assert 'deepseek: "deepseek-flash"' in html, "缺 deepseek 默认视觉模型"
+    assert "读不了公式图" not in html, "设置页还在说 DeepSeek 读不了图"
 
 
 def test_brand_mark_matches_the_windows_icon(html):

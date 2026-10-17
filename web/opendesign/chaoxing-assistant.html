@@ -745,13 +745,13 @@
               <div class="card-head"><div><h2>OCR 识别</h2></div></div>
               <div class="stack" style="gap:16px;">
                 <div class="field"><label for="ocr-provider">供应商</label>
-                  <select class="select" id="ocr-provider"><option value="">（不使用）</option><option>siliconflow</option><option>openai</option><option>claude</option><option>qwen</option><option>openai_compatible</option></select>
+                  <select class="select" id="ocr-provider"><option value="">（不使用）</option><option>deepseek</option><option>siliconflow</option><option>openai</option><option>claude</option><option>qwen</option><option>openai_compatible</option></select>
                 </div>
                 <div class="field"><label for="ocr-key">密钥</label><input class="input" id="ocr-key" type="password" placeholder="sk-…" /></div>
                 <div class="field"><label for="ocr-endpoint">接口地址</label><input class="input" id="ocr-endpoint" placeholder="https://…" /></div>
                 <div class="field"><label for="ocr-model">模型</label><input class="input" id="ocr-model" placeholder="…" /></div>
                 <p class="mono-note" id="ocr-status" data-od-id="settings-ocr-status">OCR —</p>
-                <p class="mono-note" data-od-id="settings-ocr-tip">需要「能看图」的模型：通义 qwen-vl、硅基流动 Qwen2-VL、OpenAI gpt-4o 之类。DeepSeek 系列只能处理文字，读不了公式图；这类题本工具会直接留空、整卷不交，不会瞎猜。</p>
+                <p class="mono-note" data-od-id="settings-ocr-tip">需要「能看图」的模型。DeepSeek 的 deepseek-flash 实测能读公式图（2026-10-17：$F(x)$ 分段函数 1.8 秒识别成 LaTeX），选 deepseek + 你的 key 即可，地址和模型留空就用官方默认。通义 qwen-vl、硅基流动 Qwen2-VL、OpenAI gpt-4o 同样可用。配错或没配时，图题不会瞎猜，整卷按「跳过」处理。</p>
               </div>
             </div>
           </div>
@@ -1619,10 +1619,18 @@
   // 关的，日志里只有一条 WARNING；结果 29 道公式图题的卷子被当成「没答上」的
   // 空题交上去，14 分且不可重做。现在界面上直接说清楚缺什么。
   var OCR_DEFAULT_ENDPOINT = {
+    deepseek: "https://api.deepseek.com/chat/completions",
     openai: "https://api.openai.com/v1/chat/completions",
     claude: "https://api.anthropic.com/v1/messages",
     qwen: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     siliconflow: "https://api.siliconflow.cn/v1/chat/completions"
+  };
+  var OCR_DEFAULT_MODEL = {
+    deepseek: "deepseek-flash",
+    openai: "gpt-4o",
+    claude: "claude-3-5-sonnet-20241022",
+    qwen: "qwen-vl-plus",
+    siliconflow: "Qwen/Qwen2-VL-72B-Instruct"
   };
   function ocrState() {
     var provider = $("#ocr-provider").value;
@@ -1637,7 +1645,8 @@
     if (!endpoint && !OCR_DEFAULT_ENDPOINT[provider]) {
       return { ok: false, text: "未生效：openai_compatible 必须自己填接口地址，只填供应商和密钥不够。" };
     }
-    return { ok: true, text: "已启用 → " + (endpoint || OCR_DEFAULT_ENDPOINT[provider]) + "（公式图片会先识别成文字再答题）" };
+    var model = ($("#ocr-model").value || "").trim() || OCR_DEFAULT_MODEL[provider] || "默认模型";
+    return { ok: true, text: "已启用 → " + (endpoint || OCR_DEFAULT_ENDPOINT[provider]) + " · " + model + "（公式图片会先识别成文字再答题）" };
   }
   function renderOcrStatus() {
     var el = $("#ocr-status");
